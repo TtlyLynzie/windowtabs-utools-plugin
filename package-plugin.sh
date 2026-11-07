@@ -21,7 +21,16 @@ cp -R "$ROOT_DIR/helper" "$STAGE_DIR/helper"
 
 (
   cd "$STAGE_DIR"
-  zip -qr "$OUTPUT_DIR/$PACKAGE_NAME" .
+  if command -v zip >/dev/null 2>&1; then
+    zip -qr "$OUTPUT_DIR/$PACKAGE_NAME" .
+  elif command -v 7z >/dev/null 2>&1; then
+    7z a -tzip -bd -y "$OUTPUT_DIR/$PACKAGE_NAME" . >/dev/null
+  elif [ -x "/c/Program Files/7-Zip/7z.exe" ]; then
+    "/c/Program Files/7-Zip/7z.exe" a -tzip -bd -y "$OUTPUT_DIR/$PACKAGE_NAME" . >/dev/null
+  else
+    echo "Neither zip nor 7-Zip is available" >&2
+    exit 127
+  fi
 )
 
 echo "created: $OUTPUT_DIR/$PACKAGE_NAME"
