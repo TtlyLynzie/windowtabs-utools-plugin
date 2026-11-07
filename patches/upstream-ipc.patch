@@ -47,32 +47,12 @@ index cca6320..b0086a9 100755
          CaptionDragPlugin()
          NotifyIconPlugin()
          ExceptionHandlerPlugin()
-diff --git a/WtProgram/WtProgram.fsproj b/WtProgram/WtProgram.fsproj
-index f1c4f57..ba4f871 100755
---- a/WtProgram/WtProgram.fsproj
-+++ b/WtProgram/WtProgram.fsproj
-@@ -259,6 +259,7 @@ if $(ConfigurationName) == Release (
-     <Compile Include="ManagerViewService/SettingsBenchmark.fs">
-       <Link>SettingsBenchmark.fs</Link>
-     </Compile>
-+    <Compile Include="WindowTabsIpc.fs" />
-     <Compile Include="Program.fs" />
-     <EmbeddedResource Include="Resources\Bemo.ico" />
-     <EmbeddedResource Include="Resources\workspace.png" />
-@@ -307,6 +308,7 @@ if $(ConfigurationName) == Release (
-       <HintPath>..\Newtonsoft.Json.dll</HintPath>
-     </Reference>
-     <Reference Include="System" />
-+    <Reference Include="System.Core" />
-     <Reference Include="System.Drawing" />
-     <Reference Include="System.Security" />
-     <Reference Include="UIAutomationClient" />
 diff --git a/WtProgram/WindowTabsIpc.fs b/WtProgram/WindowTabsIpc.fs
 new file mode 100644
-index 0000000..60947f1
+index 0000000..6ad464c
 --- /dev/null
 +++ b/WtProgram/WindowTabsIpc.fs
-@@ -0,0 +1,248 @@
+@@ -0,0 +1,249 @@
 +namespace Bemo
 +
 +open System
@@ -271,7 +251,8 @@ index 0000000..60947f1
 +                                log (sprintf "IPC request failed: %O" ex)
 +                                error "INTERNAL_ERROR" ex.Message
 +                        writer.WriteLine((response id body).ToString(Formatting.None))
-+                    with ex
++                    with
++                    | ex ->
 +                        log (sprintf "IPC client disconnected after malformed request: %O" ex)
 +                        connected <- false
 +
@@ -321,3 +302,23 @@ index 0000000..60947f1
 +            let server = Server(pipe, fun message -> Debug.WriteLine(message))
 +            server.Start()
 +            Some server
+diff --git a/WtProgram/WtProgram.fsproj b/WtProgram/WtProgram.fsproj
+index f1c4f57..ba4f871 100755
+--- a/WtProgram/WtProgram.fsproj
++++ b/WtProgram/WtProgram.fsproj
+@@ -259,6 +259,7 @@ if $(ConfigurationName) == Release (
+     <Compile Include="ManagerViewService/SettingsBenchmark.fs">
+       <Link>SettingsBenchmark.fs</Link>
+     </Compile>
++    <Compile Include="WindowTabsIpc.fs" />
+     <Compile Include="Program.fs" />
+     <EmbeddedResource Include="Resources\Bemo.ico" />
+     <EmbeddedResource Include="Resources\workspace.png" />
+@@ -307,6 +308,7 @@ if $(ConfigurationName) == Release (
+       <HintPath>..\Newtonsoft.Json.dll</HintPath>
+     </Reference>
+     <Reference Include="System" />
++    <Reference Include="System.Core" />
+     <Reference Include="System.Drawing" />
+     <Reference Include="System.Security" />
+     <Reference Include="UIAutomationClient" />
