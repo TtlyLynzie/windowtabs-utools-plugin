@@ -1,0 +1,974 @@
+# WindowTabs Standard-Software Version
+
+**Language:** [Japanese/日本語](version_Japanese.md)
+
+## version ss_2026.11.06
+
+- Fixed an older window coming to the front instead of a new window
+  that was linked into a minimized group (#34).
+- Added a snap preview.
+  - It looks like the Windows snap preview.
+  - Shown when a tab dragged out of the group snaps.
+  - Shown when the cursor rests on a move, snap, size or
+    link-to-group item in the tab menu.
+- A maximized group moved to the same position on another display from
+  the tab menu stays maximized there.
+  - Restoring it puts it at the same proportion as on the old display.
+- A snap that keeps a length already filling the screen (a left snap
+  moved to a top snap, for example) uses half of it in that direction.
+- Fixed the top tabs folding inside the window when a normal window
+  moved to the same position on another display.
+
+## version ss_2026.11.02
+
+- Left and right tabs can be written horizontally.
+  - The settings choose vertical or horizontal text.
+- Translucent tabs (inactive groups, other virtual desktops) are frosted:
+  the windows behind them are blurred, so the tab text stays readable.
+- The New tab menu has items such as "Right end of top tabs".
+- "Right of this tab" in the New tab menu shows its shortcut key.
+- The Programs page can take the tabs off a single window.
+- The settings dialog is now shown on every virtual desktop.
+- The settings dialog opens on the page it was closed on.
+- Snap positions are adjusted.
+  - No gap is left at the left, right and bottom of the window.
+- An inactive tab's tooltip shows a thumbnail of its window below it.
+  - It can be turned off on the General page. It is on by default.
+- A closed window's tab colours, pin and tab name are cleared when it closes.
+- Linking and detaching keep the state of each tab.
+  - Linking from the menu keeps a tab's edge, alignment and pin.
+  - Detached tabs stay on their edge, one at a time or several together.
+  - Moving or snapping a detached window leaves room for the edges it keeps.
+- Fixed a tab of a detached group sometimes not being drawn.
+- Dark Mono 3 and Night Horizon are added to the color themes.
+- The tab style names now say what each shape looks like.
+
+## version ss_2026.10.29
+
+- Tabs can be shown on any edge of the window: top, left, right and bottom.
+  - Each edge can be turned on or off, and has its own page in the settings.
+  - The tab menu changes a tab's alignment and its edge (direction).
+  - Tabs can be dragged to another edge of their own group.
+  - Left and right tabs can face the text either way.
+- Fixed: a tab strip could stay hidden behind its window for a while,
+  for example after switching Excel books (#31, #33).
+- "Combine taskbar buttons for tab groups" now has a note: it works only
+  while Windows combines taskbar buttons (labels hidden).
+
+## version ss_2026.10.25
+
+- Position Move has a new Size submenu with common screen resolutions.
+  - Sizes that do not fit the screen are grayed out.
+- Snapping or moving a group to the left, right or a corner also aligns
+  its tabs to that side, when they all share one alignment.
+  - A move that fits the window into the screen keeps the room for tabs.
+- "Run WindowTabs at startup" now puts a shortcut in your Startup folder
+  instead of writing to the registry.
+  - The check box shows whether a shortcut or the old registry entry
+    starts this WindowTabs.exe.
+  - Turning it off removes both. A failure is reported instead of
+    showing an error screen.
+- Taskbar grouping: a File Explorer window that dropped out of its
+  group's button after going to Home or opening a new tab is put back.
+  - It goes back within a few seconds.
+- Japanese text writes "all" in hiragana.
+
+## version ss_2026.10.23
+
+- Settings dialog
+  - New System tab: shows the folders, and makes a portable copy.
+  - A check box toggles only from its box and its caption.
+- Combined taskbar buttons
+  - Fixed buttons that could stay combined after the setting was turned off.
+  - A window that dropped out of its button is put back at shorter intervals.
+- Settings are now saved in WindowTabsSettings.json.
+  - The .txt is copied on the first start, and left as it is.
+- Bug fix: closing or restarting from the tray menu no longer ends with
+  an error.
+- Bug fix: "Prevent moving windows and resizing them from the top"
+  - File Explorer windows can no longer be resized from the top.
+  - The strip along the top edge no longer flickers.
+- Bug fix: an item of a submenu opened over another menu sometimes did
+  nothing when clicked; it now works.
+- When the whole desktop stops answering, WindowTabs waits up to two
+  minutes before restarting itself.
+
+## version ss_2026.10.17
+
+- Taskbar: the buttons of a tab group can be combined into one button.
+  - Turned on with a new setting on the General page (off by default).
+  - Windows shown on every desktop join the button of the desktop in view.
+  - Each window gets its own button back when it leaves the group, when the
+    setting is turned off, and on the next start after a crash.
+- Windows without a title
+  - Applications named in Settings\FramelessWindow.json get tabs even when
+    their window has no title.
+  - Fixed the tooltip of the previous tab staying over a tab without a title.
+- Shipped settings: smaller top inset for virt-viewer.exe.
+- Window event hooks: one per kind of event instead of one per window and
+  per tab group, and none while WindowTabs is disabled.
+- Fixed: windows could get no tab when their virtual desktop could not be
+  identified.
+  - Since ss_2026.10.03.
+  - Happened on a PC where the virtual desktop was never switched.
+  - Windows now get a tab unless they are known to be on another desktop.
+
+## version ss_2026.10.14
+
+- Close and pin buttons: shown on the active tab only by default.
+  - The previous behaviour can be selected on the Interaction page.
+- Settings dialog: regrouped into Appearance, Color, Interaction, General.
+  - Appearance: shape, size, distance from edge, then tab placement.
+  - Appearance and Interaction: choices are offered as radio buttons.
+  - Number, colour and shortcut fields: frames and heights evened out.
+  - Colour codes: always shown with six digits.
+- The code of the unused Diagnostics page is removed.
+- Fixed a tab with a special resize frame, such as LINE, ending up off by its
+  frame when it is detached and placed at a position.
+- Applications that draw their own title bar and frame (GTK 3 and the like)
+  can now get tabs.
+  - Only applications whose exe name is in Settings\FramelessWindow.json.
+  - Writing the invisible margin there lines the tab up with the window.
+  - The shipped file lists virt-viewer (remote-viewer.exe, virt-viewer.exe).
+- Less wasted work when several windows of one application are in tab groups.
+  - Events of other windows are dropped before they reach a tab group.
+- Linking tabs from the menu to a minimised tab group left windows off screen.
+  - The group is restored first, and the linked window stays in front.
+- Settings of three features removed long ago are dropped from the file.
+  - combineIconsInTaskbar, replaceAltTab, groupWindowsInSwitcher.
+- Tabs restored after a restart: windows that share a title are restored too.
+  - A saved tab is matched by its window first, then by the nearest window.
+
+## version ss_2026.10.09
+
+- Tab groups are no longer kept separately for each virtual desktop.
+  - The tab of a window on another desktop is drawn at half opacity;
+    clicking it switches to that desktop.
+- The "Link to another tab group" menus work across virtual desktops.
+  - Tab groups are listed left to right by position, with their display's name.
+  - The menus used to say "Link to another group".
+- The first item of the tab menu shows the size of the tab group.
+- A new workspace saves only the tabs on the current desktop.
+  - With several desktops, the tabs on all desktops can be chosen instead.
+  - A restore switches no desktop and moves no window between desktops.
+- The tabs of an inactive tab group are drawn at 50% opacity (was about 38%).
+- Fixed WindowTabs freezing when the scale of a display is changed.
+- Fixed problems with windows that have a special resize frame, such as LINE.
+  - The frame could stick out of the tab group.
+  - The whole tab group could grow when such a window started and joined it.
+- Tabs no longer flicker when the desktop is switched.
+- Fixed windows dropping out of their tab group at a desktop switch.
+- Fixed a crash when a tab group held a borderless full-screen window.
+- The top-edge lock no longer covers another group's window in front of it.
+- WindowMargin.json is gone; frame windows around a window are found by themselves.
+- Restoring tab groups after a restart works in more cases.
+  - A window returns to its tab group on another desktop.
+  - A Store app's windows return after an update changed its version.
+  - Windows with the same title return to the tab group nearest to them.
+- Fixed pins and tab order being lost when WindowTabs is switched off and on.
+  - Windows on another desktop were dropped from their tab group.
+
+## version ss_2026.10.03
+
+- Maximizing or restoring a tab group is smooth.
+  - The other windows follow without animating and without flashing in front.
+  - The tab strip moves first; minimizing no longer waits for each window.
+- Fixes for "Prevent moving windows and resizing them from the top"
+  - The minimize, maximize and close buttons work in applications that draw
+    their own title bar.
+  - Windows Terminal, HmFiler, MassiGra, ...
+- Fixed a window flying off screen when the tab of a one-tab group was dragged
+  onto another group.
+- Fixed a window being put into more than one tab group across virtual desktops.
+  - A new workspace captures only the current desktop's tab groups.
+- Fixed the tab groups, colours and pins being lost on a slow start.
+- Fixed WindowTabs quitting instead of starting again after it froze
+  and was restarted automatically.
+- Pressing a tab no longer makes the application's toolbar flicker.
+- Settings
+  - A new Color page; every page has the same margins.
+  - The distance from the edge can be set separately for the left and the right.
+- A tab opened with "Right of this tab" goes right beside it, with its colours.
+- Tab names follow applications that do not announce title changes (PowerPoint).
+- Fixes for restoring closed tabs
+  - A window opened from the tab menu stays where it was opened for 15 seconds.
+  - If it then becomes a closed tab's document, that tab's place and colours
+    come back.
+
+## version ss_2026.10.01
+
+- Lighter and faster with many windows and tab groups.
+  - Virtual desktops are read on a thread of their own, settings are read without waiting, and a tab strip is drawn again only when it changes.
+  - Resizing a window no longer waits for the other windows of its group to follow.
+- Fixed a tab dragged over some windows dropping out of the strip and back in, over and over.
+- Fixed the tab groups being built twice when WindowTabs, started disabled, was switched on: two tabs for one window, and windows that could not be moved or minimized.
+
+## version ss_2026.09.30
+
+- Withdrawn because of a performance problem around virtual desktops
+
+- The tab outline can be chosen in the appearance settings.
+  - It applies without restarting, and the original S curve stays the default.
+  - Rounded and angular vertical lines, trapezoids, trapezoids cut away on the left or right, rounded and angular rectangles, among others.
+- The fields of the settings dialog look alike.
+  - Drop-downs, text fields and colour fields: one height, the text in the middle of the field, and the frames in one colour.
+- More of what "Prevent moving windows and resizing them from the top" needs
+  - The invisible band that stops the top edge from being dragged is now placed when the tabs are drawn downward as well
+  - The band sits directly behind the tab strip and in front of the window
+  - An application given a margin in WindowMargin.json draws its own frame in windows of its own, and the band goes in front of those too
+  - Fixed a window that an application opens dropping behind the window it came from
+- More of what virtual desktops need
+  - "Show this window on all desktops" no longer breaks the tab groups.
+  - "Show windows from this app on all desktops" likewise
+  - A tab group is drawn per virtual desktop, and the window's position and size are shared between them
+- A window opened from the tab menu now goes where it was asked to go
+  - It was in conflict with the code that puts a tab back in the seat it had when it was closed, when the two happened to share a title
+  - A tab that comes back to its old place no longer rearranges the tabs that were never closed
+- Removed the unused code for showing a whole tab group as one taskbar button
+- A window left off screen in no group is brought back on screen.
+- Notepad and other Store apps can now be opened in a new window from the tab menu and the new-tab hot key. The app decides whether it opens a window or a tab.
+
+## version ss_2026.09.21
+
+- "Prevent moving windows and resizing them from the top" is now a setting of each tab group.
+  - It is in the tab menu, under "tab group behaviour", beside the snap margin.
+  - The one in the settings dialog is what a new group starts from, and changing it there applies to every group.
+- More of what virtual desktops need
+  - A tab group no longer straddles two virtual desktops.
+  - A window sent to another desktop leaves its tab group.
+  - The menus that link a tab or a group into another group no longer offer groups that are on another desktop
+  - Several windows moved in task view, the screen that switches virtual desktops, arrive on the other desktop as one tab group
+
+## version ss_2026.09.18
+
+- This version marks ten thousand downloads (or thereabouts).
+- Added "Prevent moving windows and resizing them from the top".
+  - The title bar no longer starts a drag, and the top edge no longer resizes.
+  - It keeps a window from moving or resizing while its tabs are being used.
+  - An invisible band over the top border keeps the resize cursor from appearing, so the edge cannot be grabbed.
+  - Its height follows the scale of the display, so it still covers the border at 125% and above.
+  - Its height is measured from each window: how thick the border is differs between applications.
+  - The caption buttons and the top-left corner stay usable, measured per window.
+  - Some applications still move when dragged; those are put back where they were.
+- Tab menus open faster
+  - Right-clicking a tab no longer brings its group forward first, so the menu does not wait for every group to react
+- Added "Snap detached tabs by drop position".
+  - The display is quartered along its diagonals, and where the drop lands snaps the window to that half of it
+- Tab groups survive a spell with WindowTabs switched off
+  - The record of them is no longer overwritten while it is off, and switching it back on rebuilds them, even after a restart
+  - A start-up with the box ticked no longer rebuilds them behind it
+- Switching tabbing off for an application clears what it left behind
+- Tab tooltips no longer take keyboard focus from the application
+- A tabbed window left outside every monitor is put back on screen
+- Exiting no longer destroys the settings dialog from a thread that did not create it
+- The settings tabs line up on one row grid, the behaviour tab reads in order, and "tab position" is now "tab placement"
+
+## version ss_2026.09.12
+
+- Reduce overhead by streamlining processing during startup and normal use.
+  - Remove an unnecessary low-level mouse hook that intercepted mouse input system-wide.
+  - Remove the hook's dedicated thread. This eliminates the path through which settings UI delays could affect mouse input via the hook, and reduces overhead during normal use.
+  - Reuse previously read settings to reduce repeated parsing and data copying when looking up values.
+  - Reduce redundant lookups when checking automatic-grouping categories and shortcut key settings.
+  - Temporarily reuse drive information used to resolve application executable paths, reducing duplicate work when inspecting many applications.
+- Speed up both the first opening and reopening of settings.
+  - Prepare the dialog during startup and reuse it, allowing quick reopening after ordinary setting changes without rebuilding the dialog.
+  - Reopen on the Programs page and refresh settings values and lists.
+  - Fix some settings edits not taking effect after an invalid setting value was read.
+- Add a Shortcut Keys tab to settings.
+  - Add configurable shortcuts for selecting tabs 1–9, switching to the previous or next tab, and adding a new tab.
+  - Activate these shortcuts only while a managed window is active.
+- Expand workspace restoration and improve editing.
+  - Save and restore tab styling, pins, names and layout.
+  - Fix changes not being saved after deleting groups or windows from a workspace.
+  - Refine editor layouts and remove unwanted scrollbars.
+  - Initially display the workspace list collapsed.
+- Add options to the Behavior tab in settings.
+  - Choose between upward tabs that turn downward when they would extend off-screen, and tabs that always point downward.
+  - Add a setting to hide tabs while moving a window.
+  - Fix clicking an inactive tab's icon hiding the tabs when the option is set to hide them by clicking the active tab's icon.
+- Improve display when moving between monitors with different scaling (DPI).
+  - Scale settings checkboxes, radio buttons, tree headers and icons to match the monitor.
+  - Support monitor transitions in confirmation dialogs and color theme save/edit dialogs as well.
+- Improve dialog behavior.
+  - Add restart and exit confirmations.
+  - Disable tray commands and other conflicting actions while settings or confirmation dialogs are open to prevent overlapping dialogs.
+  - Show pending notifications after the currently open dialog closes.
+  - Support copying confirmation and notification dialog contents with Ctrl+C.
+
+## version ss_2026.09.08
+
+- Fixed a window staying invisible at the off-screen minimized position
+  - Happened when a minimized group was restored
+  - Present since ss_2026.07.14
+  - A window found there is now put back where its group is
+
+## version ss_2026.09.04
+
+- Per-application settings now survive the application's own updates
+  - A Store app, or an application that keeps each version in a directory of its own such as LineMediaPlayer.exe, counted as a new application after every update, and its tab settings were lost
+- Every JSON file WindowTabs ships is now a default, overridden by your own file under `%APPDATA%\WindowTabs\Settings`
+  - Languages moved from `Language\` to `Settings\Language\`, and `Window_Margin.json` is now `WindowMargin.json`
+  - See the README for how, and for moving files edited under an earlier version
+  - The installer no longer backs up edited files
+- A tab that leaves its group (hidden, moved off-screen, or its application switched off in the settings) keeps its state
+  - Position, colour, underline, pin and name come back when the window returns or is reopened
+
+## version ss_2026.09.02
+
+- The installer no longer carries any script
+  - Its file maintenance moved into WindowTabs.exe, and clearing stale files now uses Windows Installer's own mechanism
+  - The embedded encoded PowerShell was under suspicion of being what made Defender report the installer as a trojan, so it has been taken out
+
+## version ss_2026.08.31
+- This version marks the day every Japanese person remembers from their school days: the last of the summer holiday, spent wrestling with a mountain of homework.
+- Tab groups now come back after a Windows restart or a logoff
+  - Windows are found again by their application and title, so a group returns however late its applications start
+  - Name, pin, colours and left/right alignment come back too, and the tabs return to their saved order
+  - A window whose title has not settled waits rather than take a place that is not its own, and takes its own when its real title appears
+  - What was saved for a window that has not reopened is kept: thirty days for one that has not started, eight for a tab closed by hand
+  - The groups are frozen as of the shutdown notification, so applications closing during it cannot overwrite them
+- Turning on Auto Grouping or a Category in the Programs tab now also gathers the windows that are already open
+  - They go through the same path a newly opened window takes, so a window pulled out of its tabs joins the others
+  - A tab pulled out by hand while the setting is already on stays out
+
+## version ss_2026.08.28
+- Fixed the settings file being emptied while WindowTabs was running: a saved value holding a "//" - a renamed tab carrying a URL - was cut short by the JSONC comment strip, which broke the whole file and made the next save write defaults over it
+- A settings file that can no longer be read is now repaired from the newest sound backup, and the unreadable one is kept as `WindowTabsSettings.txt.corrupt.<timestamp>`
+- Until that succeeds nothing is saved at all, so a failed read can no longer come back as defaults written over real settings
+- The settings file is backed up before the first overwrite of each session and on any sharp shrink (`WindowTabsSettings.txt.bak.<timestamp>`, ten kept), and every read failure is recorded in `WindowTabsSettings.txt.read_error.log`
+- Fixed tab drag and drop stopping, and newly opened windows no longer being tabbed, until WindowTabs was restarted
+
+## version ss_2026.08.24
+- Fixed the settings dialog's Behavior-tab rows growing to nearly double height (forcing a scrollbar) on some machines
+  - Windows fixes one session-wide "system DPI" from the scale of the primary display at sign-in
+  - Cause: with a system DPI above 96, WinForms pre-scales control metrics on its own before the dialog captures them as its 96-dpi design values
+  - Fix: the design metrics are snapshotted right after construction, the first layout runs with the design font, and the design is re-asserted after the window is shown, so the capture can no longer be polluted whatever the system DPI is
+- Release build script: verifies that the merged exe still carries the PerMonitorV2 DPI-awareness manifest
+
+## version ss_2026.08.21
+- Tab strips are now per-monitor DPI aware: on displays scaled above 100% they are drawn at native resolution instead of being bitmap-stretched by Windows, at the same apparent size as before
+- Tab geometry, fonts, icons, hit-testing and context menus all follow the scale of the monitor the strip sits on, so displays at different scales are correct at the same time
+- The settings dialog is now per-monitor DPI aware: text is drawn sharp at the scale of the monitor it is on, and moving it to another monitor re-lays it out for that monitor's scale
+- Fixed the dialog being clamped to the work area on a 175% display (it may now overlap the taskbar instead of showing scrollbars), check-box rows reserving far too much height, dark-mode check/radio glyphs leaving a bright sliver, and toolbar captions staying tiny on scaled displays
+- Fixed a latent crash risk: fonts evicted from the render cache are no longer disposed while a control may still be using them
+
+## version ss_2026.08.12
+- Added 4 language files: Turkish, Polish, Vietnamese, Indonesian
+- Build script: the release build verifies the installer file list by name (Language/Settings vs WtSetup.wxs) and checks the actual MSI contents after build (guards against the ss_2026.07.16 MSI omission)
+
+## version ss_2026.07.17
+- Fixed: the MSI installer was missing the 6 language files added in ss_2026.07.16 (Korean, French, German, Italian, Spanish, Portuguese) — the Language menu listed them but they fell back to English; the zip package was unaffected
+
+## version ss_2026.07.16
+- Added 6 language files: Korean, French, German, Italian, Spanish, Portuguese (Brazilian)
+- Multi-monitor position menus: the current display is now marked with a localized "(here)" suffix instead of " *"
+- Fixed: after a display was turned on/off, context menus could lose the display direction names and the "(here)" mark, and screen-targeted snaps could land at the main display's top-left (stale WinForms screen cache; now refreshed on every menu build)
+- Fixed: "Align all tabs to Left/Right" (and the snap-triggered realignment) reversed the tab order; the tabs now keep their relative order
+- Tab context menu: renamed "Tab Position" to "Tab Alignment" in all languages so it no longer overlaps with "Position Move"
+- Tab context menu: "Rename this tab", "Reset this tab name" and "Copy window title" show their name suffix again (their values can differ from the target-tab header); the reset item hides the name while disabled
+- Multi-select labels: when the right-clicked tab is not part of the selection, items now read "Selected {N} tabs + target tab ..." instead of silently counting it into {N}
+
+## version ss_2026.07.14
+- Group minimize/restore: only the operated window animates, no flash on the others; fixed glitches — restored window not coming to front, shrinking windows, minimize/restore oscillation, stuck hover color, brief freeze
+- Tray menu: added "Check for Updates" — on-demand check of the latest GitHub release, install after confirmation (MSI runs the installer; zip updates in place and restarts)
+- Tray menu reorganized: version at top, bold "Settings" as default (double-click) action, update check grouped with restart/exit
+- Tab context menu: "Target tab : <name>" header added; per-tab items no longer repeat the tab name ({TabName} or {0} in translations restores it)
+- Drag preview: shows the window's actual look (was a Windows 7 style frame); right-aligned tabs drawn right-aligned
+- Closed-tab restore: a window closed and reopened while WindowTabs runs returns to its former group/position with color, pin, rename, alignment (cleared on restart)
+- Fixed: pin/unpin could leave the saved tab order stale, restoring in the wrong order after restart
+- Fixed under high load: closing a grouped window could shrink the others to minimum (#13); clicking a resize edge could remove the others from the group (#12)
+- Fixed: a second instance could show an error dialog instead of the "already running" message
+- README: download badge now shows the exact count (e.g. "6,512", not "6.5k"), recounted by GitHub Actions every 6 hours and on each release
+
+## version ss_2026.07.10
+- Fixed: WindowTabs could freeze (and be auto-restarted by the watchdog) when the display count or resolution changed
+- Multi-monitor: position menus now appear once per display (the current display is marked with " *")
+- Context menus reorganized: the "Snap Other" submenu was flattened into the position menu, and the launch / detach / rename items now show their target tab name (e.g. "Detach this tab : <name>")
+- New Behavior setting: on a left/right snap, tabs of a uniformly-aligned group realign to the snap side (default on)
+- The tab of a single-tab group can now be dragged inside the strip to change its left/right alignment
+
+## version ss_2026.07.06
+- Version prefix changed from `ss_jp_` to `ss_`
+  - The `jp` originally indicated a Japanese-language build, but this fork has since gained multi-language support and is no longer Japanese-only, so the `jp` suffix no longer makes sense
+  - Past releases keep their original `ss_jp_...` names (release tags, historical entries in this file); only new releases from 2026.07.06 onward use the `ss_...` prefix
+- Fixed: tab tooltip could stay on screen after the cursor left the strip
+  - Happened when the cursor moved off via a screen edge or to another display, so no mouse-leave event fired
+  - A 200 ms cursor-position poll now force-hides the tooltip
+- Context menu: once a submenu opens to the left, its child submenus also open to the left
+  - Previously a deeper submenu could wrap back to the right and cover earlier levels
+  - The position is corrected before the submenu becomes visible (CBT hook + WM_WINDOWPOSCHANGING rewrite), so there is no flicker
+
+## version ss_jp_2026.06.24
+- Tab-group state is now saved every 10 seconds (previously only on graceful shutdown), so a force-quit (Task Manager kill, crash, power loss) no longer loses the session
+  - Atomic write (temp file + replace) so a force-quit mid-write cannot corrupt the settings file
+  - Dirty check skips the disk write when nothing has changed, keeping the steady-state cost negligible
+- A tab joining an existing group now inherits the alignment of that group's last tab, regardless of the joining window's previous per-tab alignment, and lands at the rightmost slot accordingly
+  - All-left group → joiner becomes left-aligned; any right-aligned tab in the group → joiner becomes right-aligned
+  - Applies to auto-grouping and to the menu commands "Move tab to another group", "Link tab group to another group", and "Detach and link tab to another group" (the latter two route through the move-tab path)
+  - "New Tab" (which still matches the invoker tab) and startup restore (which uses saved values) are unchanged
+
+## version ss_jp_2026.06.22
+- High-DPI: fixed several hit-test and rendering bugs at non-integer DPI scales (150% / 175% / etc.) and on multi-monitor mixed-DPI setups
+  - Fixed: Close/Pin button hover and click were offset from the visible button at non-integer DPI scales
+  - Fixed: tab-rename input box was offset and oversized at non-integer DPI
+  - Fixed: at non-integer DPI the rightmost right-aligned tab lost hover at its right edge (incl. the Close button) because the draw-correction left a transparent right margin that the layered strip passed through as click-through; that margin is now an invisible hit-testable fill, and the hover no longer vanishes on a spurious WM_MOUSELEAVE while the cursor is still over a tab
+- Tab hit-test (independent of DPI):
+  - Fixed: hovering/clicking a tab behind an overlapping tab (incl. its Close/Pin button) was stolen by the front tab
+  - Fixed: the last tab in a group had a wider hover area than the others (it extended to the trapezoid's slanted bottom edge); its hit width is now trimmed by half the overlap to match every other tab
+
+## version ss_jp_2026.06.06
+- Fixed: dragging the only tab of a single-tab group could crash WindowTabs (regression from the 2026.06.02 multi-select drag-reorder).
+- Build script: retry temp folder cleanup with a 5-second wait (avoids leftover folder from sync locks).
+
+## version ss_jp_2026.06.02
+- Multi-select tab drag-reorder: dragging a selected tab now moves the whole contiguous selected range together (= active tab + adjacent selected tabs that share the same pin state and alignment) as a single block.
+  - Visual: the group slides as one block during drag, preserving the normal Chrome-style overlap between members; non-dragged tabs slide aside for the whole group, not just one tab.
+  - Swap timing: the group's leading edge crossing the next tab's center triggers the swap; right-aligned multi-tab uses the group center to match the visual expectation.
+  - Smart-pin (also unified for single-tab drag): an all-unpinned group whose right neighbor is pinned becomes pinned; an all-pinned group whose left neighbor is unpinned becomes unpinned; otherwise the pin state is preserved.
+  - Selection persists across a successful drag; an accidental drag that ended without moving any tab still falls back to the click-to-reduce-selection behavior.
+
+## version ss_jp_2026.05.27
+- Fixed: incorrect behavior on maximize for apps configured in Window_Margin.json
+- Color theme settings: added missing "Selected" row label localization across all languages (was showing the raw key name)
+- Color theme: added "Dark Mono 2" preset (placed between "Dark Mono" and "Dark Red Frame" in the Appearance tab combo box)
+- Multi-select tab: added the feature; per-tab context menu items become selection-aware and operate on the active tab plus selected tabs when a selection is active
+  - Tab Pin / Tab Position: split into separate items with enable/disable; Left/Right items removed
+  - Tab Color Settings: Left/Right submenus removed; added "Clear all tabs"
+  - Close Tab: "Close other tabs" becomes "Close N unselected tabs"; Left/Right items disabled
+  - Tab Detach: renamed from "Tab Detach and Split"; Left/Right split items removed (covered by multi-select detach; ~1180 lines of impl removed)
+  - System: Copy path / Copy window title operate on all selected tabs (CR-LF joined); Open folder / Force kill disabled
+  - Single-tab only: Rename, Reset name, New launch
+
+## version ss_jp_2026.05.01
+- Restructured the Position Move submenu (used by tab group / detach / split menus).
+- Settings dialog: added dark mode support, toggled via the new "Dark Mode (Menu and Settings Dialog)" option on the View tab.
+- Settings dialog: fixed bugs that could leave the dialog un-openable after certain tray-menu operations.
+- Color editor: invalid hex input (empty / non-hex / too long) now silently falls back to 000000 instead of showing an error dialog.
+
+## version ss_jp_2026.04.22
+- Bug fix
+  - Build script: include the Settings folder in the portable ZIP distribution
+  - Performance: reduced CPU load for heavy apps like LibreOffice; improved tab-strip tracking and rendering
+- Installer: Language/Settings files are always rewritten with the new defaults on install/upgrade/repair; user-edited files are backed up to `Backup_YYYY-MM-DD_HH-MM-SS/` first (no folder when nothing changed; kept after uninstall)
+- Detach/Split position submenu: Snap Left/Right at top, rest under "Position Other"
+- Tab menu: "New tab" replaced by a "New launch : exe" submenu with 3 variants (in-group tab, new window with position, new window linked to another group; new-window variants bypass auto-grouping)
+- Pin Tab submenu: removed "Pin all tabs"/"Unpin all tabs" items and added a separator between the left-tab and right-tab groups
+- Tab Color submenu: added "Clear color" items next to this/left/right color submenus; removed the in-submenu "Clear color setting" item and the "All tabs color" submenu
+
+## version ss_jp_2026.04.12
+- Restructured Tab Position menu: "Align all" at top level, individual tab alignment in submenu
+  - Individual tab alignment menu now shows only the opposite alignment option (e.g. "Align this tab to Right" when currently left-aligned)
+- Unified tab name truncation across all menus (12 half-width chars, full-width counts as 2)
+- Renamed localization keys: TabPositionMenu→TabAlignMenu, AlignGroupTopLeft/Right→AlignTopLeft/Right, AlignLeftTabsFormat/Right→AlignLeftTabsChange/Right
+- Restructured Move/Snap menu: Snap Left/Right at top level, Move submenu inside "Position Other"
+- Removed "Combined Move and Snap Menu" setting and all related split menu code
+- Internal: unified the redundant `lorder` and `visualOrder` tab list representations into a single `visualOrder` list, kept canonically sorted as left-pinned, left-unpinned, right-pinned, right-unpinned so the stored order always matches the on-screen order
+- Restructured Tab Color Settings menu: color selection in submenus per scope (this tab, left/right tabs, all tabs) with shared "Clear color setting" item
+  - Checkmarks and toggle-off behavior now apply only inside the "this tab" submenu; left/right/all-tab submenus always apply the clicked color without showing checkmarks
+  - Renamed "Reset" to "Clear color setting" across all languages
+- Renamed "Move Other" menu to "Position Other"
+- Replaced "Corner" submenu with "Move" submenu containing edge and corner positions
+- TopMost windows are no longer excluded from tab management
+- Added System submenu: copy exe path, copy window title, open exe folder, force kill process
+- Restructured Pin Tab submenu
+  - Items are ordered as pin/unpin this tab, paired pin/unpin left and right tab actions, then pin/unpin all tabs
+  - Left/right tab counts include all tabs on the specified side regardless of alignment or pin state (including the target tab)
+
+## version ss_jp_2026.03.25
+- Fixed: Changing tab alignment now correctly repositions pinned/unpinned tabs within the new alignment group
+- Simplified pin/unpin and align left/right tab menu text by removing alignment group name
+- Removed "Reset color" text variant from apply color left/right menu (always shows "Apply color" regardless of current tab's color state)
+
+## version ss_jp_2026.03.24
+- Fixed: "New Tab" did not move to the correct position when the invoking tab was right-aligned
+  - New tabs were created with the default alignment, causing incorrect behavior
+- Fixed: Pin/unpin tab position now correctly stays within the same alignment group
+- "New Tab" created from a pinned tab is now automatically pinned
+
+## version ss_jp_2026.03.23
+- Fixed: Tab drag & drop position calculation was too sensitive, causing tabs to swap with minimal movement
+  - Restored original step-based calculation where tab position only changes when dragged tab's center passes the next tab's start position
+- Fixed: Auto-pin/unpin on drag now only considers tabs in the same alignment group
+  - Previously, dragging an unpinned tab between pinned tabs of different alignment groups would incorrectly pin the tab
+
+## version ss_jp_2026.03.22
+- Removed Center tab alignment option (Left and Right only)
+  - Existing Center settings are automatically converted to Left
+- Added per-tab left/right alignment feature
+  - Drag & drop to switch between left and right alignment
+  - Close left/right tabs, pin/unpin left/right tabs, apply color to left/right tabs, split left/right tabs now correctly account for per-tab alignment
+- Tab Position menu: renamed "Left"/"Right" to "Align Left"/"Align Right", added "Align all tabs to Left/Right" options
+- Tab Position menu: added "Align X left/right tab(s) in [group] to [target]" menu items
+  - Operates within same alignment group, similar to pin left/right tabs
+- Apply color left/right menu shows "Reset color" text when current tab has no color settings
+
+## version ss_jp_2026.03.18
+- Added "Apply color to X left tab(s)" and "Apply color to X right tab(s)" menu items
+- Changed Pin tab menu: "Pin/Unpin left/right tabs" now toggles based on current tab's pin state
+- Changed per-exe margin from single value to 4-direction (top, left, right, bottom) support
+  - Added Settings/Window_Margin.json for user-configurable per-exe margin settings
+  - Margins are loaded at startup from the JSON file next to the executable
+  - Installer preserves existing settings file on upgrade (NeverOverwrite); creates if not exists
+- Fixed: Auto-grouping now triggers on window activation (HSHELL_WINDOWACTIVATED) in addition to window creation
+
+## version ss_jp_2026.03.07
+- Added "Same position" option to Detach, Split Right, and Split Left position menus
+- Fixed tab color and pinned state not being preserved when splitting, detaching, or linking tabs to another group
+  - Tab color and pinned state now use global HWND-keyed storage (same pattern as renamed tab names)
+- Tab colors: Red, Blue, Green, Yellow, Purple, Orange, Pink
+- Added underline color type and border color type
+- Tab Color menu
+  - Checkmark overlay on the color icon when the tab's current color matches
+  - "Reset this tab color" is disabled when the tab has no color set
+  - "Reset all tab colors" is disabled when no tabs in the group have colors
+
+## version ss_jp_2026.03.01
+- Added per-tab color fill feature
+  - Tab context menu: "Tab Color Change" submenu with 6 color options (Red, Blue, Green, Yellow, Purple, Orange)
+  - Semi-transparent (40% transparent / 60% opaque) color overlay on tab background
+  - "Reset this tab color : tab name" and "Reset all tab colors" options
+
+## version ss_jp_2026.02.26
+- Added pinned tab feature
+  - Pinned tabs display as icon-only with narrow width (50px) and are positioned on the left side
+  - Context menu: "Tab Pin" submenu with Pin/Unpin this tab, Pin all, Unpin all, Pin left tabs, Unpin right tabs
+  - VSCode-style cross-zone drag and drop
+    - Dragging a tab into the pinned zone automatically pins it
+    - Dragging a tab into the unpinned zone automatically unpins it
+  - Pinned tabs show unpin button (VSCode-style tilted pushpin icon) always visible
+  - Pinned Tab Width setting uses radio buttons: "Icon Only" or "Specify Width" with numeric input
+  - Pin icon uses Segoe MDL2 Assets system font (E718 glyph) for high-quality rendering
+- Settings UI: renamed appearance labels for clarity (Tab Height, Tab Width (Max), Pinned Tab Width, Tab Overlap)
+- Removed "Tab Width" (Icon Only / Icon and Text) feature from context menu and settings
+  - Removed "Toggle tab width on active tab icon double-click" setting from Behavior tab
+- Changed "hide on active tab double-click" to single-click (icon click) when tabs are at bottom
+
+## version ss_jp_2026.02.23
+- Programs tab: "Show all settings" checkbox to display settings for programs not currently running
+  - Added [x] delete button on non-running process rows to remove settings
+- Per-tab-group tab position: each tab group can have its own Left/Center/Right alignment via context menu
+  - Tab position setting in Behavior tab changed from radio buttons to ComboBox
+- "Add tab height margin when snapping" is now a per-tab-group setting
+- Snap percent menu: added Center, Center Horizontally, Center Vertically options
+- Snap Maximize: changed from submenu to direct menu items (Snap Display / Snap Desktop)
+- Tooltip: immediately update to new tab's content when switching tabs (no delay)
+  - Tooltip stays visible when mouse moves to tab's rounded edge area
+- Tab border area at screen edge now responds to mouse clicks (no longer passes through to desktop)
+
+## version ss_jp_2026.02.21
+- Tab close button is now only shown on hover (hidden when not hovered)
+  - Tab title text uses fade-out gradient instead of ellipsis ("...") when text overflows
+- Snap percent menu order reversed: 90% 70% 50% 30% (most useful first)
+- Fix: icon double-click now works on transparent areas of the icon
+- New setting: "Add tab height margin when snapping" offsets snap/move-top positions by tab height
+- Active tab double-click now opens tab rename UI
+  - When "Hide when double-clicking active tab" option is on and tabs at bottom, double-click hides tabs instead
+
+## version ss_jp_2026.02.20
+- Auto-grouping: new tabs are now placed next to existing tabs of the same exe instead of at the end
+  - Works for both category-based and same-process auto-grouping
+- "New Tab" menu: new tab is now inserted to the right of the invoking tab instead of at the end
+
+## version ss_jp_2026.02.19
+- Change settings JSON keys from camelCase to PascalCase for consistency with localization keys
+  - Backward compatible: reads settings case-insensitively so old camelCase files still work
+- Keep tab strip visible during window move/resize
+  - Tabs now follow the window position in real-time while dragging
+  - Background windows are still hidden off-screen during move as before
+- Slightly reduce internal overhead when closing tabs
+- Rename WtSetup\README.md to README.txt to avoid duplicate README.md in project
+- Major restructuring of context menu layout
+  - Place move items at top level
+  - Move close tab items into a submenu
+  - Replace tab width toggle menu item with "Tab Width" submenu
+- Combine move and snap menu items into split items with left/right click detection
+  - Left click = move to edge, right click = snap
+  - Add "Combined Move and Snap Menu" checkbox to Appearance settings
+    - Default ON: split items with left/right click detection and hover effect
+    - OFF: separate move and snap items (classic layout)
+- Use format strings ({0}) for "New Tab" and "Close Tab" menu items
+- Improve tab name editing
+  - Replace rename/restore items with "Tab Name" submenu (reset is always shown but disabled when not renamed)
+  - Stop rendering renamed tab names in italic font
+  - Confirm rename when input field loses focus (instead of canceling)
+- Update README.md and README_Japanese.md
+
+## version ss_jp_2026.02.12
+- Re-release: The ZIP in version ss_jp_2026.02.11 contained a non-working exe.
+  No code changes were made. Both ZIP and MSI have been rebuilt and replaced.
+- Merge build_installer.bat and build_release_zip.bat into a single build_release.bat
+  - Add ILRepack merge verification to prevent shipping unmerged exe
+  - Use /t:Rebuild to ensure clean build state
+
+## version ss_jp_2026.02.11
+- Hide Auto Grouping checkbox in Programs tab when Tabs checkbox is OFF
+- Add category-based auto-grouping
+  - Automatically group apps with the same category
+    - E.g., Auto-group MS Office apps into the same tab group
+    - E.g., Auto-group Chrome, Edge, Firefox into the same group
+  - Add category columns to Programs settings tab
+  - Sort Programs tab items by category for better visibility
+
+## version ss_jp_2026.02.10
+- Add Windows virtual desktop (Win+Tab) support
+  - UWP apps (Settings, Calculator, etc.) are properly hidden when on other virtual desktops
+  - Tab group state is preserved across all virtual desktops during WindowTabs restart
+
+## version ss_jp_2026.02.05
+- Redesign reposition menu structure
+  - Top level: Same position, Move Left/Right, Snap Left/Right
+  - "Move Other" submenu: Top, Bottom, Top-Left, Top-Right, Bottom-Left, Bottom-Right
+  - "Snap Other" submenu: Left/Right/Top/Bottom with 30-90% options
+- Fix tab drag bug where mouse button release was not detected
+  - Use GetAsyncKeyState API to check physical mouse button state
+
+## version ss_jp_2026.02.02
+- Rename color theme property keys
+- Add text color and border color for each tab state
+- Redesign color settings GUI layout
+  - Display colors in grid format
+- Add custom color theme features
+  - Save/edit/delete custom themes
+  - Import/export themes via clipboard
+- Simplify tab group save/restore to use window handle only
+  - Tab groups, order, and renamed tab names all restored by hwnd matching
+
+## version ss_jp_2026.01.30
+- New Window from tab menu now always docks to current group
+  - Regardless of auto-grouping settings, new window launched from tab context menu will dock to the same tab group
+- Renamed tab names are now preserved across WindowTabs restart
+  - User-defined tab names are saved to settings and restored on startup
+- Rename "New Window" menu item to "New Tab" in tab context menu
+
+## version ss_jp_2026.01.29
+- Add watchdog to detect UI freeze and auto-restart
+  - Monitors UI thread responsiveness every 10 seconds
+  - Auto-restarts WindowTabs if UI is frozen for 30 seconds
+  - Preserves tab group configuration before restart when possible
+  - On watchdog restart, restores last saved state from previous normal shutdown
+
+## version ss_jp_2026.01.28
+- Fix excessive window switching when closing/restarting/disabling WindowTabs
+  - Skip "activate next tab" behavior during shutdown/restart/disable operations
+- Fix WindowTabs tabs appearing for invisible UWP apps (Settings, etc.)
+  - Add cloaked window detection using DwmGetWindowAttribute API
+  - UWP apps in cloaked state (suspended, virtual desktop, etc.) are now properly excluded
+- Fix virtual desktop switch causing return to previous desktop
+  - Skip "activate next tab" when window is cloaked (moved to another virtual desktop)
+- Preserve tab group configuration when disabling/enabling WindowTabs
+  - Tab order and separate groups are now restored after re-enabling
+- Preserve tab group configuration across WindowTabs restart
+  - Tab groups are saved on exit and restored on next startup
+
+## version ss_jp_2026.01.27
+- Add "Tab Detach and Split" parent submenu in tab context menu
+  - Add tab split functionality (split tabs from selected tab to right/left and reposition or link to another group)
+- Fix Installer: Language folder backup may not work in previous version
+  - Fixed timing and method to ensure backup works on upgrade and reinstall
+
+## version ss_jp_2026.01.24
+- Separate reset buttons per control in Appearance tab settings
+- Change color theme switching UI
+- Add "Hide tabs when window is fullscreen" option in Behavior tab
+- Rename background color labels for clarity (Normal → Inactive, Highlight → Mouse Over)
+- Reorganize tab context menu structure (tab operations first, then separator, then tab group operations)
+- Installer: Backup Language folder with timestamp (Backup_Language_YYYY-MM-DD_HH-MM-SS) before install
+
+## version ss_jp_2025.12.09
+- update README
+- build_release_zip.bat,build_installer.bat support VS2026
+- Support JSONC format for all JSON files (FileList.json, language files, settings) - allows // and /* */ comments
+- Add multi-language support
+  - Add Chinese Simplified and Chinese Traditional language support
+  - Add Japanese Kansai and Tohoku dialect language files
+  - Language files can be customized to support any language
+
+## version ss_jp_2025.11.24
+- Added "Disable" checkbox menu item in tray icon context menu
+  - When enabled, hides all tab groups and stops tab grouping
+  - Settings menu becomes disabled when Disable is enabled
+  - Disable state is now saved to settings file and persists across restarts
+- Fix background window resize visual glitch and improve performance
+  - Background windows now move and resize simultaneously instead of sequentially
+  - DPI-aware logic: Same DPI uses fast single-step move for better performance, different DPI uses position-first approach to handle scaling correctly
+  - Significantly faster window resizing and movement operations
+- Fix window size issue when linking tabs to maximized group across different DPI displays
+- Improve Windows Installer to prevent duplicate entries and preserve installation path after uninstall
+
+## version ss_jp_2025.11.20
+- Add tab width toggle feature per tab group
+  - Added "Make tabs wider" / "Make tabs narrower" menu items to tab context menu
+  - Tab width can be toggled individually for each tab group
+  - Added "Toggle tab width on active tab icon double-click" setting in Behavior tab
+- Remove "Hide after specified time when maximized only" option from hide tabs settings
+- Fix tab rename floating textbox positioning on high-DPI displays
+- Add "Detach and link tab to another group" and "Link tab group to another group" features to tab context menu
+- Update README.md documentation
+
+## version ss_jp_2025.11.14
+- Reorganize tab context menu structure
+  - Rename "Move tab" → "Move tab to another group"
+  - Rename "Detach tab / Move window" → "Detach tab"
+  - Add "Reposition tab group" menu with display edge positioning options
+- Update README.md documentation
+
+## version ss_jp_2025.11.13
+- Add Windows Installer (MSI) with build scripts (build_installer.bat, build_release_zip.bat)
+- Enable ILRepack to merge DLLs into single executable (WindowTabs.exe, WindowTabs.exe.config, version.md, README.md)
+- Add Windows Terminal UWP support in "New Window" menu
+- Remove unnecessary folders and files from repository
+- Change distribution format from exe/WindowTabs/ to WindowTabs.zip
+
+## version ss_jp_2025.11.10
+- Add menu dark mode support
+  - Added "Menu Dark Mode" checkbox in Appearance settings
+  - Enables dark mode for popup menus (tab context menu, drag-and-drop menu)
+- Implement runtime language switching without restart
+  - Replaced .NET resource system with code-based localization (Localization.fs, Localization_en.fs, Localization_ja-JP.fs)
+  - Language changes take effect immediately, removed dependency on resx files and WindowTabs.resources.dll
+- Enhance tab detach functionality with multi-display support
+  - Display-specific submenus with DPI-aware percentage-based positioning
+  - Current display menu is disabled, and "Same position and size" changed to "Same position"
+
+## version ss_jp_2025.10.09
+- Fix tab drag and drop for all alignment settings (left/center/right)
+  - Tab reordering within same group: cursor position follows tab correctly
+  - Tab separation with preview: cursor grabs scaled preview at correct position
+  - Window drop position: respects tab alignment when placing window from preview
+- Change UI controls in Behavior tab from ComboBox to RadioButton
+  - Tab position setting
+  - Hide tabs when positioned at bottom setting
+- Improve tab drag and drop to limit window size to display size
+  - Automatically resize window if it exceeds monitor dimensions when dropped
+
+## version ss_jp_2025.09.26
+- Add icons to "Move tab" menu items
+  - Display exe icon from first tab of each group
+- Improve "Move tab" menu filtering logic
+  - Check if moving tab actually belongs to a group using hwnd list
+  - Fix issue where groups with same-named tabs were incorrectly excluded
+
+## version ss_jp_2025.09.25
+- Improve "Move tab" menu to always show latest state
+  - Update all group infos synchronously when menu is opened
+  - Validate window handles with IsWindow API to prevent showing non-existent groups
+  - Exclude single-tab groups that only contain the tab being moved
+  - Remove all unnecessary update calls from individual operations
+
+## version ss_jp_2025.09.23
+- Fix "Move tab" menu not updating properly
+  - Remove group info when last tab closes
+  - Update group info after detach/drag/drop operations
+
+## version ss_jp_2025.09.22
+- Improve default settings management
+  - Made these 3 settings instantly apply from settings dialog instead of tab group:
+    - Tab width (narrow/wide) setting
+    - Tab position (left/center/right) setting
+    - Hide tabs when positioned at bottom setting
+- Fix appearance settings to apply immediately
+  - Height (pixels)
+  - Distance from edge when tabs up
+  - Distance from edge when tabs down
+- Add tab detach functionality
+  - Added "Detach tab" submenu to context menu
+  - Can detach tab at same position and size
+- Enhance tab detach menu with positioning options
+  - Added options to move to display edges (right/left/top/bottom)
+- Improve tab drag and drop behavior
+  - Keep dropped windows within display boundaries
+- Add "Move tab" menu to transfer tabs between groups
+  - Shows other groups with tab names (adaptive truncation: 1-22, 2-9, 3+-5 chars)
+  - Multi-language support with proper thread safety and error handling
+
+## version ss_jp_2025.09.04
+- Improve DPI handling for tab drag and drop
+  - Changed drop operation from SetWindowPlacement to SetWindowPos API
+  - Added window state restoration before positioning in both hide and drop operations
+- Improve DPI handling for tab docking
+  - Changed docking operation from MoveWindow API to SetWindowPos API
+  - Implemented dynamic DPI change detection using GetDpiForWindow API
+- Fix appearance settings not applying correctly
+  - Fixed field order mismatch causing color settings to be offset
+  - Preserves internal fields like tabHeightOffset when updating appearance
+- Fix reset button not immediately applying color changes
+  - Added event suppression to prevent race conditions during UI updates
+  - Colors now reset correctly on first button click
+- Update appearance settings UI buttons
+  - Changed "Dark Mode" to "Dark Color" and "Dark Mode (Blue)" to "Dark Blue Color"
+  - Added "Light Color" button for applying light theme colors only
+  - Reset button now only resets size settings, preserving color choices
+
+## version ss_jp_2025.08.30
+- Add "Hide when double-clicking active tab" option
+  - Added new option to "Hide tabs when positioned at bottom" in Behavior settings
+  - Hides tabs when double-clicking the active tab (tabs must be positioned at bottom)
+  - Shows tabs immediately when mouse hovers over hidden tab area
+  - Prevents hiding when double-clicking inactive tabs (only works on already active tab)
+
+## version ss_jp_2025.08.24
+- Activate next window when closing active tab
+- Modify tab context menu display to show tab names and counts
+
+## version ss_jp_2025.08.20
+- Unify tab alignment setting across window inside/outside positions
+  - Single setting for tab alignment (left/center/right) regardless of tab position
+- Improve tab auto-hide functionality  
+  - Increased delay from 100ms to 1000ms when mouse leaves tabs
+  - Changed to "Hide tabs when down" with three modes: Never/Maximized only/Always
+  - Added context menu submenu and default setting in Behavior tab
+  - Backward compatibility with old boolean settings
+- Add default settings in Behavior tab
+  - "Default: Make tabs narrower" - new tab groups start with narrower tabs
+  - "Default: Tab position" - dropdown for Left/Center/Right default position
+- Rename Appearance tab indent options
+  - "Indent for Tabs Down" and "Indent for Tabs Up"
+- Prevent tab switching flash when tabs are inside window
+  - Temporarily set TOPMOST flag during tab switch for smooth transition
+- Improve clarity of settings labels
+  - Made tab hide function labels clearer and simpler
+  - Added pixel unit labels to appearance settings
+  - Renamed and repositioned indent settings for better understanding
+- Improve settings dialog layout consistency
+  - Unified row height and column width across all settings tabs
+  - Increased label column width to prevent text wrapping
+- Fix context menu closing immediately due to tooltip conflict
+  - Hide tooltip when right-clicking to prevent interference with context menu
+- Add "Restart WindowTabs" menu item
+  - Added restart option in tray menu above "Close WindowTabs"
+  - Shared restart logic with language change functionality
+- Add configurable delay for auto-hide tabs feature
+  - Added "Delay before hiding tabs" setting in Behavior tab (default 3000ms)
+  - Replaced hardcoded 1000ms delays with configurable value
+
+## version ss_jp_2025.08.07
+- Disable tab rename on double-click
+  - Removed double-click rename functionality from tabs
+  - Tab rename can still be accessed via right-click context menu
+  - Reduces accidental tab renaming
+
+## version ss_jp_2025.08.06
+- Add language switching functionality
+  - Added Language submenu in tray icon context menu (English/Japanese)
+  - Auto-restart application with confirmation dialog when language is changed
+  - Language setting saved to configuration file
+- Rename "Indent Flipped" to "Indent (Window Inside)" and "Indent Normal" to "Indent (Window Outside)"
+- Fix issue where WindowTabs tabs go behind UWP applications
+  - Added TOPMOST flag for all UWP app windows regardless of tab position
+  - Handle UWP app Z-order changes to maintain tab visibility
+  - Automatically remove TOPMOST flag when non-UWP window or window outside group gets focus
+  - Insert tabs after the new foreground window when removing TOPMOST
+- Prevent multiple settings dialogs from opening simultaneously
+  - Settings dialog closes existing instance before opening new one
+  - Only one settings dialog can be open at a time
+
+## version ss_jp_2025.08.04
+- Remove "Combine icons in taskbar" feature
+  - This feature is not supported on Windows 11
+  - Removed combineIconsInTaskbar setting from all related files
+  - Always pass false to createGroup() to disable SuperBarPlugin
+- Remove ALT+TAB replacement and task switcher features
+  - Removed replaceAltTab setting that replaced ALT+TAB with WindowTabs task switcher
+  - Removed groupWindowsInSwitcher setting that grouped windows in task switcher
+  - Deleted TaskSwitch.fs file and removed from project
+  - Removed all related UI controls and settings
+- Delete: Fix tabs overlap the minimize button when align right
+  - This item can be configured in the settings, so no source code modifications are necessary.
+- Improve Japanese translations for tab context menu
+- Add "Close tabs to the right" feature
+  - Added new menu item "Close tabs to the right"
+  - Closes all tabs positioned to the right of the current tab
+  - Added onCloseRightTabWindows method in TabStripDecorator.fs
+- Remove "Close all tabs of specific process" feature
+  - Removed menu item "Close all %s tabs in this window"
+  - Deleted onCloseAllExeWindows method
+  - Simplified tab closing options in context menu
+- Add "Close tabs to the left" feature
+  - Added new menu item "Close tabs to the left"
+  - Closes all tabs positioned to the left of the current tab
+  - Added onCloseLeftTabWindows method in TabStripDecorator.fs
+  - Menu item positioned right after "Close tabs to the right"
+- Remove "Don't use tabs for %s" and "Auto-group %s" menu items
+  - Removed menu item "Don't use tabs for %s"
+  - Removed menu item "Auto-group %s"
+  - These settings can be easily configured in the settings dialog
+  - Simplified tab context menu by removing redundant options
+- Reorganize tab context menu order for better user experience
+- Disable mouse wheel tab switching functionality
+  - Removed MouseScrollPlugin from Desktop.fs
+  - Deleted MouseScrollPlugin.fs file and removed from project
+  - Mouse wheel scrolling over tabs no longer switches between tabs
+
+## version ss_jp_2025.08.03
+- Fix null exception when toggling Fade out option
+  - leafOfTree commit: https://github.com/leafOfTree/WindowTabs/commit/dce4f67
+- Update Resources.ja-JP.resx hideInactiveTabs 
+- Fix desktop Programs title missing issue (from leafOfTree)
+  - Added missing "Programs" value in Resources.resx
+  - leafOfTree commit: https://github.com/leafOfTree/WindowTabs/commit/4314877
+- Add Font resource for UI consistency
+  - Added "Font" resource with value "Segoe UI" in Resources.resx
+  - leafOfTree commit: https://github.com/leafOfTree/WindowTabs/commit/ac0df82
+- Re-add SmoothNodeTextBox implementation for better text rendering
+  - Added SmoothNodeTextBox class with ClearTypeGridFit text rendering
+  - Updated TaskSwitch.fs to use SmoothNodeTextBox and increased RowHeight (36→48)
+  - Updated ProgramView.fs to use SmoothNodeTextBox and increased RowHeight (18→24)
+  - Updated WorkspaceView.fs to use SmoothNodeTextBox and increased RowHeight (18→24)
+  - leafOfTree commit: https://github.com/leafOfTree/WindowTabs/commit/a62c0d6
+- Add option to deactivate hotkeys ctrl+1,ctrl+2
+  - Added enableCtrlNumberHotKey setting to control numeric tab hotkeys
+  - leafOfTree commit: https://github.com/leafOfTree/WindowTabs/commit/c416a49
+- Update option default values and text
+  - Changed enableCtrlNumberHotKey Japanese text to "Activate tabs with Ctrl+1...+9"
+  - Changed enableCtrlNumberHotKey default value to false
+  - Changed hideInactiveTabs default value to false
+- Remove all peek code to fix alt-tab error
+  - Removed DWM preview functionality from TaskSwitch.fs
+  - Removed peekTimer, doShowPeek, and peekSelected method
+  - leafOfTree commit: https://github.com/leafOfTree/WindowTabs/commit/4fed82a
+- Add New window item to tab context menu
+  - Added "New window" option to tab right-click menu
+  - Launches a new instance of the same application
+  - leafOfTree commit: https://github.com/leafOfTree/WindowTabs/commit/96c6387
+- Improve task switch form appearance and window filtering
+  - Apply FormBorderStyle.None for modern borderless appearance
+  - Filter out windows with empty text and 'Microsoft Text Input Application'
+  - Enhance Alt+Tab experience
+  - leafOfTree commit: https://github.com/leafOfTree/WindowTabs/commit/3b4fd83
+- Add diagnostic view improvements
+  - Add button to copy settings file to exe path for easier troubleshooting
+  - Add toolbar separator for better UI organization
+  - Enhance support capabilities
+  - leafOfTree commits: https://github.com/leafOfTree/WindowTabs/commit/faf7623, https://github.com/leafOfTree/WindowTabs/commit/cf3089f
+- Fix WindowTabs own alt+tab collapse when there is no window
+  - leafOfTree commit: https://github.com/leafOfTree/WindowTabs/commit/5cb3cf5
+- Add a text color option to the setting appearance panel
+  - leafOfTree commit: https://github.com/leafOfTree/WindowTabs/commit/fce3a8d
+  - Added tabTextColor property to TabAppearanceInfo
+- Update text color in Resources.ja-JP.resx
+- Add color theme dark mode and dark mode blue variant
+  - leafOfTree commit: https://github.com/leafOfTree/WindowTabs/commit/d582a4f
+  - Added Dark Mode and Dark Mode (Blue) appearance options
+- Adjust dark mode blue colors
+  - leafOfTree commit: https://github.com/leafOfTree/WindowTabs/commit/e3f1df0
+  - Adjusted Dark Mode (Blue) color scheme for better visibility
+- Support mouse hover to active tab
+  - leafOfTree commit: https://github.com/leafOfTree/WindowTabs/commit/34d8dd1
+  - Added option to activate tabs on mouse hover
+
+## version ss_jp_2025.08.02
+- Fix Window Title Icon Size
+- Add tooltip support
+
+## version ss_jp_2025.07.19
+- Support compiles with VS2022 Community Edition.
+- Place WindowTabs.exe and required DLLs in the exe folder.
+- Multi-display support, multi-DPI support.
+
+## version ss_jp_2020.08.03
+- Japanese text support
+- Default tab alignment set to right
+- Default auto-hide set to false
+- ./exe/WindowTabs/WindowTabs.exe
+- Support compiles with VS2017 Community Edition.

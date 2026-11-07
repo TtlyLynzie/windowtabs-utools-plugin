@@ -1,0 +1,22 @@
+{
+  "main": "index.html",
+  "logo": "logo.png",
+  "preload": "preload.js",
+  "pluginSetting": {
+    "single": true,
+    "height": 640
+  },
+  "features": [
+    {
+      "code": "windowtabs",
+      "description": "启动和管理 WindowTabs",
+      "cmds": ["WindowTabs", "窗口标签"]
+    },
+    {
+      "code": "windowtabs-settings",
+      "description": "打开 WindowTabs 高级设置",
+      "mainHide": true,
+      "cmds": ["WindowTabs 设置"]
+    }
+  ]
+}
