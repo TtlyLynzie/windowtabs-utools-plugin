@@ -37,7 +37,7 @@ jobs:
 
       - name: Restore NuGet packages
         shell: pwsh
-        run: nuget restore WindowTabs-source\WindowTabs.sln -NonInteractive
+        run: nuget restore WindowTabs-source\WtProgram\packages.config -PackagesDirectory WindowTabs-source\packages -NonInteractive
 
       - name: Build patched WindowTabs core
         shell: pwsh
