@@ -1,0 +1,324 @@
+diff --git a/WtProgram/Program.fs b/WtProgram/Program.fs
+index cca6320..b0086a9 100755
+--- a/WtProgram/Program.fs
++++ b/WtProgram/Program.fs
+@@ -4329,7 +4329,7 @@ type Program() as this =
+             this.updateAppWindows()
+             
+ 
+-    member this.run(plugins:List2<IPlugin>) =
++    member this.run(ipcPipe: string option, plugins:List2<IPlugin>) =
+ 
+         // Initialize localization with language setting
+         let language =
+@@ -4377,6 +4377,16 @@ type Program() as this =
+ #endif
+         managerView.preload()
+ 
++        // The uTools bridge is optional. A normal standalone WindowTabs
++        // launch has no pipe argument and keeps the original behaviour.
++        let ipc =
++            match ipcPipe with
++            | Some pipe ->
++                let server = WindowTabsIpc.Server(pipe, fun message -> Debug.WriteLine(message))
++                server.Start()
++                Some server
++            | None -> None
++
+         plugins.iter <| fun p -> p.init()
+ 
+         SettingsBenchmark.install()
+@@ -4392,6 +4402,7 @@ type Program() as this =
+         | _ -> ()
+ #endif
+         Application.Run()
++        ipc |> Option.iter(fun server -> server.Dispose())
+         ShutdownDeadline.setStage "main plugins dispose"
+         ShutdownTrace.write "main message loop ended"
+ #if DEBUG
+@@ -4494,8 +4505,9 @@ let main argv =
+         with _ -> ()
+ 
+     TaskbarAppId.startRecovery()
++    let ipcPipe = WindowTabsIpc.pipeArgument argv
+     let program = Program()
+-    program.run(List2<obj>([
++    program.run(ipcPipe, List2<obj>([
+         CaptionDragPlugin()
+         NotifyIconPlugin()
+         ExceptionHandlerPlugin()
+diff --git a/WtProgram/WindowTabsIpc.fs b/WtProgram/WindowTabsIpc.fs
+new file mode 100644
+index 0000000..482b658
+--- /dev/null
++++ b/WtProgram/WindowTabsIpc.fs
+@@ -0,0 +1,249 @@
++namespace Bemo
++
++open System
++open System.IO
++open System.IO.Pipes
++open System.Text
++open System.Threading
++open System.Threading.Tasks
++open System.Diagnostics
++open System.Security.AccessControl
++open System.Security.Principal
++open Newtonsoft.Json
++open Newtonsoft.Json.Linq
++
++/// Small, versioned Named Pipe bridge used by the uTools host.
++/// The bridge deliberately exposes a whitelist of settings instead of the
++/// complete WindowTabs object graph. This keeps the public plugin contract
++/// stable while the native settings model evolves upstream.
++module WindowTabsIpc =
++
++    [<Literal>]
++    let protocolVersion = 1
++
++    [<Literal>]
++    let maxFrameBytes = 1024 * 1024
++
++    let private exposedSettings =
++        [| "IncludedPaths"; "ExcludedPaths"; "AutoGroupingPaths"
++           "HideInactiveTabs"; "GroupTaskbarButtons"; "EnableTabbingByDefault"
++           "EnableCtrlNumberHotKey"; "EnableAltNumberHotKey"; "EnableHoverActivate"
++           "EnableTabPreview"; "TabPreviewDelay"; "TabPreviewSize"
++           "TabCloseButton"; "TabPinButton"; "TabPositionByDefault"
++           "TabVerticalDirection"; "HideTabsWhenDownByDefault"
++           "HideTabsDelayMilliseconds"; "HideTabsOnFullscreen"
++           "HideTabsWhileMoving"; "LockWindowPosition"; "SnapTabHeightMargin"
++           "ChangeTabPositionOnSnap"; "SnapOnDragDetach"; "TabAppearance"
++           "IsDisabled"; "EnableDarkMode" |]
++
++    let private error code message =
++        JObject([| JProperty("ok", false);
++                  JProperty("error", JObject([| JProperty("code", code);
++                                                 JProperty("message", message) |])) |])
++
++    let private success result =
++        JObject([| JProperty("ok", true); JProperty("result", result) |])
++
++    let private response id body =
++        let result = body.DeepClone() :?> JObject
++        result.["id"] <- JValue(id)
++        result
++
++    let private normalizePipeName (value: string) =
++        if String.IsNullOrWhiteSpace(value) then invalidArg "pipeName" "IPC pipe name is empty."
++        elif value.StartsWith("\\\\.\\pipe\\", StringComparison.OrdinalIgnoreCase) then
++            value.Substring(9)
++        else value
++
++    let private pipeSecurity() =
++        let security = PipeSecurity()
++        let user = WindowsIdentity.GetCurrent().User
++        security.AddAccessRule(PipeAccessRule(user, PipeAccessRights.ReadWrite, AccessControlType.Allow))
++        security
++
++    let private jsonValue (token: JToken) =
++        if isNull token then null
++        else
++            match token.Type with
++            | JTokenType.Boolean -> box(token.Value<bool>())
++            | JTokenType.Integer -> box(token.Value<int64>())
++            | JTokenType.Float -> box(token.Value<double>())
++            | JTokenType.String -> box(token.Value<string>())
++            | _ -> token.DeepClone() :> obj
++
++    let private cloneExposedSettings() =
++        let root = Services.settings.root
++        let result = JObject()
++        for key in exposedSettings do
++            let value = root.[key]
++            if not (isNull value) then result.[key] <- value.DeepClone()
++        // runAtStartup is held by the Settings service because it controls the
++        // Windows Startup-folder shortcut rather than the JSON settings file.
++        result.["RunAtStartup"] <- JToken.FromObject(Services.settings.getValue("runAtStartup"))
++        result
++
++    let private validatePatch (patch: JObject) =
++        let allowed = Set.ofArray (Array.append exposedSettings [| "RunAtStartup" |])
++        let invalid =
++            patch.Properties()
++            |> Seq.map(fun p -> p.Name)
++            |> Seq.filter(fun name -> not (allowed.Contains(name)))
++            |> Seq.toArray
++        if invalid.Length > 0 then
++            invalidArg "patch" (sprintf "Unsupported settings: %s" (String.Join(", ", invalid :> seq<string>)))
++
++    let private applyPatch (patch: JObject) =
++        validatePatch patch
++        // All mutations happen through the service proxy. Calls from the pipe
++        // worker are marshalled to WindowTabs' owner thread by Services.
++        let root = Services.settings.root
++        for property in patch.Properties() do
++            if property.Name = "RunAtStartup" then
++                if property.Value.Type <> JTokenType.Boolean then
++                    invalidArg "RunAtStartup" "RunAtStartup must be boolean."
++                Services.settings.setValue("runAtStartup", box(property.Value.Value<bool>()))
++            else
++                root.[property.Name] <- property.Value.DeepClone()
++        if patch.Properties() |> Seq.exists(fun p -> p.Name <> "RunAtStartup") then
++            Services.settings.root <- root
++            Services.program.refresh()
++        cloneExposedSettings()
++
++    let private dispatch (request: JObject) =
++        match request.["version"] with
++        | :? JValue as value when value.Type = JTokenType.Integer && value.Value<int>() = protocolVersion -> ()
++        | _ -> invalidArg "version" "Unsupported IPC protocol version."
++        let methodName =
++            match request.["method"] with
++            | :? JValue as value when value.Type = JTokenType.String -> value.Value<string>()
++            | _ -> invalidArg "method" "method is required."
++        let parameters =
++            match request.["params"] with
++            | :? JObject as obj -> obj
++            | _ -> JObject()
++        match methodName with
++        | "hello" ->
++            success (JObject([| JProperty("coreVersion", Services.program.version);
++                               JProperty("protocolVersion", protocolVersion);
++                               JProperty("pid", Process.GetCurrentProcess().Id);
++                               JProperty("groupCount", Services.desktop.groups.length);
++                               JProperty("capabilities", JArray([| JValue("status") :> JToken; JValue("config") :> JToken; JValue("settings") :> JToken |]));
++                               JProperty("status", if Services.program.isShuttingDown then "stopping" else "ready") |]))
++        | "status" ->
++            success (JObject([| JProperty("running", not Services.program.isShuttingDown);
++                               JProperty("disabled", Services.program.isDisabled);
++                               JProperty("coreVersion", Services.program.version);
++                               JProperty("protocolVersion", protocolVersion);
++                               JProperty("groupCount", Services.desktop.groups.length);
++                               JProperty("pid", Process.GetCurrentProcess().Id) |]))
++        | "getCapabilities" ->
++            success (JObject([| JProperty("protocolVersion", protocolVersion);
++                               JProperty("capabilities", JArray([| JValue("status") :> JToken; JValue("config") :> JToken; JValue("settings") :> JToken |])) |]))
++        | "getConfig" -> success (cloneExposedSettings())
++        | "updateConfig" ->
++            match parameters.["patch"] with
++            | :? JObject as patch -> success (applyPatch patch)
++            | _ -> invalidArg "patch" "params.patch must be an object."
++        | "reloadConfig" ->
++            Services.program.refresh()
++            success (cloneExposedSettings())
++        | "openSettings" ->
++            Services.managerView.show()
++            success (JObject([| JProperty("opened", true) |]))
++        | "stop"
++        | "shutdown" ->
++            Services.program.shutdown()
++            success (JObject([| JProperty("accepted", true) |]))
++        | "restart" ->
++            Services.program.shutdown()
++            success (JObject([| JProperty("accepted", true); JProperty("restarting", true) |]))
++        | "logTail" ->
++            // Native diagnostics remain local. The first implementation has no
++            // stable log ring, so return an empty list rather than exposing an
++            // arbitrary file path over IPC.
++            success (JObject([| JProperty("lines", JArray()) |]))
++        | _ -> invalidArg "method" (sprintf "Unsupported IPC method: %s" methodName)
++
++    type Server(pipeName: string, log: string -> unit) =
++        let pipeName = normalizePipeName pipeName
++        let cancellation = new CancellationTokenSource()
++        let mutable task: Task = null
++
++        let handleClient (pipe: NamedPipeServerStream) =
++            use reader = new StreamReader(pipe, Encoding.UTF8, false, 65536, true)
++            use writer = new StreamWriter(pipe, Encoding.UTF8, 65536, true)
++            writer.AutoFlush <- true
++            let mutable connected = true
++            while connected && not cancellation.IsCancellationRequested do
++                let line = reader.ReadLine()
++                if isNull line then connected <- false
++                elif Encoding.UTF8.GetByteCount(line) > maxFrameBytes then
++                    writer.WriteLine((error "FRAME_TOO_LARGE" "IPC frame exceeds the size limit.").ToString(Formatting.None))
++                    connected <- false
++                else
++                    try
++                        let request = JObject.Parse(line)
++                        let id =
++                            match request.["id"] with
++                            | null -> ""
++                            | value -> value.ToString(Formatting.None)
++                        let body =
++                            try dispatch request
++                            with
++                            | :? ArgumentException as ex -> error "INVALID_REQUEST" ex.Message
++                            | :? InvalidOperationException as ex -> error "CORE_NOT_READY" ex.Message
++                            | ex ->
++                                log (sprintf "IPC request failed: %O" ex)
++                                error "INTERNAL_ERROR" ex.Message
++                        writer.WriteLine((response id body).ToString(Formatting.None))
++                    with
++                    | ex ->
++                        log (sprintf "IPC client disconnected after malformed request: %O" ex)
++                        connected <- false
++
++        let listen() =
++            try
++                while not cancellation.IsCancellationRequested do
++                    use pipe = new NamedPipeServerStream(
++                        pipeName, PipeDirection.InOut, 1, PipeTransmissionMode.Byte,
++                        PipeOptions.Asynchronous, 65536, 65536, pipeSecurity())
++                    pipe.WaitForConnection()
++                    if not cancellation.IsCancellationRequested then handleClient pipe
++            with
++            | :? OperationCanceledException -> ()
++            | :? ObjectDisposedException -> ()
++            | ex -> log (sprintf "IPC server stopped: %O" ex)
++
++        member _.Start() =
++            if isNull task then
++                task <- Task.Factory.StartNew((fun () -> listen()), cancellation.Token,
++                                              TaskCreationOptions.LongRunning, TaskScheduler.Default)
++
++        member _.Dispose() =
++            cancellation.Cancel()
++            // Connecting once wakes a blocking WaitForConnection so the loop
++            // can observe cancellation. The connection is local and carries no
++            // request data.
++            try
++                use wake = new NamedPipeClientStream(".", pipeName, PipeDirection.Out)
++                wake.Connect(100)
++            with _ -> ()
++            if not (isNull task) then
++                try task.Wait(1000) |> ignore with _ -> ()
++            cancellation.Dispose()
++
++    let pipeArgument (argv: string array) =
++        argv
++        |> Array.tryPick(fun arg ->
++            let prefix = "--windowtabs-ipc-pipe="
++            if arg.StartsWith(prefix, StringComparison.OrdinalIgnoreCase) then
++                Some(arg.Substring(prefix.Length))
++            else None)
++
++    let start (argv: string array) =
++        match pipeArgument argv with
++        | None -> None
++        | Some pipe ->
++            let server = Server(pipe, fun message -> Debug.WriteLine(message))
++            server.Start()
++            Some server
+diff --git a/WtProgram/WtProgram.fsproj b/WtProgram/WtProgram.fsproj
+index f1c4f57..ba4f871 100755
+--- a/WtProgram/WtProgram.fsproj
++++ b/WtProgram/WtProgram.fsproj
+@@ -259,6 +259,7 @@ if $(ConfigurationName) == Release (
+     <Compile Include="ManagerViewService/SettingsBenchmark.fs">
+       <Link>SettingsBenchmark.fs</Link>
+     </Compile>
++    <Compile Include="WindowTabsIpc.fs" />
+     <Compile Include="Program.fs" />
+     <EmbeddedResource Include="Resources\Bemo.ico" />
+     <EmbeddedResource Include="Resources\workspace.png" />
+@@ -307,6 +308,7 @@ if $(ConfigurationName) == Release (
+       <HintPath>..\Newtonsoft.Json.dll</HintPath>
+     </Reference>
+     <Reference Include="System" />
++    <Reference Include="System.Core" />
+     <Reference Include="System.Drawing" />
+     <Reference Include="System.Security" />
+     <Reference Include="UIAutomationClient" />
