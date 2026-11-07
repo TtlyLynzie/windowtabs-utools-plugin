@@ -1,0 +1,87 @@
+name: Build WindowTabs uTools plugin v4
+
+on:
+  workflow_dispatch:
+    inputs:
+      core_tag:
+        description: WindowTabs Git tag to build
+        required: true
+        default: ss_2026.11.06
+  push:
+    paths:
+      - '.github/workflows/build-plugin.yml'
+      - '.github/workflows/build-plugin-v4.yml'
+      - 'patches/**'
+      - 'native/**'
+      - 'plugin.json'
+      - 'index.html'
+      - 'renderer.js'
+      - 'styles.css'
+      - 'preload.js'
+      - 'package-plugin.sh'
+
+jobs:
+  build:
+    runs-on: windows-latest
+    env:
+      CORE_TAG: ${{ github.event.inputs.core_tag || 'ss_2026.11.06' }}
+
+    steps:
+      - name: Checkout plugin
+        uses: actions/checkout@v4
+
+      - name: Checkout WindowTabs source
+        shell: pwsh
+        run: |
+          git clone --depth 1 --branch "$env:CORE_TAG" https://github.com/standard-software/WindowTabs.git WindowTabs-source
+          git -C WindowTabs-source apply "$env:GITHUB_WORKSPACE\patches\upstream-ipc-v4.patch"
+
+      - name: Restore NuGet packages
+        shell: pwsh
+        run: nuget restore WindowTabs-source\WtProgram\packages.config -PackagesDirectory WindowTabs-source\packages -NonInteractive
+
+      - name: Build patched WindowTabs core
+        shell: pwsh
+        run: |
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          $msbuild = & $vswhere -latest -products * -requires Microsoft.Component.MSBuild -find MSBuild\**\Bin\MSBuild.exe | Select-Object -First 1
+          if ([string]::IsNullOrWhiteSpace($msbuild)) { throw 'MSBuild was not found.' }
+          & $msbuild "$env:GITHUB_WORKSPACE\WindowTabs-source\WtProgram\WtProgram.fsproj" /t:Rebuild /p:Configuration=Release /p:Platform=AnyCPU /v:minimal
+          if ($LASTEXITCODE -ne 0) { throw "MSBuild failed: $LASTEXITCODE" }
+
+      - name: Install helper and generate manifest
+        shell: pwsh
+        run: |
+          $source = Join-Path $env:GITHUB_WORKSPACE 'WindowTabs-source'
+          $program = Join-Path $source 'WtProgram\Program.fs'
+          $version = (Select-String -Path $program -Pattern 'let version = "([^"]+)"' | Select-Object -First 1).Matches[0].Groups[1].Value
+          $build = Join-Path $source 'WtProgram\bin\Release'
+          $target = Join-Path $env:GITHUB_WORKSPACE "helper\$version"
+          New-Item -ItemType Directory -Force -Path $target | Out-Null
+          Copy-Item (Join-Path $build 'WindowTabs.exe') (Join-Path $target 'WindowTabs.exe') -Force
+          foreach ($file in @('WindowTabs.exe.config', 'version.md')) {
+            $candidate = if ($file -eq 'version.md') { Join-Path $source $file } else { Join-Path $build $file }
+            if (Test-Path $candidate) { Copy-Item $candidate (Join-Path $target $file) -Force }
+          }
+          if (Test-Path (Join-Path $build 'Settings')) { Copy-Item (Join-Path $build 'Settings') $target -Recurse -Force }
+          $hash = (Get-FileHash (Join-Path $target 'WindowTabs.exe') -Algorithm SHA256).Hash.ToLowerInvariant()
+          [ordered]@{
+            version = $version
+            path = "$version/WindowTabs.exe"
+            protocol = 1
+            source = "https://github.com/standard-software/WindowTabs/releases/tag/$env:CORE_TAG"
+            sourceCommit = (git -C WindowTabs-source rev-parse HEAD).Trim()
+            sha256 = $hash
+          } | ConvertTo-Json | Set-Content helper\current.json -Encoding UTF8
+          Write-Host "Built $version ($hash)"
+
+      - name: Package plugin
+        shell: bash
+        run: bash package-plugin.sh
+
+      - name: Upload plugin artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: windowtabs-utools-plugin-${{ env.CORE_TAG }}
+          path: dist/windowtabs-utools-plugin.upx
+          if-no-files-found: error
