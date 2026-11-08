@@ -9,12 +9,18 @@
   <body>
     <main class="app-shell">
       <header class="hero">
-        <div>
-          <p class="eyebrow">uTools 插件</p>
-          <h1>WindowTabs</h1>
-          <p class="subtitle">用 uTools 管理 WindowTabs 原生核心</p>
+        <div class="brand-lockup">
+          <img class="brand-logo" src="logo.png" alt="WindowTabs" />
+          <div class="brand-copy">
+            <p class="eyebrow">uTools 插件</p>
+            <h1>WindowTabs</h1>
+            <p class="subtitle">在 uTools 中管理窗口标签</p>
+          </div>
         </div>
-        <span id="statusBadge" class="status-badge status-unknown">检测中</span>
+        <div class="hero-meta">
+          <span id="statusBadge" class="status-badge status-unknown" aria-live="polite">检测中</span>
+          <span id="pluginVersion" class="version-label">插件 0.2.2</span>
+        </div>
       </header>
 
       <section class="card status-card">
@@ -22,7 +28,7 @@
           <div>
             <h2>运行状态</h2>
             <p id="statusText" class="muted">正在连接 WindowTabs…</p>
-            <p id="legacyHint" class="muted" hidden>兼容模式表示当前旧版核心已启动，但尚未提供 uTools IPC；WindowTabs 的托盘功能仍可使用。</p>
+            <p id="legacyHint" class="muted" hidden>当前核心不支持 uTools 设置界面，请通过系统托盘管理 WindowTabs。</p>
           </div>
           <button id="refreshButton" class="button button-quiet" type="button">刷新</button>
         </div>
@@ -32,16 +38,17 @@
           <div><dt>标签组</dt><dd id="groupCount">—</dd></div>
           <div><dt>协议</dt><dd id="protocolVersion">—</dd></div>
         </dl>
+        <p id="updateNotice" class="update-notice" hidden>插件中已有新的 WindowTabs 核心版本，重启后应用更新。</p>
         <p id="errorText" class="error-text" hidden></p>
       </section>
 
       <section class="card actions-card">
         <h2>操作</h2>
         <div class="button-row">
-          <button id="startButton" class="button button-primary" type="button">启动核心</button>
-          <button id="restartButton" class="button" type="button">重启核心</button>
-          <button id="stopButton" class="button button-danger" type="button">停止核心</button>
-          <button id="settingsButton" class="button" type="button">打开高级设置</button>
+          <button id="startButton" class="button button-primary" type="button">启动 WindowTabs</button>
+          <button id="restartButton" class="button" type="button">重启 WindowTabs</button>
+          <button id="stopButton" class="button button-danger" type="button">停止 WindowTabs</button>
+          <button id="settingsButton" class="button" type="button">打开完整设置</button>
         </div>
       </section>
 
@@ -49,7 +56,7 @@
         <div class="card-heading">
           <div>
             <h2>常用设置</h2>
-            <p class="muted">设置会写入 WindowTabs 原生配置并立即应用。</p>
+            <p class="muted">设置会写入 WindowTabs 配置并立即应用。</p>
           </div>
           <button id="loadConfigButton" class="button button-quiet" type="button">读取设置</button>
         </div>
@@ -58,29 +65,31 @@
           <label class="setting-row"><span>隐藏非活动标签</span><input id="hideInactiveTabs" type="checkbox" /></label>
           <label class="setting-row"><span>显示标签预览</span><input id="enableTabPreview" type="checkbox" /></label>
           <label class="setting-row"><span>合并任务栏按钮</span><input id="groupTaskbarButtons" type="checkbox" /></label>
+          <label class="setting-row"><span>随 Windows 启动</span><input id="runAtStartup" type="checkbox" /></label>
           <label class="setting-row"><span>预览延迟（毫秒）</span><input id="tabPreviewDelay" type="number" min="0" max="10000" step="50" /></label>
           <label class="setting-row"><span>预览尺寸（像素）</span><input id="tabPreviewSize" type="number" min="80" max="1200" step="10" /></label>
         </div>
         <div class="button-row settings-actions">
           <button id="saveConfigButton" class="button button-primary" type="button">应用设置</button>
+          <button id="resetConfigButton" class="button button-quiet" type="button">恢复常用默认值</button>
           <span id="configStatus" class="muted" aria-live="polite"></span>
         </div>
       </section>
 
-      <section class="card diagnostics-card">
+      <details class="card diagnostics-card">
+        <summary class="details-summary">诊断 <span class="muted">用于排查启动和连接问题</span></summary>
         <div class="card-heading">
           <div>
-            <h2>诊断</h2>
-            <p class="muted">用于确认 helper、命名管道和运行环境是否正常。</p>
+            <p class="muted">用于确认核心、命名管道和运行环境是否正常。</p>
           </div>
           <button id="copyDiagnosticsButton" class="button button-quiet" type="button">复制诊断</button>
         </div>
         <pre id="diagnosticsOutput" class="diagnostics-output">尚未读取诊断信息</pre>
-      </section>
+      </details>
 
       <footer class="footer">
-        <span>WindowTabs 原生核心由独立 helper 负责窗口管理。</span>
-        <span id="pluginVersion">插件 MVP</span>
+        <span>WindowTabs 由 uTools 负责界面，Windows 核心负责窗口管理。</span>
+        <span id="helperVersion">核心版本检测中</span>
       </footer>
     </main>
     <script src="renderer.js"></script>
