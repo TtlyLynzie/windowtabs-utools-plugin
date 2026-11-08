@@ -24,6 +24,9 @@ module WindowTabsIpc =
     [<Literal>]
     let maxFrameBytes = 1024 * 1024
 
+    // Keep the pipe protocol BOM-free. Node.js JSON.parse rejects a leading BOM.
+    let private utf8NoBom = UTF8Encoding(false)
+
     let private exposedSettings =
         [| "IncludedPaths"; "ExcludedPaths"; "AutoGroupingPaths"
            "HideInactiveTabs"; "GroupTaskbarButtons"; "EnableTabbingByDefault"
@@ -37,12 +40,12 @@ module WindowTabsIpc =
            "IsDisabled"; "EnableDarkMode" |]
 
     let private error code message =
-        JObject([ JProperty("ok", false);
-                  JProperty("error", JObject([ JProperty("code", code);
-                                                 JProperty("message", message) ])) ])
+        JObject([| JProperty("ok", false);
+                  JProperty("error", JObject([| JProperty("code", code);
+                                                 JProperty("message", message) |])) |])
 
     let private success result =
-        JObject([ JProperty("ok", true); JProperty("result", result) ])
+        JObject([| JProperty("ok", true); JProperty("result", result) |])
 
     let private response id body =
         let result = body.DeepClone() :?> JObject
@@ -90,7 +93,7 @@ module WindowTabsIpc =
             |> Seq.filter(fun name -> not (allowed.Contains(name)))
             |> Seq.toArray
         if invalid.Length > 0 then
-            invalidArg "patch" (sprintf "Unsupported settings: %s" (String.Join(", ", invalid)))
+            invalidArg "patch" (sprintf "Unsupported settings: %s" (String.Join(", ", invalid :> seq<string>)))
 
     let private applyPatch (patch: JObject) =
         validatePatch patch
@@ -123,22 +126,22 @@ module WindowTabsIpc =
             | _ -> JObject()
         match methodName with
         | "hello" ->
-            success (JObject([ JProperty("coreVersion", Services.program.version);
+            success (JObject([| JProperty("coreVersion", Services.program.version);
                                JProperty("protocolVersion", protocolVersion);
                                JProperty("pid", Process.GetCurrentProcess().Id);
                                JProperty("groupCount", Services.desktop.groups.length);
                                JProperty("capabilities", JArray([| JValue("status") :> JToken; JValue("config") :> JToken; JValue("settings") :> JToken |]));
-                               JProperty("status", if Services.program.isShuttingDown then "stopping" else "ready") ]))
+                               JProperty("status", if Services.program.isShuttingDown then "stopping" else "ready") |]))
         | "status" ->
-            success (JObject([ JProperty("running", not Services.program.isShuttingDown);
+            success (JObject([| JProperty("running", not Services.program.isShuttingDown);
                                JProperty("disabled", Services.program.isDisabled);
                                JProperty("coreVersion", Services.program.version);
                                JProperty("protocolVersion", protocolVersion);
                                JProperty("groupCount", Services.desktop.groups.length);
-                               JProperty("pid", Process.GetCurrentProcess().Id) ]))
+                               JProperty("pid", Process.GetCurrentProcess().Id) |]))
         | "getCapabilities" ->
-            success (JObject([ JProperty("protocolVersion", protocolVersion);
-                               JProperty("capabilities", JArray([| JValue("status") :> JToken; JValue("config") :> JToken; JValue("settings") :> JToken |])) ]))
+            success (JObject([| JProperty("protocolVersion", protocolVersion);
+                               JProperty("capabilities", JArray([| JValue("status") :> JToken; JValue("config") :> JToken; JValue("settings") :> JToken |])) |]))
         | "getConfig" -> success (cloneExposedSettings())
         | "updateConfig" ->
             match parameters.["patch"] with
@@ -149,19 +152,19 @@ module WindowTabsIpc =
             success (cloneExposedSettings())
         | "openSettings" ->
             Services.managerView.show()
-            success (JObject([ JProperty("opened", true) ]))
+            success (JObject([| JProperty("opened", true) |]))
         | "stop"
         | "shutdown" ->
             Services.program.shutdown()
-            success (JObject([ JProperty("accepted", true) ]))
+            success (JObject([| JProperty("accepted", true) |]))
         | "restart" ->
             Services.program.shutdown()
-            success (JObject([ JProperty("accepted", true); JProperty("restarting", true) ]))
+            success (JObject([| JProperty("accepted", true); JProperty("restarting", true) |]))
         | "logTail" ->
             // Native diagnostics remain local. The first implementation has no
             // stable log ring, so return an empty list rather than exposing an
             // arbitrary file path over IPC.
-            success (JObject([ JProperty("lines", JArray()) ]))
+            success (JObject([| JProperty("lines", JArray()) |]))
         | _ -> invalidArg "method" (sprintf "Unsupported IPC method: %s" methodName)
 
     type Server(pipeName: string, log: string -> unit) =
@@ -170,8 +173,8 @@ module WindowTabsIpc =
         let mutable task: Task = null
 
         let handleClient (pipe: NamedPipeServerStream) =
-            use reader = new StreamReader(pipe, Encoding.UTF8, false, 65536, true)
-            use writer = new StreamWriter(pipe, Encoding.UTF8, 65536, true)
+            use reader = new StreamReader(pipe, utf8NoBom, false, 65536, true)
+            use writer = new StreamWriter(pipe, utf8NoBom, 65536, true)
             writer.AutoFlush <- true
             let mutable connected = true
             while connected && not cancellation.IsCancellationRequested do
@@ -196,7 +199,8 @@ module WindowTabsIpc =
                                 log (sprintf "IPC request failed: %O" ex)
                                 error "INTERNAL_ERROR" ex.Message
                         writer.WriteLine((response id body).ToString(Formatting.None))
-                    with ex
+                    with
+                    | ex ->
                         log (sprintf "IPC client disconnected after malformed request: %O" ex)
                         connected <- false
 
