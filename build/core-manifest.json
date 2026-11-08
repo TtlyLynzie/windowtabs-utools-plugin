@@ -1,6 +1,6 @@
 {
   "coreTag": "ss_2026.11.06",
-  "patch": "patches/upstream-ipc-v6.patch",
+  "patch": "patches/upstream-ipc-v6.txt",
   "patchId": "upstream-ipc-v6",
   "protocol": 1,
   "ipc": true,
