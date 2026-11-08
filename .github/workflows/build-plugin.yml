@@ -11,7 +11,10 @@ on:
     paths:
       - '.github/workflows/build-plugin.yml'
       - 'patches/**'
+      - 'build/**'
       - 'native/**'
+      - 'helper/**'
+      - 'scripts/**'
       - 'plugin.json'
       - 'index.html'
       - 'renderer.js'
@@ -32,8 +35,13 @@ jobs:
       - name: Checkout WindowTabs source
         shell: pwsh
         run: |
-          git clone --depth 1 --branch "$env:CORE_TAG" https://github.com/standard-software/WindowTabs.git WindowTabs-source
-          git -C WindowTabs-source apply "$env:GITHUB_WORKSPACE\patches\upstream-ipc.patch"
+          $manifest = Get-Content "$env:GITHUB_WORKSPACE\build\core-manifest.json" -Raw | ConvertFrom-Json
+          $tag = if ([string]::IsNullOrWhiteSpace("${{ github.event.inputs.core_tag }}")) { $manifest.coreTag } else { "${{ github.event.inputs.core_tag }}" }
+          "CORE_TAG=$tag" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          $patch = Join-Path $env:GITHUB_WORKSPACE $manifest.patch
+          if (-not (Test-Path $patch)) { throw "Patch file was not found: $patch" }
+          git clone --depth 1 --branch "$tag" https://github.com/standard-software/WindowTabs.git WindowTabs-source
+          git -C WindowTabs-source apply "$patch"
 
       - name: Restore NuGet packages
         shell: pwsh
@@ -66,8 +74,13 @@ jobs:
           $hash = (Get-FileHash (Join-Path $target 'WindowTabs.exe') -Algorithm SHA256).Hash.ToLowerInvariant()
           [ordered]@{
             version = $version
+            buildId = "$version-ipc-v6"
+            sourceTag = $env:CORE_TAG
             path = "$version/WindowTabs.exe"
             protocol = 1
+            ipc = $true
+            supportsIpc = $true
+            patchId = $manifest.patchId
             source = "https://github.com/standard-software/WindowTabs/releases/tag/$env:CORE_TAG"
             sourceCommit = (git -C WindowTabs-source rev-parse HEAD).Trim()
             sha256 = $hash
@@ -77,6 +90,21 @@ jobs:
       - name: Package plugin
         shell: bash
         run: bash package-plugin.sh
+
+      - name: Smoke test native IPC core
+        shell: pwsh
+        run: |
+          $manifest = Get-Content helper\current.json -Raw | ConvertFrom-Json
+          $exe = Join-Path $env:GITHUB_WORKSPACE (Join-Path 'helper' $manifest.path)
+          .\scripts\Smoke-TestCore.ps1 -Executable $exe
+
+      - name: Validate JavaScript
+        shell: pwsh
+        run: |
+          node --check preload.js
+          node --check renderer.js
+          node tests/smoke-test.mjs
+          bash scripts/validate-market-dir.sh dist/market
 
       - name: Upload plugin artifact
         uses: actions/upload-artifact@v4
