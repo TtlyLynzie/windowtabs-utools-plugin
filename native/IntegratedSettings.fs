@@ -45,8 +45,31 @@ module IntegratedSettings =
         use sha = SHA256.Create()
         sha.ComputeHash(Encoding.UTF8.GetBytes(value.ToString(Formatting.None)))
         |> Array.map(fun b -> b.ToString("x2")) |> String.concat ""
+    let private openSchemaStream() =
+        let assemblies =
+            [ Assembly.GetEntryAssembly(); Assembly.GetExecutingAssembly() ]
+            |> List.filter(fun assembly -> not (isNull assembly))
+        let resource =
+            assemblies
+            |> Seq.collect(fun assembly ->
+                assembly.GetManifestResourceNames()
+                |> Seq.map(fun name -> assembly, name))
+            |> Seq.tryFind(fun (_, name) ->
+                String.Equals(name, "WindowTabs.SettingsSchema.json", StringComparison.OrdinalIgnoreCase)
+                || name.EndsWith(".SettingsSchema.json", StringComparison.OrdinalIgnoreCase))
+        match resource with
+        | Some (assembly, name) ->
+            let stream = assembly.GetManifestResourceStream(name)
+            if isNull stream then fail "SCHEMA_RESOURCE_MISSING" (sprintf "Unable to open embedded settings schema: %s" name)
+            stream
+        | None ->
+            let available =
+                assemblies
+                |> Seq.collect(fun assembly -> assembly.GetManifestResourceNames())
+                |> String.concat ", "
+            fail "SCHEMA_RESOURCE_MISSING" (sprintf "Embedded settings schema was not found. Available resources: %s" available)
     let private schema = lazy (
-        use stream = Assembly.GetExecutingAssembly().GetManifestResourceStream("WindowTabs.SettingsSchema.json")
+        use stream = openSchemaStream()
         use reader = new StreamReader(stream)
         JObject.Parse(reader.ReadToEnd()))
     let private fields() = schema.Value.["fields"] :?> JArray |> Seq.cast<JObject> |> Seq.toArray
