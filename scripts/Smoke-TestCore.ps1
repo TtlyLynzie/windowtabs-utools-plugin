@@ -10,10 +10,14 @@ $process = $null
 $client = $null
 $reader = $null
 $writer = $null
+$settingsDirectory = Join-Path ([System.IO.Path]::GetTempPath()) ("windowtabs-core-smoke-" + [Guid]::NewGuid().ToString('N'))
+$settingsPath = Join-Path $settingsDirectory 'WindowTabsSettings.json'
 
 try {
   Write-Host "Starting IPC smoke-test core: $Executable"
-  $process = Start-Process -FilePath $Executable -ArgumentList "--windowtabs-ipc-pipe=\\.\pipe\$pipeName" -PassThru
+  New-Item -ItemType Directory -Force -Path $settingsDirectory | Out-Null
+  $arguments = @("--windowtabs-ipc-pipe=\\.\pipe\$pipeName", "--windowtabs-settings=$settingsPath")
+  $process = Start-Process -FilePath $Executable -ArgumentList $arguments -PassThru
   Write-Host "Connecting to named pipe: $pipeName"
   $client = New-Object System.IO.Pipes.NamedPipeClientStream('.', $pipeName, [System.IO.Pipes.PipeDirection]::InOut)
   $client.Connect($TimeoutSeconds * 1000)
@@ -72,4 +76,5 @@ finally {
     $process.WaitForExit(5000) | Out-Null
   }
   if ($process) { $process.Dispose() }
+  if (Test-Path $settingsDirectory) { Remove-Item $settingsDirectory -Recurse -Force -ErrorAction SilentlyContinue }
 }

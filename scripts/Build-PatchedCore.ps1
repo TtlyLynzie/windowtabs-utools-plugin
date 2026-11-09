@@ -33,7 +33,9 @@ $buildDir = Join-Path $sourceRoot "WtProgram\bin\$Configuration"
 $exe = Join-Path $buildDir 'WindowTabs.exe'
 if (-not (Test-Path $exe)) { throw "Built WindowTabs.exe not found: $exe" }
 
-$target = Join-Path $pluginRoot "helper\$version"
+$coreManifest = Get-Content (Join-Path $pluginRoot 'build\core-manifest.json') -Raw | ConvertFrom-Json
+$targetName = "$version-$($coreManifest.patchId)"
+$target = Join-Path $pluginRoot "helper\$targetName"
 New-Item -ItemType Directory -Force -Path $target | Out-Null
 Copy-Item $exe (Join-Path $target 'WindowTabs.exe') -Force
 foreach ($file in @('WindowTabs.exe.config', 'version.md', 'README.txt')) {
@@ -47,8 +49,16 @@ if (Test-Path (Join-Path $buildDir 'Settings')) {
 $hash = (Get-FileHash (Join-Path $target 'WindowTabs.exe') -Algorithm SHA256).Hash.ToLowerInvariant()
 $manifest = [ordered]@{
     version = $version
-    path = "$version/WindowTabs.exe"
+    buildId = "$version-$($coreManifest.patchId)"
+    sourceTag = $version
+    path = "$targetName/WindowTabs.exe"
     protocol = 1
+    ipc = $true
+    supportsIpc = $true
+    patchId = $coreManifest.patchId
+    contractVersion = $coreManifest.contractVersion
+    capabilities = $coreManifest.requiredCapabilities
+    schemaSha256 = (Get-FileHash (Join-Path $pluginRoot 'settings-schema.json') -Algorithm SHA256).Hash.ToLowerInvariant()
     source = 'local patched build'
     sha256 = $hash
 }
