@@ -39,15 +39,17 @@ module WindowTabsIpc =
            "ChangeTabPositionOnSnap"; "SnapOnDragDetach"; "TabAppearance"
            "IsDisabled"; "EnableDarkMode" |]
 
-    let private error code message =
-        JObject([| JProperty("ok", false);
-                  JProperty("error", JObject([| JProperty("code", code);
-                                                 JProperty("message", message) |])) |])
+    let private makeObject (properties: JProperty array) = JObject(properties)
 
-    let private success result =
-        JObject([| JProperty("ok", true); JProperty("result", result) |])
+    let private error (code: string) (message: string) : JObject =
+        makeObject([| JProperty("ok", false);
+                     JProperty("error", makeObject([| JProperty("code", code);
+                                                       JProperty("message", message) |])) |])
 
-    let private response id body =
+    let private success (result: JObject) : JObject =
+        makeObject([| JProperty("ok", true); JProperty("result", result) |])
+
+    let private response (id: string) (body: JObject) : JObject =
         let result = body.DeepClone() :?> JObject
         result.["id"] <- JValue(id)
         result
@@ -104,7 +106,7 @@ module WindowTabsIpc =
             if property.Name = "RunAtStartup" then
                 if property.Value.Type <> JTokenType.Boolean then
                     invalidArg "RunAtStartup" "RunAtStartup must be boolean."
-                Services.settings.setValue("runAtStartup", box(property.Value.Value<bool>()))
+                Services.settings.setValue("runAtStartup", box(unbox<bool>(property.Value.Value)))
             else
                 root.[property.Name] <- property.Value.DeepClone()
         if patch.Properties() |> Seq.exists(fun p -> p.Name <> "RunAtStartup") then
@@ -112,13 +114,16 @@ module WindowTabsIpc =
             Services.program.refresh()
         cloneExposedSettings()
 
-    let private dispatch (request: JObject) =
+    // Handshake/status must never synchronously call a proxied UI service.
+    // The IPC server starts before Application.Run(), so such a call can wait
+    // forever for the main WinForms message loop and make every client time out.
+    let private dispatch (coreVersion: string) (request: JObject) =
         match request.["version"] with
-        | :? JValue as value when value.Type = JTokenType.Integer && value.Value<int>() = protocolVersion -> ()
+        | :? JValue as value when value.Type = JTokenType.Integer && unbox<int>(value.Value) = protocolVersion -> ()
         | _ -> invalidArg "version" "Unsupported IPC protocol version."
         let methodName =
             match request.["method"] with
-            | :? JValue as value when value.Type = JTokenType.String -> value.Value<string>()
+            | :? JValue as value when value.Type = JTokenType.String -> unbox<string>(value.Value)
             | _ -> invalidArg "method" "method is required."
         let parameters =
             match request.["params"] with
@@ -126,21 +131,21 @@ module WindowTabsIpc =
             | _ -> JObject()
         match methodName with
         | "hello" ->
-            success (JObject([| JProperty("coreVersion", Services.program.version);
+            success (makeObject([| JProperty("coreVersion", coreVersion);
                                JProperty("protocolVersion", protocolVersion);
                                JProperty("pid", Process.GetCurrentProcess().Id);
-                               JProperty("groupCount", Services.desktop.groups.length);
+                               JProperty("groupCount", 0);
                                JProperty("capabilities", JArray([| JValue("status") :> JToken; JValue("config") :> JToken; JValue("settings") :> JToken |]));
-                               JProperty("status", if Services.program.isShuttingDown then "stopping" else "ready") |]))
+                               JProperty("status", "ready") |]))
         | "status" ->
-            success (JObject([| JProperty("running", not Services.program.isShuttingDown);
-                               JProperty("disabled", Services.program.isDisabled);
-                               JProperty("coreVersion", Services.program.version);
+            success (makeObject([| JProperty("running", true);
+                               JProperty("disabled", false);
+                               JProperty("coreVersion", coreVersion);
                                JProperty("protocolVersion", protocolVersion);
-                               JProperty("groupCount", Services.desktop.groups.length);
+                               JProperty("groupCount", 0);
                                JProperty("pid", Process.GetCurrentProcess().Id) |]))
         | "getCapabilities" ->
-            success (JObject([| JProperty("protocolVersion", protocolVersion);
+            success (makeObject([| JProperty("protocolVersion", protocolVersion);
                                JProperty("capabilities", JArray([| JValue("status") :> JToken; JValue("config") :> JToken; JValue("settings") :> JToken |])) |]))
         | "getConfig" -> success (cloneExposedSettings())
         | "updateConfig" ->
@@ -152,22 +157,22 @@ module WindowTabsIpc =
             success (cloneExposedSettings())
         | "openSettings" ->
             Services.managerView.show()
-            success (JObject([| JProperty("opened", true) |]))
+            success (makeObject([| JProperty("opened", true) |]))
         | "stop"
         | "shutdown" ->
             Services.program.shutdown()
-            success (JObject([| JProperty("accepted", true) |]))
+            success (makeObject([| JProperty("accepted", true) |]))
         | "restart" ->
             Services.program.shutdown()
-            success (JObject([| JProperty("accepted", true); JProperty("restarting", true) |]))
+            success (makeObject([| JProperty("accepted", true); JProperty("restarting", true) |]))
         | "logTail" ->
             // Native diagnostics remain local. The first implementation has no
             // stable log ring, so return an empty list rather than exposing an
             // arbitrary file path over IPC.
-            success (JObject([| JProperty("lines", JArray()) |]))
+            success (makeObject([| JProperty("lines", JArray()) |]))
         | _ -> invalidArg "method" (sprintf "Unsupported IPC method: %s" methodName)
 
-    type Server(pipeName: string, log: string -> unit) =
+    type Server(pipeName: string, coreVersion: string, log: string -> unit) =
         let pipeName = normalizePipeName pipeName
         let cancellation = new CancellationTokenSource()
         let mutable task: Task = null
@@ -191,7 +196,7 @@ module WindowTabsIpc =
                             | null -> ""
                             | value -> value.ToString(Formatting.None)
                         let body =
-                            try dispatch request
+                            try dispatch coreVersion request
                             with
                             | :? ArgumentException as ex -> error "INVALID_REQUEST" ex.Message
                             | :? InvalidOperationException as ex -> error "CORE_NOT_READY" ex.Message
@@ -243,10 +248,10 @@ module WindowTabsIpc =
                 Some(arg.Substring(prefix.Length))
             else None)
 
-    let start (argv: string array) =
+    let start (argv: string array) (coreVersion: string) =
         match pipeArgument argv with
         | None -> None
         | Some pipe ->
-            let server = Server(pipe, fun message -> Debug.WriteLine(message))
+            let server = Server(pipe, coreVersion, fun message -> Debug.WriteLine(message))
             server.Start()
             Some server
