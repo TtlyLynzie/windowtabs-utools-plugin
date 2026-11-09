@@ -15,10 +15,12 @@ const STOP_TIMEOUT_MS = 3000;
 const LEGACY_GRACE_MS = 900;
 const MAX_FRAME_BYTES = 1024 * 1024;
 const NATIVE_PLATFORM = "win32";
-const PLUGIN_VERSION = "0.2.2";
+const PLUGIN_VERSION = "0.2.3";
 
 function makeError(code, message, details) {
   const error = new Error(message);
+  // Error.message is normally non-enumerable and disappears from diagnostics.
+  Object.defineProperty(error, "message", { value: message, enumerable: true, configurable: true });
   error.code = code;
   if (details !== undefined) error.details = details;
   return error;
@@ -81,6 +83,13 @@ class PipeClient {
     this.pending = new Map();
     this.listeners = new Set();
     this.connecting = null;
+    this.trace = [];
+    this.legacyResponseIdCount = 0;
+  }
+
+  record(event, details = {}) {
+    this.trace.push({ time: new Date().toISOString(), event, ...details });
+    if (this.trace.length > 30) this.trace.shift();
   }
 
   onEvent(listener) {
@@ -117,14 +126,14 @@ class PipeClient {
         this.socket = socket;
         finish();
       });
-      socket.on("data", (chunk) => this.handleData(chunk));
+      socket.on("data", (chunk) => { if (this.socket === socket) this.handleData(chunk); });
       socket.on("error", (error) => {
         if (!settled) finish(makeError("PIPE_UNAVAILABLE", error.message));
-        this.handleDisconnect(error);
+        if (this.socket === socket) this.handleDisconnect(error);
       });
       socket.on("close", () => {
         if (!settled) finish(makeError("PIPE_UNAVAILABLE", "WindowTabs 命名管道已关闭"));
-        this.handleDisconnect();
+        if (this.socket === socket) this.handleDisconnect();
       });
     }).finally(() => {
       this.connecting = null;
@@ -147,16 +156,37 @@ class PipeClient {
       // Be tolerant of a legacy/native server that prepends a UTF-8 BOM.
       // The pipe protocol itself is BOM-free, but stripping it here prevents
       // one malformed first frame from becoming an opaque request timeout.
-      try { message = JSON.parse(line.replace(/^\uFEFF/, "")); } catch (_) { continue; }
+      try { message = JSON.parse(line.replace(/^\uFEFF/, "")); } catch (_) {
+        this.record("invalidJson");
+        continue;
+      }
+      if (!message || typeof message !== "object") { this.record("invalidResponse"); continue; }
       if (message.type === "event") {
         for (const listener of this.listeners) {
           try { listener({ event: message.event, payload: message.payload }); } catch (_) {}
         }
         continue;
       }
-      const pending = this.pending.get(message.id);
-      if (!pending) continue;
-      this.pending.delete(message.id);
+      let responseId = message.id;
+      // Compatibility with shipped v9 cores: decode exactly one JSON-string
+      // wrapper, and only accept it if it matches an outstanding request.
+      if (!this.pending.has(responseId) && typeof responseId === "string") {
+        try {
+          const decoded = JSON.parse(responseId);
+          if (typeof decoded === "string" && this.pending.has(decoded)) {
+            responseId = decoded;
+            this.legacyResponseIdCount++;
+            this.record("legacyResponseId", { id: decoded });
+          }
+        } catch (_) {}
+      }
+      const pending = this.pending.get(responseId);
+      if (!pending) {
+        this.record("unmatchedResponse", { id: String(message.id).slice(0, 120) });
+        continue;
+      }
+      this.record("response", { id: responseId, method: pending.method, ok: message.ok });
+      this.pending.delete(responseId);
       clearTimeout(pending.timer);
       if (message.ok === false || message.error) {
         const error = makeError(
@@ -192,9 +222,11 @@ class PipeClient {
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(id);
-        reject(makeError("REQUEST_TIMEOUT", `WindowTabs 请求超时：${method}`));
+        this.record("timeout", { id, method, timeoutMs });
+        reject(makeError("REQUEST_TIMEOUT", `WindowTabs 请求超时：${method}`, { id, method, timeoutMs }));
       }, timeoutMs);
-      this.pending.set(id, { resolve, reject, timer });
+      this.pending.set(id, { resolve, reject, timer, method });
+      this.record("request", { id, method });
       try { this.socket.write(message); } catch (error) {
         clearTimeout(timer);
         this.pending.delete(id);
@@ -384,7 +416,8 @@ class HelperManager {
         updateAvailable,
         message: updateAvailable
           ? "WindowTabs 正在运行，重启后应用新版本"
-          : "WindowTabs 正在运行"
+          : "WindowTabs 正在运行",
+        error: null
       });
       return this.lastStatus;
     } catch (error) {
@@ -714,6 +747,13 @@ class HelperManager {
       helperVersion: this.helperManifest?.version || null,
       bundledHelperVersion: bundledManifest?.version || null,
       helperSource: this.helperManifest?.source || null,
+      helperBuildId: this.helperManifest?.buildId || null,
+      helperPatchId: this.helperManifest?.patchId || null,
+      helperSha256: this.helperManifest?.sha256 || null,
+      bundledHelperBuildId: bundledManifest?.buildId || null,
+      bundledHelperPatchId: bundledManifest?.patchId || null,
+      ipcTrace: this.pipe.trace.slice(),
+      legacyResponseIdCount: this.pipe.legacyResponseIdCount,
       childPid: this.child?.pid || null,
       childAlive: this.isChildAlive(),
       recentLogs: this.logLines.slice(-30),
