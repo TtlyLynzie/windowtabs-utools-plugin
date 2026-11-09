@@ -64,10 +64,12 @@ async function main() {
     assert.ok(Array.isArray(apps.apps));
     const testApp = path.join(temporary, "WindowTabsSmokeApp.exe");
     let updatedApps = await client.request("applicationUpdate", {path:testApp,enabled:true,autoGroup:true,category:7}, 8000);
-    let testRule = updatedApps.apps.find(app => path.resolve(app.path) === path.resolve(testApp));
+    const sameWindowsPath = (left, right) =>
+      path.win32.normalize(left).toLowerCase() === path.win32.normalize(right).toLowerCase();
+    let testRule = updatedApps.apps.find(app => sameWindowsPath(app.path, testApp));
     assert.ok(testRule && testRule.enabled && testRule.autoGroup && testRule.category === 7, "application rule must round-trip");
     updatedApps = await client.request("applicationUpdate", {path:testApp,remove:true}, 8000);
-    assert.equal(updatedApps.apps.some(app => path.resolve(app.path) === path.resolve(testApp)), false, "test application rule must be removable");
+    assert.equal(updatedApps.apps.some(app => sameWindowsPath(app.path, testApp)), false, "test application rule must be removable");
     const afterApps = await client.request("settingsSnapshot", {}, 8000);
     const theme = { name:"Runtime smoke theme" };
     for (const field of schema.fields.filter(field => field.type === "color")) {
