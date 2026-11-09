@@ -56,6 +56,7 @@ module IntegratedSettings =
                 |> Seq.map(fun name -> assembly, name))
             |> Seq.tryFind(fun (_, name) ->
                 String.Equals(name, "WindowTabs.SettingsSchema.json", StringComparison.OrdinalIgnoreCase)
+                || String.Equals(name, "SettingsSchema.json", StringComparison.OrdinalIgnoreCase)
                 || name.EndsWith(".SettingsSchema.json", StringComparison.OrdinalIgnoreCase))
         match resource with
         | Some (assembly, name) ->
