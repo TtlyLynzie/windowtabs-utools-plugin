@@ -102,7 +102,7 @@ jobs:
             exit $LASTEXITCODE
           } -ArgumentList (Join-Path $env:GITHUB_WORKSPACE 'scripts\Smoke-TestCore.ps1'), $exe
           if ($null -eq (Wait-Job $job -Timeout 30)) {
-            Stop-Job $job -Force -ErrorAction SilentlyContinue
+            Stop-Job $job -ErrorAction SilentlyContinue
             Remove-Job $job -Force -ErrorAction SilentlyContinue
             Write-Warning 'IPC smoke test exceeded 30 seconds; continuing because build/package validation passed.'
           } else {
