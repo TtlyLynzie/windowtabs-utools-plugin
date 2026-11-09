@@ -19,6 +19,8 @@ on:
       - 'plugin.json'
       - 'index.html'
       - 'renderer.js'
+      - 'settings-model.js'
+      - 'settings-schema.json'
       - 'styles.css'
       - 'preload.js'
       - 'package-plugin.sh'
@@ -70,7 +72,8 @@ jobs:
           $program = Join-Path $source 'WtProgram\Program.fs'
           $version = (Select-String -Path $program -Pattern 'let version = "([^"]+)"' | Select-Object -First 1).Matches[0].Groups[1].Value
           $build = Join-Path $source 'WtProgram\bin\Release'
-          $target = Join-Path $env:GITHUB_WORKSPACE "helper\$version"
+          $targetName = "$version-$($manifest.patchId)"
+          $target = Join-Path $env:GITHUB_WORKSPACE "helper\$targetName"
           New-Item -ItemType Directory -Force -Path $target | Out-Null
           Copy-Item (Join-Path $build 'WindowTabs.exe') (Join-Path $target 'WindowTabs.exe') -Force
           foreach ($file in @('WindowTabs.exe.config', 'version.md')) {
@@ -83,20 +86,19 @@ jobs:
             version = $version
             buildId = "$version-$($manifest.patchId)"
             sourceTag = $env:CORE_TAG
-            path = "$version/WindowTabs.exe"
+            path = "$targetName/WindowTabs.exe"
             protocol = 1
             ipc = $true
             supportsIpc = $true
+            contractVersion = $manifest.contractVersion
+            capabilities = $manifest.requiredCapabilities
+            schemaSha256 = (Get-FileHash settings-schema.json -Algorithm SHA256).Hash.ToLowerInvariant()
             patchId = $manifest.patchId
             source = "https://github.com/standard-software/WindowTabs/releases/tag/$env:CORE_TAG"
             sourceCommit = (git -C WindowTabs-source rev-parse HEAD).Trim()
             sha256 = $hash
           } | ConvertTo-Json | Set-Content helper\current.json -Encoding UTF8
           Write-Host "Built $version ($hash)"
-
-      - name: Package plugin
-        shell: bash
-        run: bash package-plugin.sh
 
       - name: Smoke test native IPC core
         timeout-minutes: 2
@@ -106,12 +108,26 @@ jobs:
           $exe = Join-Path $env:GITHUB_WORKSPACE (Join-Path 'helper' $manifest.path)
           .\scripts\Smoke-TestCore.ps1 -Executable $exe -TimeoutSeconds 20
 
+      - name: Runtime-test integrated settings contract
+        timeout-minutes: 2
+        shell: pwsh
+        run: |
+          node scripts/Smoke-TestClient.cjs . runtime-proof.json
+          $current = Get-Content helper\current.json -Raw | ConvertFrom-Json
+          $current | Add-Member -NotePropertyName runtimeVerification -NotePropertyValue (Get-Content runtime-proof.json -Raw | ConvertFrom-Json)
+          $current | ConvertTo-Json -Depth 8 | Set-Content helper\current.json -Encoding UTF8
+
+      - name: Package verified marketplace directory
+        shell: bash
+        run: bash package-plugin.sh
+
       - name: Validate JavaScript
         shell: pwsh
         run: |
           node --check preload.js
           node --check renderer.js
           node tests/smoke-test.mjs
+          node tests/settings-model.cjs
           node tests/ipc-transport.cjs
           bash scripts/validate-market-dir.sh dist/market
 
@@ -124,5 +140,5 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: windowtabs-utools-plugin-${{ env.CORE_TAG }}
-          path: dist/windowtabs-utools-plugin.upx
+          path: dist/market
           if-no-files-found: error
