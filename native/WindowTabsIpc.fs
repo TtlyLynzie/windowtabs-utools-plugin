@@ -49,9 +49,12 @@ module WindowTabsIpc =
     let private success (result: JObject) : JObject =
         makeObject([| JProperty("ok", true); JProperty("result", result) |])
 
-    let private response (id: string) (body: JObject) : JObject =
+    let private response (id: JToken) (body: JObject) : JObject =
         let result = body.DeepClone() :?> JObject
-        result.["id"] <- JValue(id)
+        // Echo the JSON value, including its type. Serializing a string ID
+        // before wrapping it in JValue adds literal quotes and breaks Node's
+        // pending-request lookup even though the response is valid JSON.
+        result.["id"] <- if isNull id then JValue.CreateNull() :> JToken else id.DeepClone()
         result
 
     let private normalizePipeName (value: string) =
@@ -191,10 +194,7 @@ module WindowTabsIpc =
                 else
                     try
                         let request = JObject.Parse(line)
-                        let id =
-                            match request.["id"] with
-                            | null -> ""
-                            | value -> value.ToString(Formatting.None)
+                        let id = request.["id"]
                         let body =
                             try dispatch coreVersion request
                             with
