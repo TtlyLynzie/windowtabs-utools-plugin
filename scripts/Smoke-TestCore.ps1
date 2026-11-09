@@ -21,7 +21,11 @@ try {
   $writer.AutoFlush = $true | Out-Null
 
   function Read-IpcResponse {
-    $line = $reader.ReadLine()
+    $read = $reader.ReadLineAsync()
+    if (-not $read.Wait($TimeoutSeconds * 1000)) {
+      throw "IPC core did not respond within $TimeoutSeconds seconds."
+    }
+    $line = $read.Result
     if ([string]::IsNullOrWhiteSpace($line)) { throw 'IPC core closed the pipe without a response.' }
     try { return ($line | ConvertFrom-Json) }
     catch { throw "IPC core returned invalid JSON: $line" }
@@ -33,6 +37,14 @@ try {
   $helloProtocol = if ($null -ne $hello.result) { $hello.result.protocolVersion } else { $hello.protocolVersion }
   if ($hello.ok -ne $true -or [int]$helloProtocol -ne 1) {
     throw ("IPC hello smoke test failed: " + ($hello | ConvertTo-Json -Compress -Depth 10))
+  }
+
+  $id++
+  $writer.WriteLine((@{ id = $id; version = 1; method = 'status'; params = @{} } | ConvertTo-Json -Compress))
+  $status = Read-IpcResponse
+  $statusRunning = if ($null -ne $status.result) { $status.result.running } else { $status.running }
+  if ($status.ok -ne $true -or $statusRunning -ne $true) {
+    throw ("IPC status smoke test failed: " + ($status | ConvertTo-Json -Compress -Depth 10))
   }
 
   # The handshake proves the patched core is reachable. Shutdown is best-effort
