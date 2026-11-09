@@ -49,7 +49,7 @@ index cca6320..d96cdaf 100755
          ExceptionHandlerPlugin()
 diff --git a/WtProgram/WindowTabsIpc.fs b/WtProgram/WindowTabsIpc.fs
 new file mode 100644
-index 0000000..e8926d8
+index 0000000..3f6e7fe
 --- /dev/null
 +++ b/WtProgram/WindowTabsIpc.fs
 @@ -0,0 +1,257 @@
@@ -109,7 +109,7 @@ index 0000000..e8926d8
 +        // Echo the JSON value, including its type. Serializing a string ID
 +        // before wrapping it in JValue adds literal quotes and breaks Node's
 +        // pending-request lookup even though the response is valid JSON.
-+        result.["id"] <- if isNull id then JValue.CreateNull() :> JToken else id.DeepClone()
++        result.["id"] <- if isNull id then JValue(null : obj) :> JToken else id.DeepClone()
 +        result
 +
 +    let private normalizePipeName (value: string) =
