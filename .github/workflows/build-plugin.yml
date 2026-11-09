@@ -15,6 +15,7 @@ on:
       - 'native/**'
       - 'helper/**'
       - 'scripts/**'
+      - 'tests/**'
       - 'plugin.json'
       - 'index.html'
       - 'renderer.js'
@@ -31,6 +32,11 @@ jobs:
     steps:
       - name: Checkout plugin
         uses: actions/checkout@v4
+
+      - name: Use uTools-compatible Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
 
       - name: Checkout WindowTabs source
         shell: pwsh
@@ -75,7 +81,7 @@ jobs:
           $hash = (Get-FileHash (Join-Path $target 'WindowTabs.exe') -Algorithm SHA256).Hash.ToLowerInvariant()
           [ordered]@{
             version = $version
-            buildId = "$version-ipc-v6"
+            buildId = "$version-$($manifest.patchId)"
             sourceTag = $env:CORE_TAG
             path = "$version/WindowTabs.exe"
             protocol = 1
@@ -106,7 +112,13 @@ jobs:
           node --check preload.js
           node --check renderer.js
           node tests/smoke-test.mjs
+          node tests/ipc-transport.cjs
           bash scripts/validate-market-dir.sh dist/market
+
+      - name: Test packaged production client against Windows core
+        timeout-minutes: 2
+        shell: pwsh
+        run: node scripts/Smoke-TestClient.cjs dist/market
 
       - name: Upload plugin artifact
         uses: actions/upload-artifact@v4
