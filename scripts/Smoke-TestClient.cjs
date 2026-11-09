@@ -86,7 +86,8 @@ async function main() {
     const workspaceReadback = await client.request("workspaceUpdate", {items:workspaces.items,revision:workspaces.revision}, 8000);
     assert.deepEqual(workspaceReadback.items, workspaces.items, "workspace definitions must round-trip");
     const storage = await client.request("storageInfo", {}, 8000);
-    assert.equal(path.resolve(storage.path), path.resolve(settingsPath));
+    assert.ok(sameWindowsPath(fs.realpathSync.native(storage.path), fs.realpathSync.native(settingsPath)),
+      "storage must resolve to the isolated settings file");
     await assert.rejects(client.request("notAnIpcMethod"), error => error.code === "INVALID_REQUEST");
     assert.equal((await client.request("shutdown", {}, 5000)).accepted, true);
     assert.equal(client.legacyResponseIdCount, 0, "New builds must echo exact IDs; legacy fallback may not hide a native regression");
