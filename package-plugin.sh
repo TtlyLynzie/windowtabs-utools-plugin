@@ -3,7 +3,6 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "$0")" && pwd)"
 OUTPUT_DIR="${1:-$ROOT_DIR/dist}"
-PACKAGE_NAME="windowtabs-utools-plugin.upx"
 STAGE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/windowtabs-utools.XXXXXX")"
 trap 'rm -rf "$STAGE_DIR"' EXIT
 
@@ -14,13 +13,16 @@ esac
 
 MARKET_DIR="$OUTPUT_DIR/market"
 mkdir -p "$OUTPUT_DIR"
-rm -f "$OUTPUT_DIR/$PACKAGE_NAME"
-rm -rf "$MARKET_DIR"
+# Never remove a working market directory until every candidate check passes.
+# Staging lives on the destination filesystem so rename does not cross volumes.
+rm -rf "$STAGE_DIR"
+STAGE_DIR="$(mktemp -d "$OUTPUT_DIR/.market-stage.XXXXXX")"
 
 node "$ROOT_DIR/scripts/validate-helper.mjs" "$ROOT_DIR"
 
 cp "$ROOT_DIR/plugin.json" "$ROOT_DIR/index.html" "$ROOT_DIR/renderer.js" \
-  "$ROOT_DIR/styles.css" "$ROOT_DIR/preload.js" "$ROOT_DIR/logo.png" "$STAGE_DIR/"
+  "$ROOT_DIR/styles.css" "$ROOT_DIR/preload.js" "$ROOT_DIR/logo.png" \
+  "$ROOT_DIR/settings-model.js" "$ROOT_DIR/settings-schema.json" "$STAGE_DIR/"
 
 # Only ship the active helper selected by current.json. Source code, old
 # helper versions, tests, build scripts and documentation stay out of the
@@ -49,25 +51,18 @@ if [ -d "$HELPER_ROOT/Settings" ]; then
   cp -R "$HELPER_ROOT/Settings" "$STAGE_DIR/helper/$HELPER_DIRECTORY/"
 fi
 
-mkdir -p "$MARKET_DIR"
-cp -R "$STAGE_DIR/." "$MARKET_DIR/"
-
-(
-  cd "$STAGE_DIR"
-  if command -v zip >/dev/null 2>&1; then
-    zip -qr "$OUTPUT_DIR/$PACKAGE_NAME" .
-  elif command -v 7z >/dev/null 2>&1; then
-    7z a -tzip -bd -y "$OUTPUT_DIR/$PACKAGE_NAME" . >/dev/null
-  elif [ -x "/c/Program Files/7-Zip/7z.exe" ]; then
-    "/c/Program Files/7-Zip/7z.exe" a -tzip -bd -y "$OUTPUT_DIR/$PACKAGE_NAME" . >/dev/null
-  else
-    echo "Neither zip nor 7-Zip is available" >&2
-    exit 127
-  fi
-)
-
-bash "$ROOT_DIR/scripts/validate-package.sh" "$OUTPUT_DIR/$PACKAGE_NAME"
-node "$ROOT_DIR/scripts/validate-helper.mjs" "$MARKET_DIR"
-bash "$ROOT_DIR/scripts/validate-market-dir.sh" "$MARKET_DIR"
-
-echo "created: $OUTPUT_DIR/$PACKAGE_NAME"
+node "$ROOT_DIR/scripts/validate-helper.mjs" "$STAGE_DIR"
+bash "$ROOT_DIR/scripts/validate-market-dir.sh" "$STAGE_DIR"
+PREVIOUS="$OUTPUT_DIR/.market-previous"
+if [ -e "$PREVIOUS" ]; then
+  echo "Previous publication recovery directory exists: $PREVIOUS" >&2
+  exit 1
+fi
+if [ -d "$MARKET_DIR" ]; then mv "$MARKET_DIR" "$PREVIOUS"; fi
+if mv "$STAGE_DIR" "$MARKET_DIR"; then
+  rm -rf "$PREVIOUS"
+else
+  if [ -d "$PREVIOUS" ]; then mv "$PREVIOUS" "$MARKET_DIR"; fi
+  exit 1
+fi
+echo "Marketplace directory ready: $MARKET_DIR"

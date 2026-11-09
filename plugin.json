@@ -1,5 +1,5 @@
 {
-  "version": "0.2.3",
+  "version": "0.3.0",
   "main": "index.html",
   "logo": "logo.png",
   "preload": "preload.js",
@@ -11,13 +11,17 @@
     {
       "code": "windowtabs",
       "description": "启动和管理 WindowTabs",
-      "cmds": ["WindowTabs", "窗口标签"]
+      "cmds": [
+        "WindowTabs",
+        "窗口标签"
+      ]
     },
     {
       "code": "windowtabs-settings",
-      "description": "打开 WindowTabs 完整设置",
-      "mainHide": true,
-      "cmds": ["WindowTabs 设置"]
+      "description": "在插件中设置窗口标签",
+      "cmds": [
+        "WindowTabs 设置"
+      ]
     }
   ]
 }

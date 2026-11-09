@@ -1,47 +1,31 @@
-# WindowTabs 更新指南
+# WindowTabs 上游版本更新指南
 
-以后每次跟随官方 WindowTabs 更新时，先检查上游变更与 IPC 补丁是否兼容，再修改目标 Tag 和补丁编号，让 GitHub Actions 完成 Windows 构建。不能只替换官方 exe：官方版本不包含插件通信桥。
+用户只通过 uTools 应用市场安装和更新插件。发布时在 uTools 开发者工具选择 `dist/market`；不以离线安装包作为用户分发方式，也不要求用户安装或运行单独的 WindowTabs。
 
-## 更新流程
+## 每次更新的执行步骤
 
-1. 检查官方仓库的正式 Tag：
-   `https://github.com/standard-software/WindowTabs`
-2. 修改 `build/core-manifest.json`：
-   - `coreTag`：新的官方 Tag；
-   - `patch`：当前 IPC 补丁路径；
-   - `patchId`：新的补丁版本号。
-3. 提交并推送到插件仓库。
-4. 在 GitHub Actions 运行 `Build WindowTabs uTools plugin`。
-5. 构建必须通过下文的自动验收，任何失败都必须阻止产物上传。下载同一次成功构建的产物，将验证过的 `helper` 和市场目录同步到本地，不能混用不同构建的清单和 exe。
-6. 检查 `helper/current.json`：确认 `buildId`（由官方版本和 `patchId` 生成）、`sourceTag`、`sourceCommit`、`supportsIpc`、`sha256` 和 `path` 均对应本次构建。发布目录内 exe 的实际 SHA-256 必须匹配清单。
-7. 在 Windows 测试旧插件升级场景：保留旧版 WindowTabs 进程运行，然后安装新插件，确认插件可以切换到新核心。
-8. 在 uTools 开发者工具中选择 `dist/market`，提交应用市场审核。
+1. 读取 `build/core-manifest.json`，确认当前官方 Tag、补丁编号、设置契约版本和必需能力。
+2. 拉取 `standard-software/WindowTabs` 的目标正式 Tag，在干净源码上审阅从旧 Tag 到新 Tag 的差异。重点检查设置字段、默认值、范围、主题、应用规则、快捷键、工作区序列化、开机启动和窗口恢复。
+3. 把现有集成补丁应用到目标 Tag。不能直接使用官方 exe，因为官方版本没有 uTools 的设置契约和命名管道接口。
+4. 解决补丁冲突，并同步更新 `settings-schema.json` 与原生嵌入的同名文件、原生 IPC 控制器、前端字段与说明、迁移逻辑和 Windows 真实核心测试。
+5. 给补丁使用新的唯一 `patchId`，更新核心 `hello.buildId`，再从干净官方 Tag 生成单一补丁文件。用 `git apply --check` 验证补丁可重放。
+6. 更新 `build/core-manifest.json` 的 `coreTag`、`patch`、`patchId`。只有在数据契约不兼容时才提升 `contractVersion`。
+7. 把源码提交到 GitHub，运行 `Build WindowTabs uTools plugin`。工作流必须先编译 Windows 核心，再用隔离设置文件测试，最后才生成市场目录。
+8. 自动测试必须覆盖准确的请求编号、核心身份、全部设置字段、修改与回读、冲突拒绝、非法值拒绝、应用规则新增/删除、自定义主题新增/删除、工作区读写、独立设置路径和正常退出。
+9. 下载同一次成功构建的 `dist/market` artifact。不要混用另一次构建的 exe、`current.json` 或设置字段表。
+10. 在 Windows uTools 中完成交互验收：应用规则、四边外观、颜色、操作习惯、快捷键、工作区捕获/编辑/恢复、开机启动、备份导入、暂停与停止、旧插件升级。
+11. 只有上述检查都通过，才用 artifact 的市场目录替换本地 `dist/market`，并在 uTools 开发者工具选择该目录发布。
 
-## 自动验收门槛
+## 自动发布门槛
 
-- `tests/ipc-transport.cjs` 执行实际 `preload.js`，验证字符串编号、并发回复匹配、BOM/分片、旧版带引号编号兼容、未知编号不能误匹配、超时诊断包含方法名。
-- `scripts/Smoke-TestCore.ps1` 在 Windows 运行新 exe，严格检查响应编号的值和类型（普通字符串、含引号与反斜杠的字符串、数字）。不能仅检查 `ok: true`。
-- `scripts/Smoke-TestClient.cjs dist/market` 使用 Node 20 执行市场目录内的真实 preload，与新编译 exe 通信，检查 `hello/status/getConfig/updateConfig` 空补丁、错误回复、`shutdown` 和进程退出。使用独立管道和临时核心副本，不修改发布文件。必须连接本次启动的 PID，且旧编号兼容次数必须为 0。
-- 保留源代码检查、SHA-256 校验、市场目录检查。测试失败不得绕过测试或使用旧构建的 exe 顶替。
+`helper/current.json` 必须同时匹配版本、上游 Tag 和 commit、`patchId`、`buildId`、exe 的 `sha256`、`contractVersion`、`integrated-settings-v1`、字段表 `schemaSha256`，以及同一个 exe/字段表/构建身份的 `runtimeVerification`。任何一项不一致，`package-plugin.sh` 都会停止，现有 `dist/market` 不会被删除。
 
-这些检查证明自动测试环境里的通信链可用，不能代替 Windows uTools 内的交互验收。
+市场目录使用白名单，只包含插件页面、字段表、图标、preload 和一个经过验证的核心版本。
 
-## Windows uTools 发布前人工验收
+## 可直接交给 Codex 的更新 Prompt
 
-- `dist/market` 只有一个 `WindowTabs.exe`；
-- `current.json` 指向当前版本目录；
-- `supportsIpc` 和 `ipc` 都是 `true`；
-- 核心可以响应 `hello`、`status`、`getConfig`、`updateConfig` 和 `shutdown`；
-- IPC 响应使用无 BOM UTF-8；插件客户端也会剥离首帧 BOM，兼容已发布的旧核心；
-- 诊断中的插件版本、核心 `helperBuildId/helperPatchId` 与打包清单一致，实际 exe 哈希匹配清单；目前 hello 不回传 buildId，不能声称已经核验运行中核心的 buildId；
-- 插件显示 READY，设置可读取，修改一项设置可保存并在重启后保持，再还原该设置；
-- `ipcTrace` 没有持续超时或无法匹配的回复；新核心 `legacyResponseIdCount` 为 0（旧 v9 核心可能大于 0，表示客户端正在兼容旧编号）；
-- 旧进程不会被误杀；
-- 新核心启动失败时显示 IPC 启动失败，不得伪装成兼容模式；
-- 市场目录不包含旧核心、源码、测试、补丁和构建脚本。
+> 请把此工作区的 WindowTabs uTools 插件同步到 GitHub 官方仓库 `standard-software/WindowTabs` 的最新正式版本。用户只通过 uTools 应用市场安装，不考虑以离线安装包分发，也不能要求用户另行安装 WindowTabs。请先读取 `WINDOWTABS-UPDATE-GUIDE.md`、`build/core-manifest.json` 和现有集成补丁；比较新旧官方 Tag，核对所有有效设置、默认值、应用规则、主题、快捷键、工作区、开机启动和数据格式。把 uTools 内置中文设置界面与原生 IPC 契约同步到新版，生成可在干净官方 Tag 上重放的新补丁，并更新唯一 patchId、核心 buildId、字段表、测试和文档。使用 GitHub Actions 的 Windows 环境编译；用隔离设置文件完成真实 exe 的设置读写、冲突、非法值、应用规则、主题、工作区和退出测试。测试通过后生成只含一个最新核心和必要资源的 `dist/market` artifact，并核对 exe SHA-256、schema SHA-256、运行时测试证明和清单完全一致。保留当前可用的 `dist/market`，直到新版通过全部自动测试和 Windows uTools 人工验收。完成后告诉我新版本、构建链接、验证结果、市场目录内容和仍需人工验收的项目。
 
-用户只从 uTools 应用市场安装和更新插件，不需要单独安装 WindowTabs，也不需要执行命令。
+## 已知回归记录
 
-## 0.2.2 超时的回归记录
-
-原生桥曾把字符串请求编号先序列化，再封装为 JSON 字符串。`req-123` 被回传成包含额外引号的编号，插件无法匹配，最终报 REQUEST_TIMEOUT。原测试仅使用数字编号且未核对响应编号，因而误判通过。0.2.3 客户端兼容已发布核心；v10 补丁原样回传 JToken；新增真实客户端与严格编号测试防止再次漏检。诊断现在保留方法名、错误消息、构建编号和最近 30 条通信摘要，不记录设置内容。
+0.2.2 曾因原生核心把字符串请求编号重复编码而出现 `REQUEST_TIMEOUT`。新核心必须原样回传编号类型和值，生产 preload 测试中的兼容计数必须为 0。连接成功只证明通信可用，不能代替设置修改与回读测试。

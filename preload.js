@@ -15,7 +15,7 @@ const STOP_TIMEOUT_MS = 3000;
 const LEGACY_GRACE_MS = 900;
 const MAX_FRAME_BYTES = 1024 * 1024;
 const NATIVE_PLATFORM = "win32";
-const PLUGIN_VERSION = "0.2.3";
+const PLUGIN_VERSION = "0.3.0";
 
 function makeError(code, message, details) {
   const error = new Error(message);
@@ -409,7 +409,7 @@ class HelperManager {
       const bundledManifest = readJson(path.join(PLUGIN_ROOT, "helper", "current.json"));
       const runningVersion = result?.coreVersion || hello?.coreVersion;
       const updateAvailable = Boolean(bundledManifest?.version && runningVersion &&
-        bundledManifest.version !== runningVersion);
+        (bundledManifest.version !== runningVersion || (bundledManifest.buildId && hello?.buildId !== bundledManifest.buildId)));
       this.setState("READY", {
         ...result,
         capabilities: this.capabilities,
@@ -447,7 +447,7 @@ class HelperManager {
                 message: "检测到未启用 uTools IPC 的旧版核心，启动时将自动替换"
               }
             });
-          } else if (helperPath && this.helperManifest?.supportsIpc === true) {
+          } else if (helperPath && this.helperManifest?.supportsIpc === true && (existingPid || this.isChildAlive())) {
             this.setState("DEGRADED", {
               message: "带 IPC 的 WindowTabs 核心未能连接",
               error: makeError("CORE_IPC_START_FAILED", "核心进程已启动，但未提供 uTools IPC")
@@ -479,7 +479,7 @@ class HelperManager {
         const bundledManifest = readJson(path.join(PLUGIN_ROOT, "helper", "current.json"));
         const runningVersion = result?.coreVersion || hello?.coreVersion;
         const updateAvailable = Boolean(bundledManifest?.version && runningVersion &&
-          bundledManifest.version !== runningVersion);
+          (bundledManifest.version !== runningVersion || (bundledManifest.buildId && hello?.buildId !== bundledManifest.buildId)));
         this.setState("READY", {
           ...result,
           capabilities: this.capabilities,
@@ -513,7 +513,14 @@ class HelperManager {
       throw makeError("UNSUPPORTED_PLATFORM", "WindowTabs 原生核心仅支持 Windows");
     }
     const current = await this.getStatus();
-    if (current.state === "READY") return current;
+    if (current.state === "READY") {
+      const bundled = readJson(path.join(PLUGIN_ROOT, "helper", "current.json"));
+      const required = bundled?.capabilities || [];
+      const outdated = bundled?.contractVersion === 1 &&
+        required.some(capability => !this.capabilities.includes(capability));
+      if (!outdated) return current;
+      await this.stop();
+    }
     if (current.state === "LEGACY_RUNNING") {
       // A plugin upgrade can leave an old helper process alive. If the
       // bundled manifest says the new helper has IPC, replace the old one
@@ -530,7 +537,20 @@ class HelperManager {
 
     this.setState("STARTING", { message: "正在启动 WindowTabs", error: null });
     try {
-      const helperArgs = [`--windowtabs-ipc-pipe=${this.pipeName}`];
+      const settingsPath = path.join(getPluginDataPath(), "settings", "WindowTabsSettings.json");
+      // Migrate once by copying; never delete or overwrite a standalone user's file.
+      if (!fileExists(settingsPath) && !fileExists(settingsPath.replace(/\.json$/, ".txt"))) {
+        const oldRoot = path.join(process.env.APPDATA || getPluginDataPath(), "WindowTabs");
+        for (const ext of ["json", "txt"]) {
+          const source = path.join(oldRoot, `WindowTabsSettings.${ext}`);
+          if (fileExists(source)) {
+            fs.mkdirSync(path.dirname(settingsPath), { recursive: true });
+            fs.copyFileSync(source, settingsPath.replace(/\.json$/, `.${ext}`), fs.constants.COPYFILE_EXCL);
+            break;
+          }
+        }
+      }
+      const helperArgs = [`--windowtabs-ipc-pipe=${this.pipeName}`, `--windowtabs-settings=${settingsPath}`];
       const command = helperPath.toLowerCase().endsWith(".js") ? process.execPath : helperPath;
       const commandArgs = helperPath.toLowerCase().endsWith(".js")
         ? [helperPath, ...helperArgs]
@@ -621,6 +641,28 @@ class HelperManager {
     });
   }
 
+  isProcessRunning(pid) {
+    if (!pid || process.platform !== NATIVE_PLATFORM) return Promise.resolve(false);
+    return new Promise((resolve) => {
+      const tasklist = spawn("tasklist", ["/FI", `PID eq ${pid}`, "/FO", "CSV", "/NH"], {
+        windowsHide: true, stdio: ["ignore", "pipe", "ignore"]
+      });
+      let output = "";
+      tasklist.stdout?.on("data", chunk => { output += chunk; });
+      tasklist.once("error", () => resolve(false));
+      tasklist.once("exit", () => resolve(new RegExp(`[,\"]${pid}[\",]`).test(output)));
+    });
+  }
+
+  async waitForProcessExit(pid, timeoutMs = STOP_TIMEOUT_MS) {
+    const deadline = Date.now() + timeoutMs;
+    while (await this.isProcessRunning(pid)) {
+      if (Date.now() >= deadline) return false;
+      await new Promise(resolve => setTimeout(resolve, 100));
+    }
+    return true;
+  }
+
   async stop() {
     if (this.stopPromise) return this.stopPromise;
     this.stopPromise = this.stopInternal();
@@ -668,6 +710,9 @@ class HelperManager {
       if (child && !(await this.waitForChildExit(child))) {
         throw makeError("CORE_STOP_TIMEOUT", "WindowTabs 进程未在规定时间内退出");
       }
+      if (!child && current.pid && !(await this.waitForProcessExit(current.pid))) {
+        throw makeError("CORE_STOP_TIMEOUT", "WindowTabs 进程未在规定时间内退出");
+      }
       this.child = null;
       this.setState("INSTALLED_STOPPED", { message: "WindowTabs 已停止", pid: null, groupCount: 0, error: null });
       return this.lastStatus;
@@ -688,24 +733,26 @@ class HelperManager {
   }
 
   async restartInternal() {
-    await this.stop().catch(() => {});
+    await this.stop();
     return await this.start();
   }
 
   async openSettings() {
-    const current = await this.getStatus();
-    if (current.state !== "READY") await this.start();
-    if (this.state === "LEGACY_RUNNING") {
-      throw makeError(
-        "IPC_UNAVAILABLE",
-        "当前 WindowTabs 版本未启用 IPC，请通过系统托盘菜单打开设置"
-      );
+    this.emit("navigate", { page: "general" });
+    return this.getStatus();
+  }
+
+  async integrated(method, params = {}) {
+    const methods = ["settingsSnapshot", "settingsApply", "themesUpdate", "setEnabled",
+      "applications", "applicationUpdate", "windowUpdate", "workspaces", "workspaceCapture",
+      "workspaceUpdate", "workspaceRestore", "workspaceRestoreStatus", "storageInfo", "storageTransfer"];
+    if (!methods.includes(method)) throw makeError("INVALID_REQUEST", "不支持此操作");
+    if (!this.capabilities.includes("integrated-settings-v1")) {
+      await this.requireIpc();
+      if (!this.capabilities.includes("integrated-settings-v1"))
+        throw makeError("CORE_UPDATE_REQUIRED", "需要更新插件内置组件，请安装新版插件");
     }
-    if (this.capabilities.length && !this.capabilities.includes("settings")) {
-      throw makeError("CAPABILITY_UNAVAILABLE", "当前 WindowTabs 核心不支持设置窗口");
-    }
-    await this.pipe.request("openSettings");
-    return this.lastStatus;
+    return this.pipe.request(method, params, 12000);
   }
 
   async requireIpc() {
@@ -776,6 +823,19 @@ const manager = new HelperManager();
 
 function expose() {
   window.windowTabs = {
+    getSchema: () => readJson(path.join(PLUGIN_ROOT, "settings-schema.json")),
+    integrated: (method, params) => manager.integrated(method, params),
+    exportBackup: async (data) => {
+      if (!global.utools?.showSaveDialog) throw makeError("SAVE_DIALOG_UNAVAILABLE", "当前环境无法保存文件");
+      const selected = await utools.showSaveDialog({ title: "导出窗口标签设置", defaultPath: "窗口标签设置.json", filters: [{name:"设置备份",extensions:["json"]}] });
+      const file = Array.isArray(selected) ? selected[0] : selected;
+      if (file) writeJsonAtomic(file, data);
+      return Boolean(file);
+    },
+    copyDiagnostics: async () => {
+      const diagnostics = await manager.getDiagnostics();
+      if (global.utools?.copyText) utools.copyText(JSON.stringify(diagnostics, null, 2));
+    },
     getStatus: () => manager.getStatus(),
     start: () => manager.start(),
     stop: () => manager.stop(),
@@ -794,7 +854,7 @@ if (global.utools && typeof utools.onPluginEnter === "function") {
   utools.onPluginEnter(async ({ code }) => {
     try {
       if (code === "windowtabs") await manager.start();
-      if (code === "windowtabs-settings") await manager.openSettings();
+      if (code === "windowtabs-settings") { manager.emit("navigate", {page:"general"}); await manager.start(); }
     } catch (error) {
       manager.emit("error", error);
     }
