@@ -21,7 +21,7 @@ try {
   $utf8 = New-Object System.Text.UTF8Encoding($false)
   $reader = New-Object System.IO.StreamReader($client, $utf8, $false, 65536, $true)
   $writer = New-Object System.IO.StreamWriter($client, $utf8, 65536, $true)
-  $writer.AutoFlush = $true | Out-Null
+  $writer.AutoFlush = $true
 
   function Read-IpcResponse {
     $read = $reader.ReadLineAsync()
@@ -37,6 +37,7 @@ try {
   $id = 1
   Write-Host 'Sending IPC hello request.'
   $writer.WriteLine((@{ id = $id; version = 1; method = 'hello'; params = @{} } | ConvertTo-Json -Compress))
+  $writer.Flush()
   $hello = Read-IpcResponse
   $helloProtocol = if ($null -ne $hello.result) { $hello.result.protocolVersion } else { $hello.protocolVersion }
   if ($hello.ok -ne $true -or [int]$helloProtocol -ne 1) {
@@ -47,6 +48,7 @@ try {
   $id++
   Write-Host 'Sending IPC status request.'
   $writer.WriteLine((@{ id = $id; version = 1; method = 'status'; params = @{} } | ConvertTo-Json -Compress))
+  $writer.Flush()
   $status = Read-IpcResponse
   $statusRunning = if ($null -ne $status.result) { $status.result.running } else { $status.running }
   if ($status.ok -ne $true -or $statusRunning -ne $true) {
