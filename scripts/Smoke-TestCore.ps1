@@ -12,9 +12,12 @@ $reader = $null
 $writer = $null
 
 try {
+  Write-Host "Starting IPC smoke-test core: $Executable"
   $process = Start-Process -FilePath $Executable -ArgumentList "--windowtabs-ipc-pipe=\\.\pipe\$pipeName" -PassThru
+  Write-Host "Connecting to named pipe: $pipeName"
   $client = New-Object System.IO.Pipes.NamedPipeClientStream('.', $pipeName, [System.IO.Pipes.PipeDirection]::InOut)
   $client.Connect($TimeoutSeconds * 1000)
+  Write-Host 'Named pipe connected.'
   $utf8 = New-Object System.Text.UTF8Encoding($false)
   $reader = New-Object System.IO.StreamReader($client, $utf8, $false, 65536, $true)
   $writer = New-Object System.IO.StreamWriter($client, $utf8, 65536, $true)
@@ -32,32 +35,33 @@ try {
   }
 
   $id = 1
+  Write-Host 'Sending IPC hello request.'
   $writer.WriteLine((@{ id = $id; version = 1; method = 'hello'; params = @{} } | ConvertTo-Json -Compress))
   $hello = Read-IpcResponse
   $helloProtocol = if ($null -ne $hello.result) { $hello.result.protocolVersion } else { $hello.protocolVersion }
   if ($hello.ok -ne $true -or [int]$helloProtocol -ne 1) {
     throw ("IPC hello smoke test failed: " + ($hello | ConvertTo-Json -Compress -Depth 10))
   }
+  Write-Host 'IPC hello response validated.'
 
   $id++
+  Write-Host 'Sending IPC status request.'
   $writer.WriteLine((@{ id = $id; version = 1; method = 'status'; params = @{} } | ConvertTo-Json -Compress))
   $status = Read-IpcResponse
   $statusRunning = if ($null -ne $status.result) { $status.result.running } else { $status.running }
   if ($status.ok -ne $true -or $statusRunning -ne $true) {
     throw ("IPC status smoke test failed: " + ($status | ConvertTo-Json -Compress -Depth 10))
   }
-
-  # The handshake proves the patched core is reachable. Shutdown is best-effort
-  # because upstream shutdown may close the pipe before writing its acknowledgement.
-  $id++
-  $writer.WriteLine((@{ id = $id; version = 1; method = 'shutdown'; params = @{} } | ConvertTo-Json -Compress))
-  Start-Sleep -Milliseconds 250
+  Write-Host 'IPC status response validated.'
   Write-Host "IPC smoke test passed for $Executable"
 }
 finally {
-  if ($writer) { $writer.Dispose() }
-  if ($reader) { $reader.Dispose() }
-  if ($client) { $client.Dispose() }
-  if ($process -and -not $process.HasExited) { $process.Kill(); $process.WaitForExit(5000) }
+  # Kill the GUI process before releasing pipe objects. StreamWriter.Dispose()
+  # may flush synchronously and can hang forever if the native peer is already
+  # shutting down, so CI deliberately lets process teardown close these handles.
+  if ($process -and -not $process.HasExited) {
+    Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+    $process.WaitForExit(5000) | Out-Null
+  }
   if ($process) { $process.Dispose() }
 }
