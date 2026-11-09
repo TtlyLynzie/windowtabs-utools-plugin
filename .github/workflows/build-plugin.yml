@@ -59,6 +59,7 @@ jobs:
       - name: Install helper and generate manifest
         shell: pwsh
         run: |
+          $manifest = Get-Content "$env:GITHUB_WORKSPACE\build\core-manifest.json" -Raw | ConvertFrom-Json
           $source = Join-Path $env:GITHUB_WORKSPACE 'WindowTabs-source'
           $program = Join-Path $source 'WtProgram\Program.fs'
           $version = (Select-String -Path $program -Pattern 'let version = "([^"]+)"' | Select-Object -First 1).Matches[0].Groups[1].Value
@@ -96,21 +97,7 @@ jobs:
         run: |
           $manifest = Get-Content helper\current.json -Raw | ConvertFrom-Json
           $exe = Join-Path $env:GITHUB_WORKSPACE (Join-Path 'helper' $manifest.path)
-          $job = Start-Job -ScriptBlock {
-            param($script, $target)
-            & $script -Executable $target
-            exit $LASTEXITCODE
-          } -ArgumentList (Join-Path $env:GITHUB_WORKSPACE 'scripts\Smoke-TestCore.ps1'), $exe
-          if ($null -eq (Wait-Job $job -Timeout 30)) {
-            Stop-Job $job -ErrorAction SilentlyContinue
-            Remove-Job $job -Force -ErrorAction SilentlyContinue
-            Write-Warning 'IPC smoke test exceeded 30 seconds; continuing because build/package validation passed.'
-          } else {
-            Receive-Job $job
-            $result = $job.State
-            Remove-Job $job -Force -ErrorAction SilentlyContinue
-            if ($result -ne 'Completed') { Write-Warning "IPC smoke test ended in state $result; continuing." }
-          }
+          .\scripts\Smoke-TestCore.ps1 -Executable $exe -TimeoutSeconds 20
 
       - name: Validate JavaScript
         shell: pwsh
