@@ -93,6 +93,7 @@ jobs:
         run: bash package-plugin.sh
 
       - name: Smoke test native IPC core
+        timeout-minutes: 2
         shell: pwsh
         run: |
           $manifest = Get-Content helper\current.json -Raw | ConvertFrom-Json
