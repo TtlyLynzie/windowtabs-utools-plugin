@@ -119,7 +119,7 @@ module WindowTabsIpc =
     // forever for the main WinForms message loop and make every client time out.
     let private dispatch (coreVersion: string) (request: JObject) =
         match request.["version"] with
-        | :? JValue as value when value.Type = JTokenType.Integer && unbox<int>(value.Value) = protocolVersion -> ()
+        | :? JValue as value when value.Type = JTokenType.Integer && Convert.ToInt32(value.Value) = protocolVersion -> ()
         | _ -> invalidArg "version" "Unsupported IPC protocol version."
         let methodName =
             match request.["method"] with
