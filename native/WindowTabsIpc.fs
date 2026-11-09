@@ -102,6 +102,8 @@ module WindowTabsIpc =
 
     let private applyPatch (patch: JObject) =
         validatePatch patch
+        if patch.Properties() |> Seq.isEmpty |> not then
+            invalidArg "patch" "Use the validated settingsApply method for setting changes."
         // All mutations happen through the service proxy. Calls from the pipe
         // worker are marshalled to WindowTabs' owner thread by Services.
         let root = Services.settings.root
@@ -120,7 +122,7 @@ module WindowTabsIpc =
     // Handshake/status must never synchronously call a proxied UI service.
     // The IPC server starts before Application.Run(), so such a call can wait
     // forever for the main WinForms message loop and make every client time out.
-    let private dispatch (coreVersion: string) (request: JObject) =
+    let private dispatch (owner: Invoker) (controller: IntegratedSettings.Controller) (coreVersion: string) (request: JObject) =
         match request.["version"] with
         | :? JValue as value when value.Type = JTokenType.Integer && Convert.ToInt32(value.Value) = protocolVersion -> ()
         | _ -> invalidArg "version" "Unsupported IPC protocol version."
@@ -132,50 +134,54 @@ module WindowTabsIpc =
             match request.["params"] with
             | :? JObject as obj -> obj
             | _ -> JObject()
-        match methodName with
-        | "hello" ->
-            success (makeObject([| JProperty("coreVersion", coreVersion);
-                               JProperty("protocolVersion", protocolVersion);
-                               JProperty("pid", Process.GetCurrentProcess().Id);
-                               JProperty("groupCount", 0);
-                               JProperty("capabilities", JArray([| JValue("status") :> JToken; JValue("config") :> JToken; JValue("settings") :> JToken |]));
-                               JProperty("status", "ready") |]))
-        | "status" ->
-            success (makeObject([| JProperty("running", true);
-                               JProperty("disabled", false);
-                               JProperty("coreVersion", coreVersion);
-                               JProperty("protocolVersion", protocolVersion);
-                               JProperty("groupCount", 0);
-                               JProperty("pid", Process.GetCurrentProcess().Id) |]))
-        | "getCapabilities" ->
-            success (makeObject([| JProperty("protocolVersion", protocolVersion);
-                               JProperty("capabilities", JArray([| JValue("status") :> JToken; JValue("config") :> JToken; JValue("settings") :> JToken |])) |]))
-        | "getConfig" -> success (cloneExposedSettings())
-        | "updateConfig" ->
-            match parameters.["patch"] with
-            | :? JObject as patch -> success (applyPatch patch)
-            | _ -> invalidArg "patch" "params.patch must be an object."
-        | "reloadConfig" ->
-            Services.program.refresh()
-            success (cloneExposedSettings())
-        | "openSettings" ->
-            Services.managerView.show()
-            success (makeObject([| JProperty("opened", true) |]))
-        | "stop"
-        | "shutdown" ->
-            Services.program.shutdown()
-            success (makeObject([| JProperty("accepted", true) |]))
-        | "restart" ->
-            Services.program.shutdown()
-            success (makeObject([| JProperty("accepted", true); JProperty("restarting", true) |]))
-        | "logTail" ->
-            // Native diagnostics remain local. The first implementation has no
-            // stable log ring, so return an empty list rather than exposing an
-            // arbitrary file path over IPC.
-            success (makeObject([| JProperty("lines", JArray()) |]))
-        | _ -> invalidArg "method" (sprintf "Unsupported IPC method: %s" methodName)
-
+        match controller.TryHandle(methodName, parameters) with
+        | Some result -> success result
+        | None ->
+          match methodName with
+          | "hello" ->
+              success (makeObject([| JProperty("coreVersion", coreVersion);
+                                 JProperty("protocolVersion", protocolVersion);
+                                 JProperty("buildId", coreVersion + "-upstream-integrated-v11");
+                                 JProperty("pid", Process.GetCurrentProcess().Id);
+                                 JProperty("groupCount", 0);
+                                 JProperty("capabilities", JArray([| JValue("status") :> JToken; JValue("config") :> JToken; JValue("integrated-settings-v1") :> JToken |]));
+                                 JProperty("status", "ready") |]))
+          | "status" ->
+              success (makeObject([| JProperty("running", true);
+                                 JProperty("disabled", Services.program.isDisabled);
+                                 JProperty("coreVersion", coreVersion);
+                                 JProperty("protocolVersion", protocolVersion);
+                                 JProperty("groupCount", 0);
+                                 JProperty("pid", Process.GetCurrentProcess().Id) |]))
+          | "getCapabilities" ->
+              success (makeObject([| JProperty("protocolVersion", protocolVersion);
+                                 JProperty("capabilities", JArray([| JValue("status") :> JToken; JValue("config") :> JToken; JValue("integrated-settings-v1") :> JToken |])) |]))
+          | "getConfig" -> success (owner.invoke cloneExposedSettings)
+          | "updateConfig" ->
+              match parameters.["patch"] with
+              | :? JObject as patch -> success (owner.invoke(fun () -> applyPatch patch))
+              | _ -> invalidArg "patch" "params.patch must be an object."
+          | "reloadConfig" ->
+              Services.program.refresh()
+              success (owner.invoke cloneExposedSettings)
+          | "openSettings" ->
+              error "INTERNAL_SETTINGS_ONLY" "Settings are managed inside uTools."
+          | "stop"
+          | "shutdown" ->
+              Services.program.shutdown()
+              success (makeObject([| JProperty("accepted", true) |]))
+          | "restart" ->
+              Services.program.shutdown()
+              success (makeObject([| JProperty("accepted", true); JProperty("restarting", true) |]))
+          | "logTail" ->
+              // Native diagnostics remain local. The first implementation has no
+              // stable log ring, so return an empty list rather than exposing an
+              // arbitrary file path over IPC.
+              success (makeObject([| JProperty("lines", JArray()) |]))
+          | _ -> invalidArg "method" (sprintf "Unsupported IPC method: %s" methodName)
     type Server(pipeName: string, coreVersion: string, log: string -> unit) =
+        let owner = InvokerService.invoker
+        let controller = IntegratedSettings.Controller(owner)
         let pipeName = normalizePipeName pipeName
         let cancellation = new CancellationTokenSource()
         let mutable task: Task = null
@@ -196,8 +202,9 @@ module WindowTabsIpc =
                         let request = JObject.Parse(line)
                         let id = request.["id"]
                         let body =
-                            try dispatch coreVersion request
+                            try dispatch owner controller coreVersion request
                             with
+                            | IntegratedSettings.ContractError(code,message) -> error code message
                             | :? ArgumentException as ex -> error "INVALID_REQUEST" ex.Message
                             | :? InvalidOperationException as ex -> error "CORE_NOT_READY" ex.Message
                             | ex ->
