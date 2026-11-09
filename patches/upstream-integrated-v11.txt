@@ -1,9 +1,9 @@
 diff --git a/WtProgram/IntegratedSettings.fs b/WtProgram/IntegratedSettings.fs
 new file mode 100644
-index 0000000..c401e4a
+index 0000000..e304be8
 --- /dev/null
 +++ b/WtProgram/IntegratedSettings.fs
-@@ -0,0 +1,319 @@
+@@ -0,0 +1,320 @@
 +namespace Bemo
 +
 +open System
@@ -62,6 +62,7 @@ index 0000000..c401e4a
 +                |> Seq.map(fun name -> assembly, name))
 +            |> Seq.tryFind(fun (_, name) ->
 +                String.Equals(name, "WindowTabs.SettingsSchema.json", StringComparison.OrdinalIgnoreCase)
++                || String.Equals(name, "SettingsSchema.json", StringComparison.OrdinalIgnoreCase)
 +                || name.EndsWith(".SettingsSchema.json", StringComparison.OrdinalIgnoreCase))
 +        match resource with
 +        | Some (assembly, name) ->
