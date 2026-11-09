@@ -54,7 +54,7 @@ module WindowTabsIpc =
         // Echo the JSON value, including its type. Serializing a string ID
         // before wrapping it in JValue adds literal quotes and breaks Node's
         // pending-request lookup even though the response is valid JSON.
-        result.["id"] <- if isNull id then JValue.CreateNull() :> JToken else id.DeepClone()
+        result.["id"] <- if isNull id then JValue(null : obj) :> JToken else id.DeepClone()
         result
 
     let private normalizePipeName (value: string) =
