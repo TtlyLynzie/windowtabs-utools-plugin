@@ -34,27 +34,33 @@ try {
     catch { throw "IPC core returned invalid JSON: $line" }
   }
 
-  $id = 1
+  $id = 'req-smoke-hello-1'
   Write-Host 'Sending IPC hello request.'
   $writer.WriteLine((@{ id = $id; version = 1; method = 'hello'; params = @{} } | ConvertTo-Json -Compress))
   $writer.Flush()
   $hello = Read-IpcResponse
+  if ($hello.id -isnot [string] -or $hello.id -cne $id) { throw 'hello response ID must equal the original string ID.' }
   $helloProtocol = if ($null -ne $hello.result) { $hello.result.protocolVersion } else { $hello.protocolVersion }
   if ($hello.ok -ne $true -or [int]$helloProtocol -ne 1) {
     throw ("IPC hello smoke test failed: " + ($hello | ConvertTo-Json -Compress -Depth 10))
   }
   Write-Host 'IPC hello response validated.'
 
-  $id++
+  $id = 'req-smoke-status-2-"quoted"-\path'
   Write-Host 'Sending IPC status request.'
   $writer.WriteLine((@{ id = $id; version = 1; method = 'status'; params = @{} } | ConvertTo-Json -Compress))
   $writer.Flush()
   $status = Read-IpcResponse
+  if ($status.id -isnot [string] -or $status.id -cne $id) { throw 'status response ID must preserve quotes and backslashes.' }
   $statusRunning = if ($null -ne $status.result) { $status.result.running } else { $status.running }
   if ($status.ok -ne $true -or $statusRunning -ne $true) {
     throw ("IPC status smoke test failed: " + ($status | ConvertTo-Json -Compress -Depth 10))
   }
   Write-Host 'IPC status response validated.'
+  $writer.WriteLine((@{ id = 3; version = 1; method = 'hello'; params = @{} } | ConvertTo-Json -Compress))
+  $writer.Flush()
+  $numeric = Read-IpcResponse
+  if ($numeric.id -is [string] -or $numeric.id -ne 3 -or $numeric.ok -ne $true) { throw 'Numeric response ID must retain its type and value.' }
   Write-Host "IPC smoke test passed for $Executable"
 }
 finally {
