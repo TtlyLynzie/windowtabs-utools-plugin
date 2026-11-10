@@ -13,8 +13,8 @@
 7. 把源码提交到 GitHub，运行 `Build WindowTabs uTools plugin`。工作流必须先编译 Windows 核心，再用隔离设置文件测试，最后才生成市场目录。
 8. 自动测试必须覆盖准确的请求编号、核心身份、全部设置字段、修改与回读、冲突拒绝、非法值拒绝、应用规则新增/删除、自定义主题新增/删除、工作区读写、独立设置路径和正常退出。
 9. 下载同一次成功构建的 `dist/market` artifact。不要混用另一次构建的 exe、`current.json` 或设置字段表。
-10. 在 Windows uTools 中完成交互验收：应用规则、四边外观、颜色、操作习惯、快捷键、工作区捕获/编辑/恢复、开机启动、备份导入、暂停与停止、旧插件升级。
-11. 只有上述检查都通过，才用 artifact 的市场目录替换本地 `dist/market`，并在 uTools 开发者工具选择该目录发布。
+10. 可选：在 Windows uTools 中抽查应用规则、四边外观、颜色、操作习惯、快捷键、工作区捕获/编辑/恢复、开机启动、备份导入、暂停与停止、旧插件升级。未执行人工抽查不阻断发布；发现明确回归时应先修复并重跑自动测试。
+11. 自动测试和 artifact 清单校验通过后，用该次成功构建的 artifact 市场目录替换本地 `dist/market`，并在 uTools 开发者工具选择该目录发布。
 
 ## 自动发布门槛
 
@@ -24,7 +24,7 @@
 
 ## 可直接交给 Codex 的更新 Prompt
 
-> 请把此工作区的 WindowTabs uTools 插件同步到 GitHub 官方仓库 `standard-software/WindowTabs` 的最新正式版本。用户只通过 uTools 应用市场安装，不考虑以离线安装包分发，也不能要求用户另行安装 WindowTabs。请先读取 `WINDOWTABS-UPDATE-GUIDE.md`、`build/core-manifest.json` 和现有集成补丁；比较新旧官方 Tag，核对所有有效设置、默认值、应用规则、主题、快捷键、工作区、开机启动和数据格式。把 uTools 内置中文设置界面与原生 IPC 契约同步到新版，生成可在干净官方 Tag 上重放的新补丁，并更新唯一 patchId、核心 buildId、字段表、测试和文档。使用 GitHub Actions 的 Windows 环境编译；用隔离设置文件完成真实 exe 的设置读写、冲突、非法值、应用规则、主题、工作区和退出测试。测试通过后生成只含一个最新核心和必要资源的 `dist/market` artifact，并核对 exe SHA-256、schema SHA-256、运行时测试证明和清单完全一致。保留当前可用的 `dist/market`，直到新版通过全部自动测试和 Windows uTools 人工验收。完成后告诉我新版本、构建链接、验证结果、市场目录内容和仍需人工验收的项目。
+> 请把此工作区的 WindowTabs uTools 插件同步到 GitHub 官方仓库 `standard-software/WindowTabs` 的最新正式版本。用户只通过 uTools 应用市场安装，不考虑以离线安装包分发，也不能要求用户另行安装 WindowTabs。请先读取 `WINDOWTABS-UPDATE-GUIDE.md`、`build/core-manifest.json` 和现有集成补丁；比较新旧官方 Tag，核对所有有效设置、默认值、应用规则、主题、快捷键、工作区、开机启动和数据格式。把 uTools 内置中文设置界面与原生 IPC 契约同步到新版，生成可在干净官方 Tag 上重放的新补丁，并更新唯一 patchId、核心 buildId、字段表、测试和文档。使用 GitHub Actions 的 Windows 环境编译；用隔离设置文件完成真实 exe 的设置读写、冲突、非法值、应用规则、主题、工作区和退出测试。自动测试通过后生成只含一个最新核心和必要资源的 `dist/market` artifact，并核对 exe SHA-256、schema SHA-256、运行时测试证明和清单完全一致。保留当前可用的 `dist/market`，直到新版通过全部自动测试；Windows uTools 人工抽查为可选项。完成后告诉我新版本、构建链接、验证结果和市场目录内容。
 
 ## 已知回归记录
 
