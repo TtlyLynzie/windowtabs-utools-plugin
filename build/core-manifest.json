@@ -1,7 +1,7 @@
 {
-  "coreTag": "ss_2026.11.06",
-  "patch": "patches/upstream-integrated-v11.txt",
-  "patchId": "upstream-integrated-v11",
+  "coreTag": "ss_2026.11.11",
+  "patch": "patches/upstream-integrated-v12.txt",
+  "patchId": "upstream-integrated-v12",
   "protocol": 1,
   "ipc": true,
   "packageName": "windowtabs-utools-plugin",

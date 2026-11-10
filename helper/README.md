@@ -5,13 +5,13 @@
 ```text
 helper/
 ├─ current.json
-└─ ss_2026.11.06/
+└─ ss_2026.11.11-upstream-integrated-v12/
    ├─ WindowTabs.exe
    ├─ WindowTabs.exe.config
    └─ Settings/
 ```
 
-当前随插件分发的上游版本为 `ss_2026.11.06`。将来更新版本时新增版本目录，再更新上级 `current.json`，不要覆盖正在运行的 EXE。
+目标发布版本为 `ss_2026.11.11`，目录名还包含集成补丁 ID。Windows CI 通过后新增该版本目录并更新上级 `current.json`，不要覆盖正在运行的 EXE。
 
 插件会通过以下参数启动 helper：
 

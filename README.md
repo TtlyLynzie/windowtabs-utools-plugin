@@ -21,12 +21,12 @@ windowtabs-utools-plugin/
 
 ## 接入原生核心
 
-当前工作区已经放入一份带 uTools IPC 的 WindowTabs `ss_2026.11.06` 编译产物，并整理为：
+当前目标核心为 WindowTabs `ss_2026.11.11`，由 Windows CI 从官方 Tag 编译并集成 uTools IPC：
 
 ```text
 windowtabs-utools-plugin/helper/
 ├─ current.json
-└─ ss_2026.11.06-ipc/
+└─ ss_2026.11.11-upstream-integrated-v12/
    ├─ WindowTabs.exe
    ├─ WindowTabs.exe.config
    └─ Settings/

@@ -3,12 +3,13 @@
   const $ = id => document.getElementById(id), M = window.SettingsModel, api = window.windowTabs;
   const pages = [
     ['home','概览','从这里开始'],['apps','应用规则','选择哪些窗口使用标签'],
-    ['appearance','标签外观','位置、形状与尺寸'],['colors','标签配色','让不同状态一目了然'],
-    ['behavior','操作习惯','按你的习惯工作'],['shortcuts','快捷键','减少鼠标操作'],
+    ['appearance','外观与配色','位置、形状与颜色'],['usage','操作习惯','窗口行为与快捷键'],
     ['workspaces','工作区','记住常用的窗口组合'],['general','设置与帮助','启动、数据与常见问题']
   ];
   let schema, draft, page='home', status={}, busy=false, edge='顶部', apps=null, workspaces=null;
-  let search='', restoreTimer=null, generation=0;
+  let restoreTimer=null, generation=0, appearanceMode='layout', usageMode='behavior';
+  let preferredScheme='';
+  let appStatusFilter='all', appSort='name-asc', workspaceSort='saved';
   const clone = v => M.clone(v);
   function el(tag, props={}, ...children) {
     const node=document.createElement(tag);
@@ -31,8 +32,8 @@
     STARTUP_FAILED:'开机启动设置未能生效。其他设置可能已经保存，请重新读取后检查。',
     WINDOW_CLOSED:'这个窗口已经关闭，请刷新应用列表。', APP_DISABLED:'请先为这个应用启用标签。',
     BUSY:'正在恢复工作区，请等完成后再操作。', UNSUPPORTED_PLATFORM:'窗口标签目前仅支持 Windows。',
-    REQUEST_TIMEOUT:'连接等待时间过长。请点击“重新连接”，你的修改仍保留。',
-    PIPE_UNAVAILABLE:'暂时无法连接窗口标签，请点击“重新连接”。',CORE_IPC_START_FAILED:'窗口标签未能启动。可能有另一个版本正在运行，请关闭它后重试。'
+    REQUEST_TIMEOUT:'连接等待时间过长。请先重试；仍无法连接时，可重启窗口标签并复制诊断信息。',
+    PIPE_UNAVAILABLE:'暂时无法连接窗口标签。请重试或重启窗口标签。',CORE_IPC_START_FAILED:'窗口标签未能启动。可能有另一个版本正在运行，请关闭它后重试。'
   };
   async function run(action) {
     if (busy) return;
@@ -59,22 +60,26 @@
   function updateSavebar() {
     const n=draft?.changes().length||0; $('savebar').hidden=!n;
     $('dirtyCount').textContent=`${n} 项修改尚未保存`;
+    $('saveState').hidden=!draft;
+    $('saveState').textContent=!draft?'':n?`有 ${n} 项未保存`:'设置已保存';
+    $('saveState').className='save-state'+(n?' pending':'');
   }
   function renderConnection() {
+    $('connection').hidden=page!=='home';
     const ready=status.state==='READY', integrated=ready&&status.capabilities?.includes('integrated-settings-v1');
     $('statusDot').className='dot'+(ready&&!status.disabled?' ready':'');
     $('statusText').textContent=ready?(status.disabled?'已暂停':'已启用'):status.state==='UNSUPPORTED_PLATFORM'?'需要 Windows 电脑':status.state==='INSTALLED_STOPPED'?'尚未启用':'等待连接';
-    $('statusDescription').textContent=ready?(integrated?(status.disabled?'窗口保留原样，恢复后继续显示标签。':'关闭这个面板后，窗口标签仍会继续工作。'):'当前组件需要更新，暂时无法使用插件内设置。'):status.state==='UNSUPPORTED_PLATFORM'?'可以查看设计说明，窗口管理功能需在 Windows 使用。':'连接成功后，可直接在这里调整所有设置。';
+    $('statusDescription').textContent=ready?(integrated?(status.disabled?'窗口保留原样，恢复后继续显示标签。':'关闭这个面板后，窗口标签仍会继续工作。'):'当前组件需要更新，暂时无法使用插件内设置。'):status.state==='UNSUPPORTED_PLATFORM'?'可以查看设计说明，窗口管理功能需在 Windows 使用。':status.state==='INSTALLED_STOPPED'?'窗口标签尚未启动，点击右侧按钮即可开始。':'暂时无法连接窗口标签。可以重试连接；仍无效时再重启窗口标签。';
     const actions=$('connectionActions'); actions.replaceChildren();
     if (ready&&integrated) actions.append(button(status.disabled?'恢复使用':'暂停标签',async()=>{
       await api.integrated('setEnabled',{enabled:Boolean(status.disabled)});status=await api.getStatus();render();
     }));
-    if (status.state!=='UNSUPPORTED_PLATFORM') actions.append(button(ready?'重新连接':'启用窗口标签',()=>connect(ready)));
+    if (status.state!=='UNSUPPORTED_PLATFORM') actions.append(button(ready?'重启 WindowTabs':'重试连接',()=>connect(ready)));
     actions.querySelectorAll('button').forEach(b=>b.disabled=busy);
   }
   function navigation() {
     $('navigation').replaceChildren(...pages.map(([id,label])=>el('button',{
-      type:'button','aria-current':page===id?'page':'false',onclick:()=>{page=id;search='';$('search').value='';render();loadPage();}
+      type:'button','aria-current':page===id?'page':'false',onclick:()=>{page=id;render();loadPage();}
     },label)));
   }
   async function connect(restart=false) {
@@ -110,6 +115,42 @@
       if(page==='workspaces') { workspaces=await api.integrated('workspaces'); if(page===requestedPage)render(); }
     } catch(e) { note(errors[e.code]||'无法读取当前内容，请重试。',true); }
   }
+  // Fixed-size previews follow WtProgram/Shared/TabShape.fs (120 × 24, edge band 18).
+  const shapePaths = {
+    'S-curve':'M0 24 C6 24 8 16 10 8 L8 16 C10 8 12 0 18 0 L102 0 C108 0 110 8 112 16 L110 8 C112 16 114 24 120 24 Z',
+    'Strong rounded vertical line':'M0 24 C4.971 24 9 19.971 9 15 L9 9 C9 4.029 13.029 0 18 0 H102 C106.971 0 111 4.029 111 9 V15 C111 19.971 115.029 24 120 24 Z',
+    'Rounded vertical line':'M4.5 24 C6.985 24 9 21.985 9 19.5 V4.5 C9 2.015 11.015 0 13.5 0 H105.5 C107.985 0 110 2.015 110 4.5 V19.5 C110 21.985 112.015 24 114.5 24 Z',
+    'Angular vertical line':'M4.5 24 L9 19.5 V4.5 L13.5 0 H106.5 L111 4.5 V19.5 L115.5 24 Z',
+    'Trapezoid':'M2.072 24 L15.928 0 H104.072 L117.928 24 Z',
+    'Left-cut trapezoid':'M2.072 24 L15.928 0 H110 V24 Z',
+    'Right-cut trapezoid':'M9 24 V0 H103.072 L116.928 24 Z',
+    'Rectangle':'M9 24 V0 H110 V24 Z',
+    'Rounded rectangle':'M13.5 24 C11.015 24 9 21.985 9 19.5 V4.5 C9 2.015 11.015 0 13.5 0 H105.5 C107.985 0 110 2.015 110 4.5 V19.5 C110 21.985 107.985 24 105.5 24 Z',
+    'Strong rounded rectangle':'M18 24 C13.029 24 9 19.971 9 15 V9 C9 4.029 13.029 0 18 0 H101 C105.971 0 110 4.029 110 9 V15 C110 19.971 105.971 24 101 24 Z',
+    'Angular rectangle':'M13.5 24 L9 19.5 V4.5 L13.5 0 H105.5 L110 4.5 V19.5 L105.5 24 Z'
+  };
+  function shapePicker(f,value,id,set) {
+    return el('fieldset',{id,class:'shape-picker',disabled:f.inherit&&value===null},
+      el('legend',{class:'sr-only'},f.label),f.options.map(o=>{
+        const svg=document.createElementNS('http://www.w3.org/2000/svg','svg');
+        svg.setAttribute('viewBox','-2 -3 124 30');svg.setAttribute('aria-hidden','true');
+        const path=document.createElementNS(svg.namespaceURI,'path');path.setAttribute('d',shapePaths[o.value]);svg.append(path);
+        return el('label',{class:'shape-option'},el('input',{type:'radio',name:id,value:o.value,checked:o.value===(value??f.default),onchange:()=>set(o.value)}),
+          el('span',{class:'shape-tile'},svg,el('span',{},o.label)));
+      }));
+  }
+  function schemeOptions() {
+    return [...draft.snapshot.presets.map((p,i)=>({value:'p'+i,key:'preset:'+p.name,colors:p.colors})),
+      ...draft.snapshot.customThemes.map((p,i)=>({value:'c'+i,key:'custom:'+p.name,colors:M.colorsFromTheme(p)}))];
+  }
+  function updateSchemeSelection() {
+    const select=$('colorScheme');if(!select)return;
+    const fields=schema.fields.filter(f=>f.type==='color');
+    const matches=schemeOptions().filter(p=>fields.every(f=>String(p.colors[f.path.split('.')[1]]).toUpperCase()===String(draft.values[f.path]).toUpperCase()));
+    const match=matches.find(p=>p.key===preferredScheme)||matches[0];
+    select.value=match?.value||'';
+    select.options[0].textContent=match?'选择配色方案…':'自定义配色';
+  }
   function fieldRow(f) {
     const value=draft.values[f.path], id='field-'+f.path.replaceAll('.','-');
     const controls=el('div',{class:'field-controls'});
@@ -120,6 +161,7 @@
       if(e.target.value===''){e.target.setCustomValidity('请输入数值');return;}e.target.setCustomValidity('');const v=Math.round(Number(e.target.value)*(f.scale||1));try{M.validate(f,v);set(v);}catch(error){e.target.setCustomValidity(error.message);note(error.message,true);}
     }});
     if(f.type==='select') input=el('select',{id,onchange:e=>set(e.target.value)},f.options.map(o=>el('option',{value:o.value,selected:o.value===(value??f.default)},o.label)));
+    if(f.path.endsWith('.tabShape')) input=shapePicker(f,value,id,set);
     if(f.type==='color') input=el('input',{id,type:'color',value:'#'+value,oninput:e=>set(e.target.value.slice(1).toUpperCase())});
     if(f.type==='hotkey') {
       const n=/activateTab([1-9])$/.exec(f.path), auto=n&&(draft.values.EnableCtrlNumberHotKey||draft.values.EnableAltNumberHotKey);
@@ -137,23 +179,63 @@
       controls.append(el('label',{class:'inherit'},el('input',{type:'checkbox',checked:value===null,onchange:e=>{set(e.target.checked?null:f.default);render();}}),'自动'));
     }
     controls.append(input);if(f.unit)controls.append(el('span',{class:'unit'},f.unit));
-    return el('div',{class:'row'},el('div',{class:'row-label'},el('label',{htmlFor:id},f.label),f.description?el('p',{class:'help'},f.description):null),controls);
+    return el('div',{class:'row'+(f.path.endsWith('.tabShape')?' shape-row':'')},el('div',{class:'row-label'},el('label',{htmlFor:id},f.label),f.description?el('p',{class:'help'},f.description):null),controls);
+  }
+  function sectionTabs(options,selected,onSelect) {
+    return el('div',{class:'section-tabs',role:'tablist'},options.map(([value,label])=>el('button',{
+      type:'button',role:'tab','aria-selected':String(selected===value),class:selected===value?'selected':'',
+      onclick:()=>{onSelect(value);render();}
+    },label)));
+  }
+  function outline(items) {
+    if(items.length<2)return null;
+    return el('nav',{class:'page-outline','aria-label':'本页目录'},el('strong',{},'本页内容'),
+      ...items.map(({id,label,target})=>el('a',{href:'#'+id,onclick:e=>{
+        e.preventDefault();if(target)target.open=true;document.getElementById(id)?.scrollIntoView({behavior:'smooth',block:'start'});
+      }},label)));
+  }
+  function isCommonAppearanceField(f) {
+    return ['TabEdges','TabPositionByDefault','TabVerticalDirection','HideTabsWhenDownByDefault'].includes(f.path) ||
+      /(?:tabShape|tabHeight|tabMaxWidth|hideTabsWhenDownByDefault)$/.test(f.path);
   }
   function settingsPage() {
     const content=[];
-    if(page==='appearance') {
+    const sourcePages=page==='appearance'?[appearanceMode==='colors'?'colors':'appearance']:
+      page==='usage'?[usageMode==='shortcuts'?'shortcuts':'behavior']:[page];
+    if(page==='appearance'&&appearanceMode==='layout') {
       content.push(el('p',{class:'help'},'顶部设置也作为默认样式。其他边缘选择“自动”时使用原版的继承规则。'),
         el('div',{class:'pill-list'},['顶部','左侧','右侧','底部'].map(name=>el('button',{type:'button',class:edge===name?'selected':'',onclick:()=>{edge=name;render();}},name))));
     }
-    const fs=schema.fields.filter(f=>f.page===page && (!search||f.label.includes(search)) &&
-      (page!=='appearance'||f.path==='TabEdges'||(f.group||'顶部')===edge));
-    const groups=new Map();for(const f of fs){const name=f.group||({general:'日常使用',behavior:'窗口与标签',appearance:'布局',shortcuts:'快捷键'}[page])||'设置';if(!groups.has(name))groups.set(name,[]);groups.get(name).push(fieldRow(f));}
-    for(const [name,rows] of groups)content.push(card(name,...rows));
-    if(!fs.length)content.push(empty('没有找到设置','尝试使用其他关键词。'));
-    if(page==='shortcuts')content.unshift(el('p',{class:'help'},'点击输入框后按下组合键；按 Backspace 清除。数字模式启用时，第 1–9 个标签使用统一组合键。'));
+    const fs=schema.fields.filter(f=>sourcePages.includes(f.page)&&
+      !(page==='general'&&f.path==='RunAtStartup')&&
+      (page!=='appearance'||appearanceMode!=='layout'||f.path==='TabEdges'||(f.group||'顶部')===edge));
+    const sections=[];
+    if(page==='appearance'&&appearanceMode==='layout') {
+      const common=fs.filter(isCommonAppearanceField),advanced=fs.filter(f=>!isCommonAppearanceField(f));
+      if(common.length)sections.push({label:'常用外观',rows:common.map(fieldRow)});
+      if(advanced.length)sections.push({label:'更多布局选项',rows:advanced.map(fieldRow),advanced:true});
+    } else {
+      const groups=new Map();
+      for(const f of fs){const name=f.group||({general:'日常使用',behavior:'窗口与标签',shortcuts:'快捷键',colors:'标签状态'}[f.page])||'设置';if(!groups.has(name))groups.set(name,[]);groups.get(name).push(fieldRow(f));}
+      for(const [label,rows] of groups)sections.push({label,rows});
+    }
+    const directory=[];
+    for(const [i,section] of sections.entries()) {
+      const id=`settings-section-${i}`;
+      if(section.advanced) {
+        const details=el('details',{class:'card advanced-section',id},el('summary',{},`${section.label}（${section.rows.length} 项）`),el('div',{class:'advanced-content'},...section.rows));
+        content.push(details);directory.push({id,label:section.label,target:details});
+      } else {
+        const node=card(section.label,...section.rows);node.id=id;content.push(node);directory.push({id,label:section.label});
+      }
+    }
+    const nav=outline(directory);if(nav)content.unshift(nav);
+    if(!fs.length)content.push(empty('此页面暂无可调整的设置',''));
+    if(page==='usage'&&usageMode==='shortcuts')content.unshift(el('p',{class:'help'},'点击输入框后按下组合键；按 Backspace 清除。数字模式启用时，第 1–9 个标签使用统一组合键。'));
     return content;
   }
   function updatePreview() {
+    updateSchemeSelection();
     const target=$('colorPreview');if(!target)return;
     const states=[['Inactive','未选中'],['Selected','已选择'],['MouseOver','鼠标停留'],['Active','当前窗口'],['Flash','提醒']];
     target.replaceChildren(...states.map(([state,label])=>{
@@ -161,10 +243,10 @@
     }));
   }
   function colorsPage() {
-    const presets=el('select',{ariaLabel:'配色方案'},el('option',{value:''},'选择配色方案…'));
+    const presets=el('select',{id:'colorScheme',ariaLabel:'配色方案'},el('option',{value:''},'选择配色方案…'));
     draft.snapshot.presets.forEach((p,i)=>presets.append(el('option',{value:'p'+i},p.name)));
     draft.snapshot.customThemes.forEach((p,i)=>presets.append(el('option',{value:'c'+i},p.name+' · 我的配色')));
-    presets.addEventListener('change',()=>{if(!presets.value)return;const i=Number(presets.value.slice(1));draft.applyPreset(presets.value[0]==='p'?draft.snapshot.presets[i].colors:M.colorsFromTheme(draft.snapshot.customThemes[i]));render();});
+    presets.addEventListener('change',()=>{if(!presets.value)return;const i=Number(presets.value.slice(1));preferredScheme=schemeOptions().find(p=>p.value===presets.value).key;draft.applyPreset(presets.value[0]==='p'?draft.snapshot.presets[i].colors:M.colorsFromTheme(draft.snapshot.customThemes[i]));render();});
     const themeActions=el('div',{class:'actions'},presets,button('保存为我的配色',async()=>{
       const name=await nameDialog('保存当前配色');if(!name)return;
       const themes=clone(draft.snapshot.customThemes);themes.push(M.themeFromValues(name,draft.values));
@@ -178,26 +260,42 @@
       button('删除',async()=>{if(await ask('删除这个配色？',el('p',{},t.name),'删除'))await saveThemes(draft.snapshot.customThemes.filter((_,n)=>n!==i));},'danger')))));
     return [card('配色方案',themeActions,el('div',{id:'colorPreview',class:'preview'}),el('p',{class:'help'},'这是颜色示意；实际标签的形状与尺寸由“标签外观”决定。')),...settingsPage(),...(draft.snapshot.customThemes.length?[card('我的配色',saved)]:[])];
   }
+  function appearancePage() {
+    return [sectionTabs([['layout','布局与位置'],['colors','配色']],appearanceMode,value=>{appearanceMode=value;}),
+      ...(appearanceMode==='colors'?colorsPage():settingsPage())];
+  }
+  function usagePage() {
+    return [sectionTabs([['behavior','窗口行为'],['shortcuts','快捷键']],usageMode,value=>{usageMode=value;}),...settingsPage()];
+  }
   async function saveThemes(items) {
     const snapshot=await api.integrated('themesUpdate',{items,revision:draft.snapshot.revision});
     draft.snapshot.customThemes=snapshot.customThemes;draft.snapshot.revision=snapshot.revision;render();
   }
   function appsPage() {
     if(!apps)return [empty('正在读取应用','稍候即可管理正在运行和已保存的应用。')];
-    const content=[el('div',{class:'actions'},button('刷新列表',loadPage),el('span',{class:'help'},'为应用启用标签后，可让同一应用的窗口自动合并。'))];
-    for(const app of apps.apps.filter(a=>!search||(a.name+' '+a.path).toLowerCase().includes(search.toLowerCase()))) {
+    const statusSelect=el('select',{ariaLabel:'筛选应用状态',onchange:e=>{appStatusFilter=e.target.value;render();}},
+      [['all','全部应用'],['enabled','已启用标签'],['disabled','已停用标签']].map(([value,label])=>el('option',{value,selected:appStatusFilter===value},label)));
+    const sortSelect=el('select',{ariaLabel:'应用排序方式',onchange:e=>{appSort=e.target.value;render();}},
+      [['name-asc','名称 A–Z'],['name-desc','名称 Z–A'],['running','正在运行优先']].map(([value,label])=>el('option',{value,selected:appSort===value},label)));
+    const shown=apps.apps.filter(app=>appStatusFilter==='all'||(appStatusFilter==='enabled'?app.enabled:!app.enabled)).slice();
+    shown.sort((a,b)=>appSort==='running'?Number(b.running)-Number(a.running)||a.name.localeCompare(b.name,'zh-CN'):
+      (appSort==='name-desc'?-1:1)*a.name.localeCompare(b.name,'zh-CN',{sensitivity:'base'}));
+    const content=[el('div',{class:'list-toolbar'},el('div',{class:'actions'},statusSelect,sortSelect,button('刷新列表',loadPage)),
+      el('span',{class:'list-count'},`显示 ${shown.length} / ${apps.apps.length} 个应用`)),
+      el('p',{class:'help category-help'},'指定类别用于把不同应用的窗口归到同一组。例如，将浏览器和文档应用都选为“类别 1”，它们的窗口就会归在同一类别中；选“不指定类别”则使用默认分组。为某个应用更换类别时，它会从原类别移出。')];
+    for(const app of shown) {
       const enabled=el('input',{type:'checkbox',checked:app.enabled,ariaLabel:'为'+app.name+'启用标签'}), group=el('input',{type:'checkbox',checked:app.autoGroup,disabled:!app.enabled,ariaLabel:'自动合并'+app.name});
       const category=el('select',{ariaLabel:app.name+'分组类别'},el('option',{value:0,selected:app.category===0},'不指定类别'),...Array.from({length:10},(_,i)=>el('option',{value:i+1,selected:app.category===i+1},'类别 '+(i+1))));
       const update=()=>run(async()=>{apps=await api.integrated('applicationUpdate',{path:app.path,enabled:enabled.checked,autoGroup:enabled.checked&&group.checked,category:Number(category.value)});render();});
       enabled.onchange=update;group.onchange=update;category.onchange=update;
       content.push(card('',el('div',{class:'app-head'},el('strong',{},app.name),el('span',{class:'tag'},app.running?'正在运行':'已保存规则')),
         el('div',{class:'row'},el('label',{},enabled,' 使用标签'),el('label',{},group,' 自动合并')),category,
-        el('p',{class:'help'},'同一类别的应用可以合并到一起。'),
         el('details',{},el('summary',{},`窗口与规则详情（${app.windows.length}）`),el('p',{class:'path'},app.path),
           app.windows.map(w=>el('label',{class:'window-row'},el('span',{},w.title||'无标题窗口'),el('input',{type:'checkbox',checked:w.enabled,disabled:!app.enabled,ariaLabel:'为'+w.title+'使用标签',onchange:e=>run(async()=>{apps=await api.integrated('windowUpdate',{id:w.id,enabled:e.target.checked});render();})}))),
           button('移除保存的规则',async()=>{if(await ask('移除这个应用的规则？',el('p',{},'该应用将重新遵循默认规则。'),'移除')){apps=await api.integrated('applicationUpdate',{path:app.path,remove:true});render();}}))));
     }
-    if(content.length===1)content.push(empty('暂时没有应用','请先打开需要使用标签的窗口，再刷新列表。'));
+    if(!apps.apps.length)content.push(empty('暂时没有应用','请先打开需要使用标签的窗口，再刷新列表。'));
+    else if(!shown.length)content.push(empty('没有符合条件的应用','切换上方筛选条件即可查看其他应用。'));
     return content;
   }
   async function saveWorkspaces(items) {workspaces=await api.integrated('workspaceUpdate',{items,revision:workspaces.revision});render();}
@@ -218,8 +316,13 @@
       if(!await ask('保存当前窗口组合',el('div',{},el('p',{},'记录已有标签组中的窗口、顺序和布局。之后可恢复已经打开的窗口。'),el('label',{},all,' 包含其他虚拟桌面上的标签组')),'保存'))return;
       workspaces=await api.integrated('workspaceCapture',{allDesktops:all.checked,revision:workspaces.revision});render();
     },'primary'),button('刷新',loadPage)),el('p',{class:'help'},'工作区会整理已打开的窗口，不会自动启动应用或打开文件。')];
-    workspaces.items.forEach((ws,wi)=>{
-      if(search&&!ws.name.includes(search))return;
+    const ordered=workspaces.items.map((ws,index)=>({ws,index}));
+    if(workspaceSort==='name-asc')ordered.sort((a,b)=>a.ws.name.localeCompare(b.ws.name,'zh-CN',{sensitivity:'base'}));
+    if(workspaceSort==='name-desc')ordered.sort((a,b)=>b.ws.name.localeCompare(a.ws.name,'zh-CN',{sensitivity:'base'}));
+    const workspaceSortSelect=el('select',{ariaLabel:'工作区排序方式',onchange:e=>{workspaceSort=e.target.value;render();}},
+      [['saved','保存顺序'],['name-asc','名称 A–Z'],['name-desc','名称 Z–A']].map(([value,label])=>el('option',{value,selected:workspaceSort===value},label)));
+    content.splice(1,0,el('div',{class:'list-toolbar'},el('span',{class:'list-count'},`${ordered.length} 个工作区`),workspaceSortSelect));
+    ordered.forEach(({ws,index:wi})=>{
       const tree=el('details',{},el('summary',{},`${ws.groups.length} 个标签组 · 查看和编辑窗口`));
       ws.groups.forEach((g,gi)=>tree.append(el('div',{class:'workspace-tree'},el('div',{class:'card-title'},el('h3',{},g.name),button('移除此组',async()=>{if(await ask('从工作区移除这个标签组？',el('p',{},'当前打开的窗口不会关闭。'),'移除')){const items=clone(workspaces.items);items[wi].groups.splice(gi,1);await saveWorkspaces(items);}})),...g.windows.map((w,xi)=>el('div',{class:'row'},el('span',{},w.name||w.title),el('div',{class:'actions'},button('编辑',()=>editWindow(w,wi,gi,xi)),button('移除',async()=>{if(await ask('从工作区移除这个窗口？',el('p',{},w.name||w.title),'移除')){const items=clone(workspaces.items);items[wi].groups[gi].windows.splice(xi,1);await saveWorkspaces(items);}})))))));
       content.push(card('',el('div',{class:'card-title'},el('h2',{},ws.name),el('div',{class:'actions'},button('恢复',()=>restore(wi),'primary'),button('改名',async()=>{const name=await nameDialog('工作区名称',ws.name);if(name){const items=clone(workspaces.items);items[wi].name=name;await saveWorkspaces(items);}}),button('删除',async()=>{if(await ask('删除这个工作区？',el('p',{},'只删除保存的组合，当前窗口不会关闭。'),'删除'))await saveWorkspaces(workspaces.items.filter((_,i)=>i!==wi));},'danger'))),tree));
@@ -253,7 +356,7 @@
         const info=await api.integrated('storageInfo'),snapshot=await api.integrated('settingsSnapshot');
         const toPortable=info.location!=='portable';
         if(await ask('切换数据存放方式？',el('p',{},toPortable?'将设置移动到内置组件旁边，并保留原文件备份。更新组件前需先返回用户文件夹，以免设置随旧目录遗留。':'将便携设置移回 Windows 用户文件夹。若目标已有设置，将停止操作以避免覆盖。'),'切换')){await api.integrated('storageTransfer',{toPortable,move:true,revision:snapshot.revision});await refreshSnapshot(true);note('已切换数据存放位置。');}
-      }))),card('帮助',el('p',{class:'help'},'关闭面板或退出 uTools 后，窗口标签继续运行。卸载插件前，请先关闭“开机启动”，然后停止窗口标签。'),el('details',{},el('summary',{},'连接失败或无法使用？'),el('p',{class:'help'},'先尝试重新连接。如果另一个独立版本正在运行，请先退出它。仍然失败时，把诊断信息交给开发者；信息可能包含你的用户名与本地路径。'),el('div',{class:'actions'},button('重新读取设置',()=>refreshSnapshot()),button('复制诊断信息',async()=>{await api.copyDiagnostics();note('诊断信息已复制。分享前请检查其中的个人路径。');}),button('停止窗口标签',async()=>{if(await ask('停止窗口标签？',el('p',{},'所有应用窗口会保留，但不再显示标签。'),'停止')){status=await api.stop();draft=null;render();}}))),el('p',{class:'help'},'插件版本 0.3.0 · 基于开源 WindowTabs'))];
+      }))),card('帮助',el('p',{class:'help'},'关闭面板或退出 uTools 后，窗口标签仍会继续运行。旧版本中已开启自动启动的用户，该偏好仍会保留；如需关闭，请在 WindowTabs 的启动设置中关闭。卸载插件前，建议先关闭窗口标签。'),el('details',{},el('summary',{},'连接失败或无法使用？'),el('p',{class:'help'},'先重试连接；仍无效时再重启窗口标签。如果电脑上还运行着独立安装的 WindowTabs，请先退出它。复制诊断信息前，请检查其中的个人路径。'),el('div',{class:'actions'},button('重试连接',()=>connect(false)),button('重启 WindowTabs',()=>connect(true)),button('重新读取设置',()=>refreshSnapshot()),button('复制诊断信息',async()=>{await api.copyDiagnostics();note('诊断信息已复制。分享前请检查其中的个人路径。');}),button('停止窗口标签',async()=>{if(await ask('停止窗口标签？',el('p',{},'所有应用窗口会保留，但不再显示标签。'),'停止')){status=await api.stop();draft=null;render();}}))),el('p',{class:'help'},'插件版本 1.0.4 · 基于开源 WindowTabs'))];
   }
   async function importBackup(file) {
     if(!file)return;if(file.size>750000)throw new Error('备份文件过大，请选择小于 750 KB 的文件。');
@@ -276,28 +379,35 @@
     return [el('div',{class:'intro'},el('h2',{},'把多个窗口，整理成一组标签'),el('p',{class:'help'},'直接在 uTools 里选择应用、调整外观、保存常用组合。')),
       card('开始使用',el('ol',{class:'steps'},el('li',{},'打开你常用的应用窗口。'),el('li',{},'在“应用规则”中，为需要的应用开启“使用标签”。'),el('li',{},'将标签拖到一起组合；常用组合可以保存为工作区。')),
         button('选择需要标签的应用',async()=>{page='apps';render();await loadPage();},'primary')),
-      card('按你的习惯调整',el('div',{class:'actions'},button('调整标签外观',()=>{page='appearance';render();}),button('选择配色',()=>{page='colors';render();}),button('设置快捷键',()=>{page='shortcuts';render();})))];
+      card('按你的习惯调整',el('div',{class:'actions'},button('调整标签外观',()=>{page='appearance';appearanceMode='layout';render();}),button('选择配色',()=>{page='appearance';appearanceMode='colors';render();}),button('设置快捷键',()=>{page='usage';usageMode='shortcuts';render();})))];
   }
   function applyTheme(){document.body.classList.toggle('dark',Boolean(draft?.values.EnableDarkMode));}
   function render() {
     navigation();const meta=pages.find(p=>p[0]===page);$('pageTitle').textContent=meta[1];$('pageHint').textContent=meta[2];
-    $('search').hidden=page==='home';applyTheme();renderConnection();
+    applyTheme();renderConnection();
     if(!draft) {
-      $('content').replaceChildren(empty(status.state==='UNSUPPORTED_PLATFORM'?'窗口标签仅支持 Windows':'连接后开始设置','连接成功前，不会读取默认值覆盖你的原设置。'),card('遇到问题？',button('复制诊断信息',async()=>{await api.copyDiagnostics();note('诊断信息已复制。');})));
+      $('content').replaceChildren(empty(status.state==='UNSUPPORTED_PLATFORM'?'窗口标签仅支持 Windows':'连接后开始设置','连接成功前，不会读取默认值覆盖你的原设置。'),card('遇到问题？',page!=='home'?button('返回概览连接',()=>{page='home';render();}):null,button('复制诊断信息',async()=>{await api.copyDiagnostics();note('诊断信息已复制。');})));
     }else {
-      const nodes=page==='home'?homePage():page==='apps'?appsPage():page==='workspaces'?workspacesPage():page==='colors'?colorsPage():page==='general'?generalPage():settingsPage();
+      const nodes=page==='home'?homePage():page==='apps'?appsPage():page==='workspaces'?workspacesPage():page==='appearance'?appearancePage():page==='usage'?usagePage():page==='general'?generalPage():settingsPage();
       $('content').replaceChildren(...nodes);updatePreview();
     }
     updateSavebar();
   }
   $('save').onclick=()=>run(save);
   $('discard').onclick=()=>run(async()=>{if(await ask('撤销未保存的修改？',el('p',{},'已保存的设置不受影响。'),'撤销')){draft.reset(draft.snapshot);render();note('已撤销未保存的修改。');}});
-  $('search').oninput=e=>{search=e.target.value.trim();render();};
   $('importFile').onchange=e=>run(()=>importBackup(e.target.files[0]));
   if(!api){status={state:'UNSUPPORTED_PLATFORM'};render();note('请在 uTools 中打开插件。');return;}
   schema=api.getSchema();
   api.onEvent(({event,payload})=>{
-    if(event==='navigate'){page=payload.page;render();if(draft)loadPage();}
+    if(event==='navigate'){
+      const target=payload.page;
+      if(target==='colors'){page='appearance';appearanceMode='colors';}
+      else if(target==='appearance'){page='appearance';appearanceMode='layout';}
+      else if(target==='shortcuts'){page='usage';usageMode='shortcuts';}
+      else if(target==='behavior'){page='usage';usageMode='behavior';}
+      else page=target;
+      render();if(draft)loadPage();
+    }
     if(event==='stateChanged'){status=payload;renderConnection();}
     if(event==='error')note(errors[payload?.code]||'窗口标签暂时不可用，请重新连接。',true);
   });

@@ -1,8 +1,8 @@
 # 原生 IPC 接入说明
 
-`WindowTabsIpc.fs` 是当前针对 WindowTabs `ss_2026.11.06` 源码的纯 F# IPC 实现，已经复制到 `WindowTabs-source/WtProgram/WindowTabsIpc.fs`，并加入 `WtProgram.fsproj`。`WindowTabsIpcServer.cs` 保留为独立 C# 管道服务的参考实现。
+`WindowTabsIpc.fs` 是针对 WindowTabs `ss_2026.11.11` 的纯 F# IPC 实现，由 `patches/upstream-integrated-v12.txt` 应用到官方源码，并加入 `WtProgram.fsproj`。`WindowTabsIpcServer.cs` 保留为独立 C# 管道服务的参考实现。
 
-当前工作区的 `WindowTabs/` 目录和插件内置的 `ss_2026.11.06/WindowTabs.exe` 都是未加入 uTools IPC 的官方编译产物。要获得完整控制能力，必须在 Windows 上从 `WindowTabs-source/` 重新编译。
+官方发布的原始 EXE 不含 uTools IPC。要获得完整控制能力，必须从官方 Tag 应用集成补丁后，在 Windows 上重新编译；市场版本通过 GitHub Actions 构建和运行验证。
 
 ## Windows 构建步骤
 
@@ -10,8 +10,8 @@
 2. 在 `WindowTabs-source/` 中打开 `WindowTabs.sln`；
 3. 确认 `WtProgram/WtProgram.fsproj` 已包含 `WindowTabsIpc.fs`；
 4. 使用 Release 配置构建 `WtProgram`；
-5. 检查生成的 `WindowTabs.exe` 含有 `ss_2026.11.06` 版本和 IPC 代码；
-6. 将生成文件复制到插件的 `helper/ss_2026.11.06/`，更新 `helper/current.json` 的 SHA-256；
+5. 检查生成的 `WindowTabs.exe` 含有 `ss_2026.11.11` 版本和 IPC 代码；
+6. 将生成文件复制到插件的 `helper/ss_2026.11.11-upstream-integrated-v12/`，更新 `helper/current.json` 的 SHA-256；
 7. 使用 `package-plugin.sh` 重新生成 `.upx`。
 
 ## IPC 接入位置

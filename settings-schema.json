@@ -1,6 +1,6 @@
 {
   "contractVersion": 1,
-  "upstream": "ss_2026.11.06",
+  "upstream": "ss_2026.11.11",
   "fields": [
     {
       "path": "EnableTabbingByDefault",

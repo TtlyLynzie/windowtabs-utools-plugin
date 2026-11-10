@@ -11,7 +11,7 @@ const exe = resolve(helperRoot,manifest.path);
 if (!exe.startsWith(helperRoot+sep) || !manifest.path.endsWith('/WindowTabs.exe')) throw Error('Invalid helper path');
 const schemaHash=hash(resolve(root,'settings-schema.json'));
 if (!manifest.version || !manifest.buildId || manifest.buildId !== `${manifest.version}-${manifest.patchId}` ||
-    manifest.patchId !== 'upstream-integrated-v11' || manifest.protocol !== 1 || manifest.ipc !== true || manifest.supportsIpc !== true ||
+    manifest.patchId !== 'upstream-integrated-v12' || manifest.protocol !== 1 || manifest.ipc !== true || manifest.supportsIpc !== true ||
     manifest.contractVersion !== 1 || !manifest.capabilities?.includes('integrated-settings-v1'))
   throw Error('Core does not implement the integrated settings contract; build and test the new core first.');
 if (!/^[a-f0-9]{64}$/.test(manifest.sha256) || hash(exe)!==manifest.sha256) throw Error('Core SHA256 mismatch');

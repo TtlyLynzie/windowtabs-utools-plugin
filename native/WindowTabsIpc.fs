@@ -141,7 +141,7 @@ module WindowTabsIpc =
           | "hello" ->
               success (makeObject([| JProperty("coreVersion", coreVersion);
                                  JProperty("protocolVersion", protocolVersion);
-                                 JProperty("buildId", coreVersion + "-upstream-integrated-v11");
+                                 JProperty("buildId", coreVersion + "-upstream-integrated-v12");
                                  JProperty("pid", Process.GetCurrentProcess().Id);
                                  JProperty("groupCount", 0);
                                  JProperty("capabilities", JArray([| JValue("status") :> JToken; JValue("config") :> JToken; JValue("integrated-settings-v1") :> JToken |]));
