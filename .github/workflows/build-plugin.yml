@@ -24,6 +24,13 @@ on:
       - 'styles.css'
       - 'preload.js'
       - 'package-plugin.sh'
+      - 'LICENSES/**'
+      - 'THIRD-PARTY-NOTICES.md'
+      - 'SOURCE-BUILD.md'
+      - 'scripts/validate-market-dir.sh'
+      - 'scripts/generate-audit-manifest.mjs'
+      - 'scripts/validate-audit-manifest.mjs'
+      - 'scripts/Package-AuditBundle.ps1'
 
 jobs:
   build:
@@ -45,6 +52,12 @@ jobs:
         run: |
           $manifest = Get-Content "$env:GITHUB_WORKSPACE\build\core-manifest.json" -Raw | ConvertFrom-Json
           $tag = if ([string]::IsNullOrWhiteSpace("${{ github.event.inputs.core_tag }}")) { $manifest.coreTag } else { "${{ github.event.inputs.core_tag }}" }
+          if ($tag -ne $manifest.coreTag) { throw "The workflow manifest must be updated before building a different core tag." }
+          $assetUrl = "https://github.com/standard-software/WindowTabs/releases/download/$tag/$($manifest.upstreamReleaseAsset)"
+          $assetPath = Join-Path $env:RUNNER_TEMP $manifest.upstreamReleaseAsset
+          Invoke-WebRequest -Uri $assetUrl -OutFile $assetPath
+          $assetHash = (Get-FileHash $assetPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($assetHash -ne $manifest.upstreamReleaseSha256) { throw "Upstream release asset SHA-256 mismatch: $assetHash" }
           "CORE_TAG=$tag" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           $patch = Join-Path $env:GITHUB_WORKSPACE $manifest.patch
           if (-not (Test-Path $patch)) { throw "Patch file was not found: $patch" }
@@ -129,6 +142,8 @@ jobs:
           node tests/smoke-test.mjs
           node tests/settings-model.cjs
           node tests/ipc-transport.cjs
+          node tests/plugin-lifecycle.cjs
+          node tests/integrated-params.cjs
           bash scripts/validate-market-dir.sh dist/market
 
       - name: Test packaged production client against Windows core
@@ -136,9 +151,20 @@ jobs:
         shell: pwsh
         run: node scripts/Smoke-TestClient.cjs dist/market
 
+      - name: Package source audit bundle
+        shell: pwsh
+        run: ./scripts/Package-AuditBundle.ps1
+
       - name: Upload plugin artifact
         uses: actions/upload-artifact@v4
         with:
           name: windowtabs-utools-plugin-${{ env.CORE_TAG }}
           path: dist/market
+          if-no-files-found: error
+
+      - name: Upload source audit artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: windowtabs-utools-plugin-${{ env.CORE_TAG }}-audit
+          path: audit-bundle
           if-no-files-found: error

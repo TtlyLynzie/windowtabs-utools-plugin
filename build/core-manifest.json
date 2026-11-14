@@ -1,5 +1,7 @@
 {
   "coreTag": "ss_2026.11.11",
+  "upstreamReleaseAsset": "WindowTabs.zip",
+  "upstreamReleaseSha256": "7cf7557e612c4204c0a5aa22c5611969d219831f623003eb365d43018e45bd70",
   "patch": "patches/upstream-integrated-v12.txt",
   "patchId": "upstream-integrated-v12",
   "protocol": 1,

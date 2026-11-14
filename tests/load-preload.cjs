@@ -12,6 +12,6 @@ module.exports = function loadPreload(root = path.resolve(__dirname, "..")) {
     setTimeout, clearTimeout, console, window: {}, global: {}, module: { exports: {} }
   };
   vm.runInNewContext(fs.readFileSync(filename, "utf8") +
-    "\nmodule.exports = { PipeClient, HelperManager };", sandbox, { filename });
+    "\nmodule.exports = { PipeClient, HelperManager, validateIntegratedParams };", sandbox, { filename });
   return sandbox.module.exports;
 };

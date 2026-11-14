@@ -75,7 +75,7 @@ Mock helper 支持 `status`、`stop`、`restart`、`openSettings`、`getConfig` 
 ./package-plugin.sh
 ```
 
-维护者可以使用脚本校验 `helper/current.json` 和核心 SHA-256，并生成提交 uTools 应用市场所需的构建文件。发布构建采用白名单，只包含当前版本核心及其运行所需的 `Settings`，不会包含旧版核心、源码、补丁、测试、构建脚本或文档。生成的 `dist/market` 是干净的市场发布目录，提交 uTools 应用市场时应选择这个目录，不要选择包含开发文件的项目根目录。用户通过 uTools 应用市场安装插件，不需要单独安装 WindowTabs。插件首次启动和升级时会比较内置版本与 uTools 本地缓存，版本变化时自动同步新核心。
+维护者可以使用脚本校验 `helper/current.json` 和核心 SHA-256，并生成提交 uTools 应用市场所需的构建文件。发布构建采用白名单，市场目录包含当前版本核心、运行所需的 `Settings`、上游 MIT 许可证、来源声明、构建说明和审计补丁清单，不会包含旧版核心、开发期 mock、测试、构建脚本或项目源码。生成的 `dist/market` 是市场发布目录，提交 uTools 应用市场时应选择这个目录，不要选择包含开发文件的项目根目录。Windows CI 还会上传包含完整上游源码快照和补丁的独立审计 artifact。用户通过 uTools 应用市场安装插件，不需要单独安装 WindowTabs。插件首次启动和升级时会比较内置版本与 uTools 本地缓存，版本变化时自动同步新核心。
 
 ### 无 Windows 电脑时的构建
 

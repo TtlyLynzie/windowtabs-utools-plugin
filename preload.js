@@ -15,7 +15,10 @@ const STOP_TIMEOUT_MS = 3000;
 const LEGACY_GRACE_MS = 900;
 const MAX_FRAME_BYTES = 1024 * 1024;
 const NATIVE_PLATFORM = "win32";
-const PLUGIN_VERSION = "0.3.0";
+const PLUGIN_VERSION = "1.0.6";
+const MAX_PARAMS_BYTES = 256 * 1024;
+const MAX_PARAM_DEPTH = 8;
+const MAX_PARAM_ARRAY_ITEMS = 2000;
 
 function makeError(code, message, details) {
   const error = new Error(message);
@@ -72,6 +75,100 @@ function readJson(filePath, fallback = null) {
     const text = fs.readFileSync(filePath, "utf8").replace(/^\uFEFF/, "");
     return JSON.parse(text);
   } catch (_) { return fallback; }
+}
+
+function invalidParams(message, details) {
+  return makeError("INVALID_PARAMS", message, details);
+}
+
+function validateParamTree(value, depth = 0, seen = new Set()) {
+  if (depth > MAX_PARAM_DEPTH) throw invalidParams("参数嵌套层级过深");
+  if (value === null || typeof value !== "object") return;
+  if (seen.has(value)) throw invalidParams("参数不能包含循环引用");
+  seen.add(value);
+  if (Array.isArray(value)) {
+    if (value.length > MAX_PARAM_ARRAY_ITEMS) throw invalidParams("参数数组项目过多");
+    for (const item of value) validateParamTree(item, depth + 1, seen);
+  } else {
+    for (const [key, item] of Object.entries(value)) {
+      if (key.length > 256) throw invalidParams("参数字段名过长");
+      validateParamTree(item, depth + 1, seen);
+    }
+  }
+  seen.delete(value);
+}
+
+function ensurePlainObject(value, message = "参数必须是对象") {
+  const prototype = value && typeof value === "object" ? Object.getPrototypeOf(value) : null;
+  const constructor = prototype && prototype.constructor;
+  if (!value || typeof value !== "object" || Array.isArray(value) || Object.prototype.toString.call(value) !== "[object Object]" ||
+      (constructor && constructor.name !== "Object")) {
+    throw invalidParams(message);
+  }
+  return value;
+}
+
+function ensureOnly(params, keys) {
+  const allowed = new Set(keys);
+  for (const key of Object.keys(params)) {
+    if (!allowed.has(key)) throw invalidParams(`不支持参数字段：${key}`);
+  }
+}
+
+function ensureString(value, name, maxLength) {
+  if (typeof value !== "string" || value.length === 0 || value.length > maxLength) throw invalidParams(`${name} 参数无效`);
+  return value;
+}
+
+function ensureBoolean(value, name) {
+  if (typeof value !== "boolean") throw invalidParams(`${name} 参数必须是布尔值`);
+  return value;
+}
+
+function ensureInteger(value, name, min, max) {
+  if (!Number.isInteger(value) || value < min || value > max) throw invalidParams(`${name} 参数超出范围`);
+  return value;
+}
+
+function validateIntegratedParams(method, rawParams) {
+  const params = ensurePlainObject(rawParams);
+  validateParamTree(params);
+  let encoded;
+  try { encoded = JSON.stringify(params); } catch (_) { throw invalidParams("参数无法序列化"); }
+  if (Buffer.byteLength(encoded, "utf8") > MAX_PARAMS_BYTES) throw invalidParams("参数总大小超过限制");
+  switch (method) {
+    case "settingsSnapshot": case "applications": case "workspaces": case "storageInfo":
+      ensureOnly(params, []); break;
+    case "setEnabled":
+      ensureOnly(params, ["enabled"]); ensureBoolean(params.enabled, "enabled"); break;
+    case "settingsApply":
+      ensureOnly(params, ["changes"]);
+      if (!Array.isArray(params.changes) || params.changes.length > 200) throw invalidParams("changes 参数无效");
+      for (const change of params.changes) {
+        ensurePlainObject(change, "changes 项必须是对象"); ensureOnly(change, ["path", "before", "value"]); ensureString(change.path, "path", 256);
+      }
+      break;
+    case "themesUpdate":
+      ensureOnly(params, ["items", "revision"]); if (!Array.isArray(params.items) || params.items.length > 100) throw invalidParams("items 参数无效"); ensureString(params.revision, "revision", 128); break;
+    case "applicationUpdate":
+      ensureOnly(params, ["path", "enabled", "autoGroup", "category", "remove"]); ensureString(params.path, "path", 32768);
+      if (params.remove === true) break;
+      ensureBoolean(params.enabled, "enabled"); ensureBoolean(params.autoGroup, "autoGroup"); ensureInteger(params.category, "category", 0, 10); break;
+    case "windowUpdate":
+      ensureOnly(params, ["id", "enabled"]); ensureString(params.id, "id", 64); ensureBoolean(params.enabled, "enabled"); break;
+    case "workspaceCapture":
+      ensureOnly(params, ["allDesktops", "revision"]); ensureBoolean(params.allDesktops, "allDesktops"); ensureString(params.revision, "revision", 128); break;
+    case "workspaceUpdate":
+      ensureOnly(params, ["items", "revision"]); if (!Array.isArray(params.items) || params.items.length > 200) throw invalidParams("items 参数无效"); ensureString(params.revision, "revision", 128); break;
+    case "workspaceRestore":
+      ensureOnly(params, ["index", "revision"]); ensureInteger(params.index, "index", 0, 200); ensureString(params.revision, "revision", 128); break;
+    case "workspaceRestoreStatus":
+      ensureOnly(params, ["jobId"]); ensureString(params.jobId, "jobId", 128); break;
+    case "storageTransfer":
+      ensureOnly(params, ["toPortable", "move", "revision"]); ensureBoolean(params.toPortable, "toPortable"); ensureBoolean(params.move, "move"); ensureString(params.revision, "revision", 128); break;
+    default: throw makeError("INVALID_REQUEST", "不支持此操作");
+  }
+  return params;
 }
 
 class PipeClient {
@@ -499,6 +596,7 @@ class HelperManager {
   }
 
   async start() {
+    if (this.exitPromise) await this.exitPromise;
     if (this.startPromise) return this.startPromise;
     this.startPromise = this.startInternal();
     try {
@@ -747,6 +845,7 @@ class HelperManager {
       "applications", "applicationUpdate", "windowUpdate", "workspaces", "workspaceCapture",
       "workspaceUpdate", "workspaceRestore", "workspaceRestoreStatus", "storageInfo", "storageTransfer"];
     if (!methods.includes(method)) throw makeError("INVALID_REQUEST", "不支持此操作");
+    params = validateIntegratedParams(method, params);
     if (!this.capabilities.includes("integrated-settings-v1")) {
       await this.requireIpc();
       if (!this.capabilities.includes("integrated-settings-v1"))
@@ -817,6 +916,17 @@ class HelperManager {
   dispose() {
     this.pipe.close();
   }
+
+  async stopOnPluginOut() {
+    if (this.startPromise) {
+      try { await this.startPromise; } catch (_) {}
+    }
+    try {
+      await this.stop();
+    } finally {
+      this.dispose();
+    }
+  }
 }
 
 const manager = new HelperManager();
@@ -862,8 +972,12 @@ if (global.utools && typeof utools.onPluginEnter === "function") {
 }
 
 if (global.utools && typeof utools.onPluginOut === "function") {
-  utools.onPluginOut((isKill) => {
-    if (isKill) manager.dispose();
+  utools.onPluginOut(() => {
+    if (!manager.exitPromise) {
+      manager.exitPromise = manager.stopOnPluginOut()
+        .catch((error) => manager.emit("error", error))
+        .finally(() => { manager.exitPromise = null; });
+    }
   });
 }
 

@@ -9,17 +9,29 @@ const renderer = readFileSync(resolve(root, "renderer.js"), "utf8");
 const preload = readFileSync(resolve(root, "preload.js"), "utf8");
 const manifest = JSON.parse(readFileSync(resolve(root, "plugin.json"), "utf8"));
 
-for (const id of ["navigation", "connection", "content", "savebar", "dialog", "importFile"]) {
+for (const id of ["navigation", "connection", "content", "savebar", "saveState", "dialog", "importFile"]) {
   assert.match(html, new RegExp(`id=["']${id}["']`), `index.html 缺少 ${id}`);
 }
 assert.equal(manifest.main, "index.html");
 assert.equal(manifest.preload, "preload.js");
 assert.ok(manifest.features.some((feature) => feature.code === "windowtabs"));
 assert.match(html, /settings-model\.js/);
+assert.doesNotMatch(html, /mock\.js/);
+assert.doesNotMatch(html, /搜索当前页设置|id=["']search["']/);
+assert.doesNotMatch(renderer, /search/);
+assert.match(renderer, /aria-label.*本页目录/);
+assert.match(renderer, /aria-selected/);
+assert.match(renderer, /已启用标签/);
+assert.match(renderer, /应用排序方式/);
+assert.match(renderer, /工作区排序方式/);
+assert.match(renderer, /重启 WindowTabs/);
 assert.match(renderer, /settingsSnapshot/);
 assert.match(renderer, /workspaceRestoreStatus/);
 assert.doesNotMatch(renderer, /openSettings/);
 assert.match(preload, /JSON\.parse\(line\.replace\(\/\^\\uFEFF\//, "preload.js must tolerate a UTF-8 BOM");
+assert.match(preload, /PLUGIN_VERSION = "1\.0\.6"/);
+assert.equal(manifest.version, "1.0.6");
+assert.match(renderer, /standard-software\/WindowTabs/);
 
 const require = createRequire(import.meta.url);
 const M = require(resolve(root, "settings-model.js"));

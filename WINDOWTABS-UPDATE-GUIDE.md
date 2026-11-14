@@ -15,12 +15,13 @@
 9. 下载同一次成功构建的 `dist/market` artifact。不要混用另一次构建的 exe、`current.json` 或设置字段表。
 10. 可选：在 Windows uTools 中抽查应用规则、四边外观、颜色、操作习惯、快捷键、工作区捕获/编辑/恢复、开机启动、备份导入、暂停与停止、旧插件升级。未执行人工抽查不阻断发布；发现明确回归时应先修复并重跑自动测试。
 11. 自动测试和 artifact 清单校验通过后，用该次成功构建的 artifact 市场目录替换本地 `dist/market`，并在 uTools 开发者工具选择该目录发布。
+12. 市场目录必须同时包含 `LICENSES/WindowTabs-MIT.txt`、`THIRD-PARTY-NOTICES.md`、`SOURCE-BUILD.md`、`audit/source-manifest.json` 和对应的补丁副本。审计清单中的上游 commit、补丁哈希、schema 哈希、exe 哈希和运行时证明必须完全一致。
 
 ## 自动发布门槛
 
 `helper/current.json` 必须同时匹配版本、上游 Tag 和 commit、`patchId`、`buildId`、exe 的 `sha256`、`contractVersion`、`integrated-settings-v1`、字段表 `schemaSha256`，以及同一个 exe/字段表/构建身份的 `runtimeVerification`。任何一项不一致，`package-plugin.sh` 都会停止，现有 `dist/market` 不会被删除。
 
-市场目录使用白名单，只包含插件页面、字段表、图标、preload 和一个经过验证的核心版本。
+市场目录使用白名单，包含插件页面、字段表、图标、preload、许可证/构建说明、审计补丁和一个经过验证的核心版本；开发期 `mock.js`、测试、源码工作树和旧核心不得进入市场目录。
 
 ## 可直接交给 Codex 的更新 Prompt
 

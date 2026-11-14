@@ -69,7 +69,7 @@
     const ready=status.state==='READY', integrated=ready&&status.capabilities?.includes('integrated-settings-v1');
     $('statusDot').className='dot'+(ready&&!status.disabled?' ready':'');
     $('statusText').textContent=ready?(status.disabled?'已暂停':'已启用'):status.state==='UNSUPPORTED_PLATFORM'?'需要 Windows 电脑':status.state==='INSTALLED_STOPPED'?'尚未启用':'等待连接';
-    $('statusDescription').textContent=ready?(integrated?(status.disabled?'窗口保留原样，恢复后继续显示标签。':'关闭这个面板后，窗口标签仍会继续工作。'):'当前组件需要更新，暂时无法使用插件内设置。'):status.state==='UNSUPPORTED_PLATFORM'?'可以查看设计说明，窗口管理功能需在 Windows 使用。':status.state==='INSTALLED_STOPPED'?'窗口标签尚未启动，点击右侧按钮即可开始。':'暂时无法连接窗口标签。可以重试连接；仍无效时再重启窗口标签。';
+    $('statusDescription').textContent=ready?(integrated?(status.disabled?'窗口保留原样，恢复后继续显示标签。':'关闭插件面板后，窗口标签将停止。'):'当前组件需要更新，暂时无法使用插件内设置。'):status.state==='UNSUPPORTED_PLATFORM'?'可以查看设计说明，窗口管理功能需在 Windows 使用。':status.state==='INSTALLED_STOPPED'?'窗口标签尚未启动，点击右侧按钮即可开始。':'暂时无法连接窗口标签。可以重试连接；仍无效时再重启窗口标签。';
     const actions=$('connectionActions'); actions.replaceChildren();
     if (ready&&integrated) actions.append(button(status.disabled?'恢复使用':'暂停标签',async()=>{
       await api.integrated('setEnabled',{enabled:Boolean(status.disabled)});status=await api.getStatus();render();
@@ -356,7 +356,7 @@
         const info=await api.integrated('storageInfo'),snapshot=await api.integrated('settingsSnapshot');
         const toPortable=info.location!=='portable';
         if(await ask('切换数据存放方式？',el('p',{},toPortable?'将设置移动到内置组件旁边，并保留原文件备份。更新组件前需先返回用户文件夹，以免设置随旧目录遗留。':'将便携设置移回 Windows 用户文件夹。若目标已有设置，将停止操作以避免覆盖。'),'切换')){await api.integrated('storageTransfer',{toPortable,move:true,revision:snapshot.revision});await refreshSnapshot(true);note('已切换数据存放位置。');}
-      }))),card('帮助',el('p',{class:'help'},'关闭面板或退出 uTools 后，窗口标签仍会继续运行。旧版本中已开启自动启动的用户，该偏好仍会保留；如需关闭，请在 WindowTabs 的启动设置中关闭。卸载插件前，建议先关闭窗口标签。'),el('details',{},el('summary',{},'连接失败或无法使用？'),el('p',{class:'help'},'先重试连接；仍无效时再重启窗口标签。如果电脑上还运行着独立安装的 WindowTabs，请先退出它。复制诊断信息前，请检查其中的个人路径。'),el('div',{class:'actions'},button('重试连接',()=>connect(false)),button('重启 WindowTabs',()=>connect(true)),button('重新读取设置',()=>refreshSnapshot()),button('复制诊断信息',async()=>{await api.copyDiagnostics();note('诊断信息已复制。分享前请检查其中的个人路径。');}),button('停止窗口标签',async()=>{if(await ask('停止窗口标签？',el('p',{},'所有应用窗口会保留，但不再显示标签。'),'停止')){status=await api.stop();draft=null;render();}}))),el('p',{class:'help'},'插件版本 1.0.4 · 基于开源 WindowTabs'))];
+      }))),card('帮助',el('p',{class:'help'},'关闭插件面板时将停止窗口标签，已打开的应用窗口会保留。旧版本中已开启自动启动的用户，该偏好仍会保留；如需关闭，请在 WindowTabs 的启动设置中关闭。卸载插件前，建议先关闭窗口标签。'),el('details',{},el('summary',{},'连接失败或无法使用？'),el('p',{class:'help'},'先重试连接；仍无效时再重启窗口标签。如果电脑上还运行着独立安装的 WindowTabs，请先退出它。复制诊断信息前，请检查其中的个人路径。'),el('div',{class:'actions'},button('重试连接',()=>connect(false)),button('重启 WindowTabs',()=>connect(true)),button('重新读取设置',()=>refreshSnapshot()),button('复制诊断信息',async()=>{await api.copyDiagnostics();note('诊断信息已复制。分享前请检查其中的个人路径。');}),button('停止窗口标签',async()=>{if(await ask('停止窗口标签？',el('p',{},'所有应用窗口会保留，但不再显示标签。'),'停止')){status=await api.stop();draft=null;render();}}))),el('p',{class:'help'},'本项目基于 standard-software/WindowTabs 修改，原项目采用 MIT License'))];
   }
   async function importBackup(file) {
     if(!file)return;if(file.size>750000)throw new Error('备份文件过大，请选择小于 750 KB 的文件。');
