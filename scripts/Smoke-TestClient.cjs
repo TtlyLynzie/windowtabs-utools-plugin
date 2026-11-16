@@ -98,7 +98,7 @@ async function main() {
       })]);
     } finally { clearTimeout(timer); }
     const proof = { passed:true, suite:"integrated-settings-v1", buildId:manifest.buildId,
-      sha256:manifest.sha256, schemaSha256, testedAt:new Date().toISOString() };
+      sha256:manifest.sha256, schemaSha256, updaterDisabled:true, testedAt:new Date().toISOString() };
     if (process.argv[3]) fs.writeFileSync(path.resolve(process.argv[3]), JSON.stringify(proof, null, 2)+"\n");
     console.log(`Integrated settings runtime passed: ${manifest.patchId} (${manifest.sha256})`);
   } catch (error) {
