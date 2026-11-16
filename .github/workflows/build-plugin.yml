@@ -81,8 +81,9 @@ jobs:
           if ([string]::IsNullOrWhiteSpace($msbuild)) { throw 'MSBuild was not found.' }
           & $msbuild "$env:GITHUB_WORKSPACE\WindowTabs-source\WtProgram\WtProgram.fsproj" /t:Rebuild /p:Configuration=Release /p:Platform=AnyCPU /v:minimal
           if ($LASTEXITCODE -ne 0) { throw "MSBuild failed: $LASTEXITCODE" }
-          $env:WT_MSBUILD_PATH = $msbuild
-          $env:WT_MSBUILD_VERSION = (& $msbuild -version -nologo | Select-Object -Last 1).Trim()
+          $msbuildVersion = (& $msbuild -version -nologo | Select-Object -Last 1).Trim()
+          "WT_MSBUILD_PATH=$msbuild" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "WT_MSBUILD_VERSION=$msbuildVersion" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: Install helper and generate manifest
         shell: pwsh
@@ -156,6 +157,7 @@ jobs:
       - name: Validate JavaScript
         shell: pwsh
         run: |
+          $PSNativeCommandUseErrorActionPreference = $true
           node --check preload.js
           node --check renderer.js
           node tests/smoke-test.mjs
