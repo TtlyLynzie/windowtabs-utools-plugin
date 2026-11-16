@@ -28,7 +28,7 @@ node (Join-Path $root 'scripts\generate-file-hashes.mjs') (Join-Path $bundle 'bu
 
 $current = Get-Content (Join-Path $root 'helper\current.json') -Raw | ConvertFrom-Json
 $helperDirectory = Split-Path $current.path -Parent
-$distributionHelper = Join-Path $root (Join-Path 'helper' $helperDirectory)
+$distributionHelper = Join-Path $root (Join-Path 'dist\market\helper' $helperDirectory)
 if (-not (Test-Path $distributionHelper)) { throw "Distribution helper directory was not found: $distributionHelper" }
 node (Join-Path $root 'scripts\generate-file-hashes.mjs') $distributionHelper (Join-Path $bundle 'distribution-helper-file-hashes.json') "helper/$($helperDirectory.Replace('\', '/'))"
 
