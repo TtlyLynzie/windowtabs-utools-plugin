@@ -24,5 +24,6 @@ if (hash('settings-schema.json') !== manifest.schemaSha256) throw Error('Audit s
 if (hash(`helper/${current.path}`) !== current.sha256) throw Error('Helper SHA-256 mismatch');
 if (!manifest.runtimeVerification?.passed || manifest.runtimeVerification.sha256 !== current.sha256 ||
     manifest.runtimeVerification.schemaSha256 !== current.schemaSha256 ||
-    manifest.runtimeVerification.buildId !== current.buildId) throw Error('Runtime proof does not match helper');
+    manifest.runtimeVerification.buildId !== current.buildId ||
+    manifest.runtimeVerification.updaterDisabled !== true) throw Error('Runtime proof does not match helper');
 console.log(`Verified audit manifest: ${manifest.buildId}`);

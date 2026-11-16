@@ -5,10 +5,10 @@ The helper in this plugin is a modified build of the MIT-licensed
 release executable: the build adds a versioned named-pipe IPC server and the
 `integrated-settings-v1` contract used by the uTools plugin.
 
-The exact source commit, upstream release asset digest, patch digest, schema
-digest, executable digest, and runtime proof are recorded in
-`audit/source-manifest.json`. The complete patch is included at
-`audit/patches/upstream-integrated-v12.txt` in the audit package.
+The exact source commit, upstream release asset digest, patch digests, schema
+digest, executable digest, per-file source hashes, MSBuild version, build
+arguments, and runtime proof are recorded in the audit artifact's
+`source-manifest.json`. The complete patched source tree is included there.
 
 ## Rebuild procedure
 
@@ -17,11 +17,14 @@ digest, executable digest, and runtime proof are recorded in
 2. Verify the downloaded upstream release asset against
    `upstreamReleaseSha256` in that manifest.
 3. Apply the recorded patch with `git apply --check` first, then `git apply`.
-4. Restore the pinned NuGet packages from `WtProgram/packages.config`.
-5. Build `WtProgram/WtProgram.fsproj` with Visual Studio MSBuild, Release and
-   AnyCPU configuration.
-6. Run the Windows IPC smoke test and the integrated settings contract test.
-7. Compare the resulting `WindowTabs.exe` and `settings-schema.json` hashes
+4. Apply the updater-disable patch, which removes the update menu action and
+   all WebClient download/install paths.
+5. Restore the pinned NuGet packages from `WtProgram/packages.config`.
+6. Build `WtProgram/WtProgram.fsproj` with Visual Studio MSBuild, Release and
+   AnyCPU configuration. The exact MSBuild path/version and arguments are
+   recorded in `build-record.json`.
+7. Run the Windows IPC smoke test and the integrated settings contract test.
+8. Compare the resulting `WindowTabs.exe` and `settings-schema.json` hashes
    with the manifest before packaging.
 
 The GitHub Actions workflow `.github/workflows/build-plugin.yml` performs this
@@ -30,10 +33,10 @@ runtime proof belongs to the same executable and schema hashes recorded in
 `helper/current.json`.
 
 The same workflow uploads a separate source audit artifact containing the
-pinned upstream source tree after the patch, the patch file, license, schema,
-`current.json`, and the generated source manifest. Submit that audit artifact
-alongside the uTools market package so the bundled executable can be reviewed
-against the exact source and build record.
+complete pinned source tree after all patches, per-file SHA-256 hashes, patch
+files, license, schema, `current.json`, `build-record.json`, and the generated
+source manifest. Submit that audit artifact alongside the uTools market
+package.
 
 ## Contract scope
 

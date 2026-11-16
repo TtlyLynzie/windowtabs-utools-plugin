@@ -24,16 +24,20 @@ cp "$ROOT_DIR/plugin.json" "$ROOT_DIR/index.html" "$ROOT_DIR/renderer.js" \
   "$ROOT_DIR/styles.css" "$ROOT_DIR/preload.js" "$ROOT_DIR/logo.png" \
   "$ROOT_DIR/settings-model.js" "$ROOT_DIR/settings-schema.json" "$STAGE_DIR/"
 
-mkdir -p "$STAGE_DIR/LICENSES" "$STAGE_DIR/audit/patches"
+mkdir -p "$STAGE_DIR/LICENSES"
 cp "$ROOT_DIR/LICENSES/WindowTabs-MIT.txt" "$STAGE_DIR/LICENSES/"
-cp "$ROOT_DIR/THIRD-PARTY-NOTICES.md" "$ROOT_DIR/SOURCE-BUILD.md" "$STAGE_DIR/"
-CORE_PATCH_RELATIVE_PATH="$(node -e 'const fs=require("fs"); const m=JSON.parse(fs.readFileSync(process.argv[1], "utf8")); process.stdout.write(m.patch || "");' "$ROOT_DIR/build/core-manifest.json")"
-mkdir -p "$STAGE_DIR/audit/$(dirname "$CORE_PATCH_RELATIVE_PATH")"
-cp "$ROOT_DIR/$CORE_PATCH_RELATIVE_PATH" "$STAGE_DIR/audit/$CORE_PATCH_RELATIVE_PATH"
+cat > "$STAGE_DIR/UPSTREAM-NOTICE.txt" <<'EOF'
+WindowTabs
+Copyright (c) 2018 Maurice Flanagan
+MIT License: LICENSES/WindowTabs-MIT.txt
+Upstream base: standard-software/WindowTabs ss_2026.11.11
+This helper is rebuilt from the pinned upstream source plus the audited IPC
+and updater-disable patches. Runtime update checks and downloads are disabled.
+EOF
 
 # Only ship the active helper selected by current.json. Old helper versions,
 # tests and build scripts stay out of the uTools marketplace package; the
-# license, source-build and audit records are retained for review.
+# Only runtime files, the upstream license and a concise attribution notice ship.
 mkdir -p "$STAGE_DIR/helper"
 cp "$ROOT_DIR/helper/current.json" "$STAGE_DIR/helper/current.json"
 HELPER_RELATIVE_PATH="$(node -e 'const fs=require("fs"); const m=JSON.parse(fs.readFileSync(process.argv[1], "utf8").replace(/^\\uFEFF/, "")); process.stdout.write(m.path || "");' "$ROOT_DIR/helper/current.json")"
@@ -59,8 +63,6 @@ if [ -d "$HELPER_ROOT/Settings" ]; then
 fi
 
 node "$ROOT_DIR/scripts/validate-helper.mjs" "$STAGE_DIR"
-node "$ROOT_DIR/scripts/generate-audit-manifest.mjs" "$ROOT_DIR" "$STAGE_DIR/audit/source-manifest.json"
-node "$ROOT_DIR/scripts/validate-audit-manifest.mjs" "$STAGE_DIR"
 bash "$ROOT_DIR/scripts/validate-market-dir.sh" "$STAGE_DIR"
 PREVIOUS="$OUTPUT_DIR/.market-previous"
 if [ -e "$PREVIOUS" ]; then

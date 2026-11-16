@@ -344,6 +344,7 @@ class HelperManager {
     this.pipe = new PipeClient(this.pipeName);
     this.child = null;
     this.helperManifest = null;
+    this.helperVerified = false;
     this.startPromise = null;
     this.stopPromise = null;
     this.restartPromise = null;
@@ -357,6 +358,7 @@ class HelperManager {
     };
     this.capabilities = [];
     this.listeners = new Set();
+    this.pluginActive = false;
     this.pipe.onEvent((event) => this.emit(event.event, event.payload));
   }
 
@@ -419,8 +421,7 @@ class HelperManager {
 
   resolveHelper() {
     this.helperManifest = null;
-    const override = process.env.WINDOWTABS_HELPER_PATH;
-    if (override && fileExists(override)) return override;
+    this.helperVerified = false;
     if (process.platform !== "win32") return null;
 
     const bundledRoot = path.join(PLUGIN_ROOT, "helper");
@@ -437,7 +438,7 @@ class HelperManager {
     const sameVersion = (left, right) => Boolean(left && right &&
       left.version === right.version &&
       left.buildId === right.buildId &&
-      (!right.sha256 || right.sha256 === "pending-local-build" || left.sha256 === right.sha256));
+      left.sha256 === right.sha256);
     const localPath = resolveManifestPath(localRoot, localManifest);
     const bundledPath = resolveManifestPath(bundledRoot, bundledManifest);
 
@@ -474,15 +475,18 @@ class HelperManager {
 
   verifyHelper(helperPath) {
     const expected = this.helperManifest?.sha256;
-    if (!expected || expected === "pending-local-build") return;
+    if (!expected || !/^[a-f0-9]{64}$/i.test(String(expected))) {
+      throw makeError("HELPER_INTEGRITY", "WindowTabs helper 未配置固定校验值");
+    }
     const actual = crypto.createHash("sha256").update(fs.readFileSync(helperPath)).digest("hex");
     if (actual.toLowerCase() !== String(expected).toLowerCase()) {
       throw makeError("HELPER_INTEGRITY", "WindowTabs helper 校验失败，请重新安装插件");
     }
+    this.helperVerified = true;
   }
 
   isNativePlatform() {
-    return process.platform === NATIVE_PLATFORM || Boolean(process.env.WINDOWTABS_HELPER_PATH);
+    return process.platform === NATIVE_PLATFORM;
   }
 
   async getStatus() {
@@ -890,6 +894,7 @@ class HelperManager {
       pipeName: this.pipeName,
       helperPath,
       helperExists: Boolean(helperPath),
+      helperVerified: this.helperVerified,
       helperVersion: this.helperManifest?.version || null,
       bundledHelperVersion: bundledManifest?.version || null,
       helperSource: this.helperManifest?.source || null,
@@ -917,15 +922,15 @@ class HelperManager {
     this.pipe.close();
   }
 
-  async stopOnPluginOut() {
-    if (this.startPromise) {
-      try { await this.startPromise; } catch (_) {}
-    }
-    try {
-      await this.stop();
-    } finally {
-      this.dispose();
-    }
+  async onPluginEnter(code) {
+    this.pluginActive = true;
+    if (code === "windowtabs-settings") this.emit("navigate", { page: "general" });
+    return await this.start();
+  }
+
+  onPluginOut() {
+    this.pluginActive = false;
+    this.dispose();
   }
 }
 
@@ -963,8 +968,7 @@ expose();
 if (global.utools && typeof utools.onPluginEnter === "function") {
   utools.onPluginEnter(async ({ code }) => {
     try {
-      if (code === "windowtabs") await manager.start();
-      if (code === "windowtabs-settings") { manager.emit("navigate", {page:"general"}); await manager.start(); }
+      if (code === "windowtabs" || code === "windowtabs-settings") await manager.onPluginEnter(code);
     } catch (error) {
       manager.emit("error", error);
     }
@@ -972,12 +976,6 @@ if (global.utools && typeof utools.onPluginEnter === "function") {
 }
 
 if (global.utools && typeof utools.onPluginOut === "function") {
-  utools.onPluginOut(() => {
-    if (!manager.exitPromise) {
-      manager.exitPromise = manager.stopOnPluginOut()
-        .catch((error) => manager.emit("error", error))
-        .finally(() => { manager.exitPromise = null; });
-    }
-  });
+  utools.onPluginOut(() => manager.onPluginOut());
 }
 

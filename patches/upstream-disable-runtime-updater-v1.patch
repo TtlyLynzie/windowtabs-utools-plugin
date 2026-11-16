@@ -1,0 +1,56 @@
+diff --git a/WtProgram/DesktopPlugins/NotifyIconPlugin.fs b/WtProgram/DesktopPlugins/NotifyIconPlugin.fs
+--- a/WtProgram/DesktopPlugins/NotifyIconPlugin.fs
++++ b/WtProgram/DesktopPlugins/NotifyIconPlugin.fs
+@@
+     member this.checkForUpdates() =
+-        match DialogState.tryAcquire() with
+-        | None -> ()
+-        | Some session ->
+-            try
+-                let show message buttons defaultButton =
+-                    AppDialog.showReserved "WindowTabs" message buttons defaultButton
+-                let invoker = InvokerService.invoker
+-                let currentVersion = Services.program.version
+-                ThreadHelper.queueBackground <| fun() ->
+-                    let release = try Some(UpdateChecker.fetchLatestRelease()) with _ -> None
+-                    invoker.asyncInvoke <| fun() ->
+-                        let mutable install = None
+-                        try
+-                            match release with
+-                            | None ->
+-                                show (Localization.getString("UpdateCheckFailed")) AppDialog.OkOnly AppDialog.DefaultOk |> ignore
+-                            | Some(release) ->
+-                                if UpdateChecker.isNewer currentVersion release.tag then
+-                                    let message = String.Format(Localization.getString("UpdateAvailableFormat"), release.tag)
+-                                    if show message AppDialog.OkCancel AppDialog.DefaultCancel = DialogResult.OK then
+-                                        install <- Some release
+-                                else
+-                                    show (String.Format(Localization.getString("UpdateUpToDateFormat"), currentVersion)) AppDialog.OkOnly AppDialog.DefaultOk |> ignore
+-                        finally
+-                            session.Dispose()
+-                        install |> Option.iter this.startUpdate
+-            with _ ->
+-                session.Dispose()
+-                reraise()
++        // Disabled for the uTools distribution. The helper never checks,
++        // downloads, installs, or executes a replacement executable.
++        ()
+@@
+     member this.startUpdate(release: UpdateChecker.ReleaseInfo) =
+-        let invoker = InvokerService.invoker
+-        let useMsi = UpdateChecker.isMsiInstall()
+-        match (if useMsi then release.msiUrl else release.zipUrl) with
+-        | None ->
+-            AppDialog.info "WindowTabs" (Localization.getString("UpdateDownloadFailed"))
+-        | Some(url) ->
+-            this.icon.ShowBalloonTip(1000, "WindowTabs", Localization.getString("UpdateDownloading"), ToolTipIcon.Info)
+-            ThreadHelper.queueBackground <| fun() ->
+-                let downloaded = try Some(UpdateChecker.download url) with _ -> None
+-                invoker.asyncInvoke <| fun() ->
+-                    match downloaded with
+-                    | None ->
+-                        AppDialog.info "WindowTabs" (Localization.getString("UpdateDownloadFailed"))
+-                    | Some(path) ->
+-                        if useMsi then UpdateChecker.installMsi path
+-                        else UpdateChecker.installZipAndExit path
++        ()

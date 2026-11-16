@@ -8,7 +8,7 @@ test -f "$PACKAGE_PATH"
 command -v unzip >/dev/null 2>&1 || { echo "unzip is required" >&2; exit 127; }
 
 entries="$(unzip -Z1 "$PACKAGE_PATH")"
-for required in plugin.json index.html preload.js renderer.js styles.css logo.png helper/current.json LICENSES/WindowTabs-MIT.txt THIRD-PARTY-NOTICES.md SOURCE-BUILD.md audit/source-manifest.json; do
+for required in plugin.json index.html preload.js renderer.js styles.css logo.png helper/current.json LICENSES/WindowTabs-MIT.txt UPSTREAM-NOTICE.txt; do
   grep -Fxq "$required" <<<"$entries" || { echo "missing package entry: $required" >&2; exit 1; }
 done
 
@@ -22,7 +22,10 @@ for forbidden in README.md native/WindowTabsIpc.fs patches/upstream-ipc.patch bu
   fi
 done
 
-grep -E '^audit/patches/[^/]+\.txt$' <<<"$entries" >/dev/null || { echo "missing bundled audit patch" >&2; exit 1; }
+if grep -E '^(audit/|SOURCE-BUILD\.md$|THIRD-PARTY-NOTICES\.md$)' <<<"$entries" >/dev/null; then
+  echo "developer audit/build material must not be bundled" >&2
+  exit 1
+fi
 
 helper_count="$(grep -E '^helper/[^/]+/WindowTabs\.exe$' <<<"$entries" | wc -l | tr -d ' ')"
 test "$helper_count" = "1" || { echo "package must contain exactly one active WindowTabs.exe" >&2; exit 1; }

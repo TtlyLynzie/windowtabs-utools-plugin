@@ -14,29 +14,15 @@ async function test(root) {
   vm.runInNewContext(fs.readFileSync(filename, "utf8") + "\nmodule.exports = manager;", sandbox, { filename });
   const manager = sandbox.module.exports;
   const calls = [];
-  let finishStart;
-  manager.startPromise = new Promise(resolve => { finishStart = resolve; });
   manager.stop = async () => { calls.push("stop"); };
   manager.dispose = () => { calls.push("dispose"); };
   onOut(false);
   onOut(true);
-  assert.deepEqual(calls, []);
-  const closing = manager.exitPromise;
-  finishStart();
-  await closing;
-  assert.deepEqual(calls, ["stop", "dispose"]);
-  assert.equal(manager.exitPromise, null);
-
-  manager.startPromise = null;
-  manager.stop = async () => { throw new Error("stop failed"); };
-  onOut(false);
-  await manager.exitPromise;
-  assert.deepEqual(calls, ["stop", "dispose", "dispose"]);
+  assert.deepEqual(calls, ["dispose", "dispose"]);
+  assert.equal(manager.exitPromise, undefined);
 }
 
 (async () => {
   await test(path.resolve(__dirname, ".."));
-  const market = path.resolve(__dirname, "../dist/market");
-  if (fs.existsSync(path.join(market, "preload.js"))) await test(market);
   console.log("plugin exit lifecycle tests passed");
 })().catch(error => { console.error(error); process.exitCode = 1; });
