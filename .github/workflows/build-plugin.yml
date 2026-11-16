@@ -9,6 +9,7 @@ on:
         default: ss_2026.11.11
   push:
     paths:
+      - '.gitattributes'
       - '.github/workflows/build-plugin.yml'
       - 'patches/**'
       - 'build/**'
