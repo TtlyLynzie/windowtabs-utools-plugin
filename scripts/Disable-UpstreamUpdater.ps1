@@ -3,28 +3,28 @@ $path = Join-Path $env:GITHUB_WORKSPACE 'WindowTabs-source\WtProgram\DesktopPlug
 $source = Get-Content $path -Raw
 $sections = @(
     @{
-        Start = '(?m)^// Auto-update: checks the GitHub releases of this repository and installs a$'
-        End = '(?m)^type NotifyIconPlugin\(\) as this ='
+        Start = '// Auto-update: checks the GitHub releases of this repository and installs a'
+        End = 'type NotifyIconPlugin() as this ='
         Replacement = ''
         Name = 'UpdateChecker module'
     },
     @{
-        Start = '(?m)^    // Check the latest GitHub release and report the result\.'
-        End = '(?m)^    // Restart application using normal shutdown$'
+        Start = '    // Check the latest GitHub release and report the result.'
+        End = '    // Restart application using normal shutdown'
         Replacement = ''
         Name = 'tray updater methods'
     },
     @{
-        Start = '(?m)^            let updateMenuItem = new MenuItem\(Localization\.getString\("CheckForUpdates"\)\)$'
-        End = '(?m)^            // Both ask first:'
+        Start = '            let updateMenuItem = new MenuItem(Localization.getString("CheckForUpdates"))'
+        End = '            // Both ask first:'
         Replacement = ''
         Name = 'tray updater menu item'
     }
 )
 
 foreach ($section in $sections) {
-    $startMatches = [regex]::Matches($source, $section.Start)
-    $endMatches = [regex]::Matches($source, $section.End)
+    $startMatches = [regex]::Matches($source, [regex]::Escape($section.Start))
+    $endMatches = [regex]::Matches($source, [regex]::Escape($section.End))
     if ($startMatches.Count -ne 1 -or $endMatches.Count -ne 1 -or $startMatches[0].Index -ge $endMatches[0].Index) {
         throw "Expected one ordered start/end marker for $($section.Name)."
     }
