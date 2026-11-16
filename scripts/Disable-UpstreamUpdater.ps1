@@ -20,8 +20,10 @@ $forbidden = @(
 )
 $sources = Get-ChildItem $sourceRoot -Recurse -File -Include *.fs,*.cs
 foreach ($token in $forbidden) {
-    if ($sources | Select-String -SimpleMatch $token -Quiet) {
-        throw "Runtime network updater token remains in patched source: $token"
+    $matches = Select-String -Path $sources.FullName -SimpleMatch $token
+    if ($matches) {
+        $locations = ($matches | ForEach-Object { "$($_.Path):$($_.LineNumber)" }) -join ', '
+        throw "Runtime network updater token remains in patched source: $token ($locations)"
     }
 }
 Write-Host 'Applied audited updater-disable patch; runtime checks, downloads, execution and feedback URL are absent.'
