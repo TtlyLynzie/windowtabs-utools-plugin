@@ -194,4 +194,5 @@ jobs:
         with:
           name: windowtabs-utools-plugin-${{ env.CORE_TAG }}-audit
           path: audit-bundle
+          include-hidden-files: true
           if-no-files-found: error
