@@ -12,7 +12,7 @@ windowtabs-utools-plugin/
 ├─ index.html        # 主界面
 ├─ renderer.js       # 前端交互
 ├─ styles.css        # 页面样式
-├─ preload.js        # helper 生命周期和 Named Pipe IPC
+├─ preload.js        # 原生能力封装、helper 生命周期和 Named Pipe IPC
 ├─ logo.png          # Big Sur 风格插件图标（256×256 PNG）
 └─ helper/
    ├─ current.json
@@ -21,7 +21,7 @@ windowtabs-utools-plugin/
 
 ## 接入原生核心
 
-当前目标核心为 WindowTabs `ss_2026.11.11`，由 Windows CI 从官方 Tag 编译并集成 uTools IPC：
+当前目标核心为 WindowTabs 官方 release `ss_2026.11.11`：
 
 ```text
 windowtabs-utools-plugin/helper/
@@ -32,9 +32,9 @@ windowtabs-utools-plugin/helper/
    └─ Settings/
 ```
 
-`current.json` 让插件按版本目录定位 helper，并记录上游 release 地址和真实 SHA-256。插件会在首次启动和插件升级后校验，并把新版本同步到 uTools 本地数据目录。
+`current.json` 让插件按版本目录定位 helper，并记录上游 release、源码 commit、补丁身份和真实 SHA-256。插件会在首次启动和插件升级后校验，并把新版本同步到 uTools 本地数据目录。uTools 发行版已从源码层移除托盘更新检查、网络下载、替换执行文件和外部反馈网址；helper 不会在用户机器上下载或执行新 EXE。
 
-如果重新放置其他版本的 WindowTabs，请保持“版本目录 + `current.json`”结构。官方原始 exe 没有 uTools IPC 时，插件会显示兼容模式；当前内置版本已经是带 IPC 的自编译版本。
+如果重新放置其他版本的 WindowTabs，请保持“版本目录 + `current.json`”结构。官方原始 exe 没有 uTools IPC 时，插件会显示兼容模式。
 
 带 IPC 的核心包含我们设计的 Named Pipe Server。插件可以定位并启动它，并在 IPC 不可用时进入兼容模式；要让 uTools 查询状态、重启核心和打开设置，原生核心需要：
 
@@ -47,26 +47,6 @@ windowtabs-utools-plugin/helper/
 
 在 uTools 开发者工具中，将本目录作为开发工程安装。正式打包时，打包目录必须包含 `plugin.json`、`index.html`、`preload.js`、前端资源和 `helper` 目录。
 
-## 环境变量
-
-开发联调时可以使用：
-
-```text
-WINDOWTABS_HELPER_PATH=C:\\path\\to\\WindowTabs.exe
-WINDOWTABS_PIPE_NAME=\\\\.\\pipe\\windowtabs-dev
-```
-
-开发阶段可以把 `WINDOWTABS_HELPER_PATH` 指向 `dev/mock-helper.js`。插件会自动使用当前 Node.js 解释器启动 `.js` helper：
-
-```text
-WINDOWTABS_HELPER_PATH=<插件目录>\\dev\\mock-helper.js
-WINDOWTABS_PIPE_NAME=\\\\.\\pipe\\windowtabs-dev
-```
-
-Mock helper 支持 `status`、`stop`、`restart`、`openSettings`、`getConfig` 和 `updateConfig`，用于验证 uTools 页面、状态机和 IPC 客户端。
-
-这样可以在不修改插件代码的情况下指定 helper 和命名管道名称。
-
 ## 准备 uTools 应用市场版本
 
 在 macOS/Linux 或带有 `zip` 命令的 Windows 环境执行：
@@ -75,11 +55,11 @@ Mock helper 支持 `status`、`stop`、`restart`、`openSettings`、`getConfig` 
 ./package-plugin.sh
 ```
 
-维护者可以使用脚本校验 `helper/current.json` 和核心 SHA-256，并生成提交 uTools 应用市场所需的构建文件。发布构建采用白名单，市场目录包含当前版本核心、运行所需的 `Settings`、上游 MIT 许可证、来源声明、构建说明和审计补丁清单，不会包含旧版核心、开发期 mock、测试、构建脚本或项目源码。生成的 `dist/market` 是市场发布目录，提交 uTools 应用市场时应选择这个目录，不要选择包含开发文件的项目根目录。Windows CI 还会上传包含完整上游源码快照和补丁的独立审计 artifact。用户通过 uTools 应用市场安装插件，不需要单独安装 WindowTabs。插件首次启动和升级时会比较内置版本与 uTools 本地缓存，版本变化时自动同步新核心。
+维护者可以使用脚本校验 `helper/current.json` 和核心 SHA-256，并生成提交 uTools 应用市场所需的构建文件。发布构建采用白名单，市场目录只包含当前版本核心、运行所需的 `Settings`、MIT 许可证和精简来源声明，不包含审计补丁、源码和构建记录。
 
 ### 无 Windows 电脑时的构建
 
-`.github/workflows/build-plugin.yml` 使用 GitHub Actions 的 `windows-latest` runner 自动完成以下工作：读取 `build/core-manifest.json`、下载指定 WindowTabs tag、应用补丁、恢复 NuGet 包、编译带 IPC 的核心、生成 `helper/current.json`，运行 JavaScript 和安装包检查，并上传构建产物。将本目录作为 GitHub 仓库后，在 Actions 页面手动运行工作流即可，不需要本地 Windows 电脑。
+`.github/workflows/build-plugin.yml` 使用 GitHub Actions 的 `windows-latest` runner 自动完成以下工作：读取 `build/core-manifest.json`、下载指定 WindowTabs tag、应用 IPC 补丁和 updater-disable 补丁、恢复 NuGet 包、编译带 IPC 的核心、生成 `helper/current.json`，运行真实核心测试，并交叉校验市场包与独立源码审核包。审核包包含完整补丁后源码、完整构建输出、逐文件 SHA-256、MSBuild 版本和参数。将本目录作为 GitHub 仓库后，在 Actions 页面手动运行工作流即可，不需要本地 Windows 电脑。
 
 如果用户已有旧版插件缓存，插件启动时会比较 SHA-256 并自动同步 `current.json` 指向的新核心。只有在核心不支持 IPC 或校验失败时，插件才会进入兼容模式。
 

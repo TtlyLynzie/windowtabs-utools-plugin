@@ -22,7 +22,8 @@ node "$ROOT_DIR/scripts/validate-helper.mjs" "$ROOT_DIR"
 
 cp "$ROOT_DIR/plugin.json" "$ROOT_DIR/index.html" "$ROOT_DIR/renderer.js" \
   "$ROOT_DIR/styles.css" "$ROOT_DIR/preload.js" "$ROOT_DIR/logo.png" \
-  "$ROOT_DIR/settings-model.js" "$ROOT_DIR/settings-schema.json" "$STAGE_DIR/"
+  "$ROOT_DIR/settings-model.js" "$ROOT_DIR/settings-schema.json" \
+  "$ROOT_DIR/lifecycle-state.js" "$ROOT_DIR/settings-storage.js" "$STAGE_DIR/"
 
 mkdir -p "$STAGE_DIR/LICENSES"
 cp "$ROOT_DIR/LICENSES/WindowTabs-MIT.txt" "$STAGE_DIR/LICENSES/"

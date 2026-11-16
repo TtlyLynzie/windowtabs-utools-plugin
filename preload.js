@@ -6,6 +6,8 @@ const os = require("os");
 const net = require("net");
 const crypto = require("crypto");
 const { spawn } = require("child_process");
+const { LifecycleState } = require("./lifecycle-state.js");
+const { prepareSettingsPath } = require("./settings-storage.js");
 
 const PLUGIN_ROOT = __dirname;
 const PROTOCOL_VERSION = 1;
@@ -349,18 +351,19 @@ class HelperManager {
     this.stopPromise = null;
     this.restartPromise = null;
     this.logLines = [];
-    this.state = "INSTALLED_STOPPED";
-    this.lastStatus = {
-      state: this.state,
+    this.lifecycle = new LifecycleState("INSTALLED_STOPPED", {
       message: "WindowTabs 尚未运行",
       protocol: PROTOCOL_VERSION,
       groupCount: 0
-    };
+    });
     this.capabilities = [];
     this.listeners = new Set();
     this.pluginActive = false;
     this.pipe.onEvent((event) => this.emit(event.event, event.payload));
   }
+
+  get state() { return this.lifecycle.state; }
+  get lastStatus() { return this.lifecycle.snapshot(); }
 
   onEvent(listener) {
     this.listeners.add(listener);
@@ -369,8 +372,7 @@ class HelperManager {
 
   emit(event, payload) {
     if (event === "stateChanged" && payload) {
-      if (payload.state) this.state = payload.state;
-      this.lastStatus = payload;
+      this.lifecycle.replace(payload);
     }
     for (const listener of this.listeners) {
       try { listener({ event, payload }); } catch (_) {}
@@ -386,14 +388,11 @@ class HelperManager {
   }
 
   setState(state, patch = {}) {
-    this.state = state;
-    this.lastStatus = {
-      ...this.lastStatus,
+    const status = this.lifecycle.transition(state, {
       ...patch,
-      state,
       protocol: PROTOCOL_VERSION
-    };
-    this.emit("stateChanged", this.lastStatus);
+    });
+    this.emit("stateChanged", status);
   }
 
   isChildAlive() {
@@ -639,19 +638,7 @@ class HelperManager {
 
     this.setState("STARTING", { message: "正在启动 WindowTabs", error: null });
     try {
-      const settingsPath = path.join(getPluginDataPath(), "settings", "WindowTabsSettings.json");
-      // Migrate once by copying; never delete or overwrite a standalone user's file.
-      if (!fileExists(settingsPath) && !fileExists(settingsPath.replace(/\.json$/, ".txt"))) {
-        const oldRoot = path.join(process.env.APPDATA || getPluginDataPath(), "WindowTabs");
-        for (const ext of ["json", "txt"]) {
-          const source = path.join(oldRoot, `WindowTabsSettings.${ext}`);
-          if (fileExists(source)) {
-            fs.mkdirSync(path.dirname(settingsPath), { recursive: true });
-            fs.copyFileSync(source, settingsPath.replace(/\.json$/, `.${ext}`), fs.constants.COPYFILE_EXCL);
-            break;
-          }
-        }
-      }
+      const settingsPath = prepareSettingsPath(getPluginDataPath(), process.env.APPDATA);
       const helperArgs = [`--windowtabs-ipc-pipe=${this.pipeName}`, `--windowtabs-settings=${settingsPath}`];
       const command = helperPath.toLowerCase().endsWith(".js") ? process.execPath : helperPath;
       const commandArgs = helperPath.toLowerCase().endsWith(".js")
@@ -930,6 +917,8 @@ class HelperManager {
 
   onPluginOut() {
     this.pluginActive = false;
+    // The uTools panel closing is not a request to stop the background helper.
+    // Closing this renderer's pipe lets the next panel entry reconnect cleanly.
     this.dispose();
   }
 }
