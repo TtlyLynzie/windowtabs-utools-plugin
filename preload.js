@@ -683,13 +683,11 @@ class HelperManager {
       const settingsPath = prepareSettingsPath(getPluginDataPath(), process.env.APPDATA);
       const startToken = crypto.randomBytes(16).toString("hex");
       const parentPid = process.pid;
-      const cleanupPath = getLocalHelperRoot();
       const helperArgs = [
         `--windowtabs-ipc-pipe=${this.pipeName}`,
         `--windowtabs-settings=${settingsPath}`,
         `--windowtabs-parent-pid=${parentPid}`,
-        `--windowtabs-start-token=${startToken}`,
-        `--windowtabs-cleanup-path=${cleanupPath}`
+        `--windowtabs-start-token=${startToken}`
       ];
       const command = helperPath.toLowerCase().endsWith(".js") ? process.execPath : helperPath;
       const commandArgs = helperPath.toLowerCase().endsWith(".js")
@@ -1054,8 +1052,9 @@ class HelperManager {
       return;
     }
     // This callback is synchronous in uTools. Start the asynchronous graceful
-    // shutdown immediately; the helper's parent monitor is the final safety
+    // shutdown immediately. The helper's parent monitor is the final safety
     // net if uTools tears down this plugin process before the promise settles.
+    // Stopping the process never removes the installed helper files.
     void this.stopForKill();
   }
 
