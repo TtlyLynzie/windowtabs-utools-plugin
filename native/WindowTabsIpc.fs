@@ -223,8 +223,11 @@ module WindowTabsIpc =
             | Some target when Directory.Exists(target) ->
                 try
                     let script = Path.Combine(Path.GetTempPath(), sprintf "windowtabs-cleanup-%d.cmd" (Process.GetCurrentProcess().Id))
+                    let dataRoot = Directory.GetParent(target).FullName
+                    let managedRecord = Path.Combine(dataRoot, "managed-windowtabs.json")
                     let escapedTarget = target.Replace("\"", "\"\"")
-                    let command = sprintf "/d /c timeout /t 3 /nobreak >nul & rmdir /s /q \"%s\" & del /q \"%s\"" escapedTarget script
+                    let escapedRecord = managedRecord.Replace("\"", "\"\"")
+                    let command = sprintf "/d /c timeout /t 3 /nobreak >nul & rmdir /s /q \"%s\" & del /q \"%s\" & del /q \"%s\"" escapedTarget escapedRecord script
                     File.WriteAllText(script, "@echo off\r\n")
                     let info = ProcessStartInfo("cmd.exe", command)
                     info.CreateNoWindow <- true
