@@ -1,6 +1,6 @@
 # 原生 IPC 接入说明
 
-`WindowTabsIpc.fs` 是针对 WindowTabs 的纯 F# IPC 实现，由对应的 `patches/upstream-integrated-v13.txt` 应用到官方源码，并加入 `WtProgram.fsproj`。`WindowTabsIpcServer.cs` 保留为独立 C# 管道服务的参考实现。
+`WindowTabsIpc.fs` 是针对 WindowTabs 的纯 F# IPC 实现，由对应的 `patches/upstream-integrated-v14.txt` 应用到官方源码，并加入 `WtProgram.fsproj`。`WindowTabsIpcServer.cs` 保留为独立 C# 管道服务的参考实现。
 
 官方发布的原始 EXE 不含 uTools IPC。要获得完整控制能力，必须从官方 Tag 应用集成补丁后，在 Windows 上重新编译；市场版本通过 GitHub Actions 构建和运行验证。
 
