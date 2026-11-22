@@ -1,0 +1,1375 @@
+{
+  "contractVersion": 1,
+  "upstream": "ss_2026.11.06",
+  "fields": [
+    {
+      "path": "EnableTabbingByDefault",
+      "label": "自动为新窗口显示标签",
+      "page": "general",
+      "type": "boolean",
+      "default": false
+    },
+    {
+      "path": "GroupTaskbarButtons",
+      "label": "合并同组窗口的任务栏按钮",
+      "page": "general",
+      "type": "boolean",
+      "default": false
+    },
+    {
+      "path": "HideInactiveTabs",
+      "label": "淡化非当前窗口的标签",
+      "page": "general",
+      "type": "boolean",
+      "default": false
+    },
+    {
+      "path": "HideTabsOnFullscreen",
+      "label": "全屏时隐藏标签",
+      "page": "general",
+      "type": "boolean",
+      "default": true
+    },
+    {
+      "path": "HideTabsWhileMoving",
+      "label": "移动窗口时隐藏标签",
+      "page": "general",
+      "type": "boolean",
+      "default": false
+    },
+    {
+      "path": "EnableTabPreview",
+      "label": "鼠标停留时显示窗口预览",
+      "page": "general",
+      "type": "boolean",
+      "default": true
+    },
+    {
+      "path": "RunAtStartup",
+      "label": "登录 Windows 后自动开启",
+      "page": "general",
+      "type": "boolean",
+      "default": false
+    },
+    {
+      "path": "EnableHoverActivate",
+      "label": "鼠标停留在标签上时切换窗口",
+      "page": "behavior",
+      "type": "boolean",
+      "default": false
+    },
+    {
+      "path": "LockWindowPosition",
+      "label": "锁定窗口位置",
+      "page": "behavior",
+      "type": "boolean",
+      "default": false
+    },
+    {
+      "path": "SnapTabHeightMargin",
+      "label": "吸附窗口时为标签留出空间",
+      "page": "behavior",
+      "type": "boolean",
+      "default": false
+    },
+    {
+      "path": "SnapOnDragDetach",
+      "label": "拖出标签后吸附到屏幕边缘",
+      "page": "behavior",
+      "type": "boolean",
+      "default": false
+    },
+    {
+      "path": "TabCloseButton",
+      "label": "关闭按钮",
+      "page": "behavior",
+      "type": "select",
+      "default": "activeOnly",
+      "options": [
+        {
+          "value": "activeOnly",
+          "label": "仅当前标签"
+        },
+        {
+          "value": "all",
+          "label": "全部标签"
+        },
+        {
+          "value": "none",
+          "label": "不显示"
+        }
+      ]
+    },
+    {
+      "path": "TabPinButton",
+      "label": "固定按钮",
+      "page": "behavior",
+      "type": "select",
+      "default": "activeOnly",
+      "options": [
+        {
+          "value": "activeOnly",
+          "label": "仅当前标签"
+        },
+        {
+          "value": "all",
+          "label": "全部标签"
+        },
+        {
+          "value": "none",
+          "label": "不显示"
+        }
+      ]
+    },
+    {
+      "path": "ChangeTabPositionOnSnap",
+      "label": "窗口吸附时标签对齐方式",
+      "page": "behavior",
+      "type": "select",
+      "default": "change",
+      "options": [
+        {
+          "value": "change",
+          "label": "随吸附方向调整"
+        },
+        {
+          "value": "nochange",
+          "label": "保持不变"
+        }
+      ]
+    },
+    {
+      "path": "TabPreviewDelay",
+      "label": "显示预览前等待",
+      "page": "behavior",
+      "type": "number",
+      "default": 500,
+      "min": 0,
+      "max": 5000,
+      "unit": "秒",
+      "scale": 1000
+    },
+    {
+      "path": "TabPreviewSize",
+      "label": "预览大小",
+      "page": "behavior",
+      "type": "number",
+      "default": 320,
+      "min": 80,
+      "max": 1000,
+      "unit": "像素"
+    },
+    {
+      "path": "TabPositionByDefault",
+      "label": "顶部标签对齐",
+      "page": "appearance",
+      "type": "select",
+      "default": "TopLeft",
+      "options": [
+        {
+          "value": "TopLeft",
+          "label": "靠左"
+        },
+        {
+          "value": "TopRight",
+          "label": "靠右"
+        }
+      ]
+    },
+    {
+      "path": "TabVerticalDirection",
+      "label": "顶部标签位置",
+      "page": "appearance",
+      "type": "select",
+      "default": "auto",
+      "options": [
+        {
+          "value": "auto",
+          "label": "优先显示在窗口外"
+        },
+        {
+          "value": "down",
+          "label": "始终显示在窗口内"
+        }
+      ]
+    },
+    {
+      "path": "HideTabsWhenDownByDefault",
+      "label": "顶部标签隐藏方式",
+      "page": "appearance",
+      "type": "select",
+      "default": "never",
+      "options": [
+        {
+          "value": "never",
+          "label": "始终显示"
+        },
+        {
+          "value": "down",
+          "label": "延时隐藏"
+        },
+        {
+          "value": "doubleclick",
+          "label": "双击隐藏"
+        }
+      ]
+    },
+    {
+      "path": "HideTabsDelayMilliseconds",
+      "label": "顶部标签隐藏前等待",
+      "page": "appearance",
+      "type": "number",
+      "default": 3000,
+      "min": 0,
+      "max": 60000,
+      "scale": 1000,
+      "unit": "秒"
+    },
+    {
+      "path": "TabAppearance.tabShape",
+      "label": "顶部标签形状",
+      "page": "appearance",
+      "type": "select",
+      "default": "S-curve",
+      "options": [
+        {
+          "value": "S-curve",
+          "label": "S 曲线"
+        },
+        {
+          "value": "Strong rounded vertical line",
+          "label": "大圆角竖线"
+        },
+        {
+          "value": "Trapezoid",
+          "label": "梯形"
+        },
+        {
+          "value": "Rounded vertical line",
+          "label": "圆角竖线"
+        },
+        {
+          "value": "Angular vertical line",
+          "label": "折角竖线"
+        },
+        {
+          "value": "Left-cut trapezoid",
+          "label": "左切梯形"
+        },
+        {
+          "value": "Right-cut trapezoid",
+          "label": "右切梯形"
+        },
+        {
+          "value": "Rectangle",
+          "label": "矩形"
+        },
+        {
+          "value": "Rounded rectangle",
+          "label": "圆角矩形"
+        },
+        {
+          "value": "Strong rounded rectangle",
+          "label": "大圆角矩形"
+        },
+        {
+          "value": "Angular rectangle",
+          "label": "折角矩形"
+        }
+      ]
+    },
+    {
+      "path": "TabAppearance.tabHeight",
+      "label": "标签高度",
+      "page": "appearance",
+      "type": "number",
+      "default": 25,
+      "min": 8,
+      "max": 200,
+      "unit": "像素"
+    },
+    {
+      "path": "TabAppearance.tabMaxWidth",
+      "label": "标签最大宽度",
+      "page": "appearance",
+      "type": "number",
+      "default": 200,
+      "min": 20,
+      "max": 2000,
+      "unit": "像素"
+    },
+    {
+      "path": "TabAppearance.tabPinnedTabWidth",
+      "label": "固定标签宽度",
+      "page": "appearance",
+      "type": "number",
+      "default": 90,
+      "min": 20,
+      "max": 2000,
+      "unit": "像素"
+    },
+    {
+      "path": "TabAppearance.tabOverlap",
+      "label": "标签重叠距离",
+      "page": "appearance",
+      "type": "number",
+      "default": 12,
+      "min": 0,
+      "max": 200,
+      "unit": "像素"
+    },
+    {
+      "path": "TabAppearance.tabHeightOffset",
+      "label": "标签高度偏移",
+      "page": "appearance",
+      "type": "number",
+      "default": 1,
+      "min": -100,
+      "max": 100,
+      "unit": "像素"
+    },
+    {
+      "path": "TabAppearance.tabIndentNormal",
+      "label": "外侧左边距",
+      "page": "appearance",
+      "type": "number",
+      "default": 10,
+      "min": 0,
+      "max": 2000,
+      "unit": "像素"
+    },
+    {
+      "path": "TabAppearance.tabIndentNormalRight",
+      "label": "外侧右边距",
+      "page": "appearance",
+      "type": "number",
+      "default": 10,
+      "min": 0,
+      "max": 2000,
+      "unit": "像素"
+    },
+    {
+      "path": "TabAppearance.tabIndentFlipped",
+      "label": "内侧左边距",
+      "page": "appearance",
+      "type": "number",
+      "default": 150,
+      "min": 0,
+      "max": 2000,
+      "unit": "像素"
+    },
+    {
+      "path": "TabAppearance.tabIndentFlippedRight",
+      "label": "内侧右边距",
+      "page": "appearance",
+      "type": "number",
+      "default": 150,
+      "min": 0,
+      "max": 2000,
+      "unit": "像素"
+    },
+    {
+      "path": "TabAppearance.tabPinnedTabWidthIcon",
+      "label": "固定标签仅保留图标宽度",
+      "page": "appearance",
+      "type": "boolean",
+      "default": true
+    },
+    {
+      "path": "TabEdgeLeft.tabHeight",
+      "label": "左侧标签高度",
+      "page": "appearance",
+      "type": "number",
+      "default": 25,
+      "min": 8,
+      "max": 200,
+      "inherit": true,
+      "group": "左侧"
+    },
+    {
+      "path": "TabEdgeLeft.tabMaxWidth",
+      "label": "左侧标签最大宽度",
+      "page": "appearance",
+      "type": "number",
+      "default": 200,
+      "min": 20,
+      "max": 2000,
+      "inherit": true,
+      "group": "左侧"
+    },
+    {
+      "path": "TabEdgeLeft.tabPinnedTabWidth",
+      "label": "左侧固定标签宽度",
+      "page": "appearance",
+      "type": "number",
+      "default": 90,
+      "min": 20,
+      "max": 2000,
+      "inherit": true,
+      "group": "左侧"
+    },
+    {
+      "path": "TabEdgeLeft.tabOverlap",
+      "label": "左侧标签重叠距离",
+      "page": "appearance",
+      "type": "number",
+      "default": 12,
+      "min": 0,
+      "max": 200,
+      "inherit": true,
+      "group": "左侧"
+    },
+    {
+      "path": "TabEdgeLeft.tabPinnedTabWidthIcon",
+      "label": "左侧固定标签仅显示图标",
+      "page": "appearance",
+      "type": "boolean",
+      "default": false,
+      "inherit": true,
+      "group": "左侧"
+    },
+    {
+      "path": "TabEdgeLeft.tabShape",
+      "label": "左侧标签形状",
+      "page": "appearance",
+      "type": "select",
+      "default": "Rounded vertical line",
+      "options": [
+        {
+          "value": "S-curve",
+          "label": "S 曲线"
+        },
+        {
+          "value": "Strong rounded vertical line",
+          "label": "大圆角竖线"
+        },
+        {
+          "value": "Trapezoid",
+          "label": "梯形"
+        },
+        {
+          "value": "Rounded vertical line",
+          "label": "圆角竖线"
+        },
+        {
+          "value": "Angular vertical line",
+          "label": "折角竖线"
+        },
+        {
+          "value": "Left-cut trapezoid",
+          "label": "左切梯形"
+        },
+        {
+          "value": "Right-cut trapezoid",
+          "label": "右切梯形"
+        },
+        {
+          "value": "Rectangle",
+          "label": "矩形"
+        },
+        {
+          "value": "Rounded rectangle",
+          "label": "圆角矩形"
+        },
+        {
+          "value": "Strong rounded rectangle",
+          "label": "大圆角矩形"
+        },
+        {
+          "value": "Angular rectangle",
+          "label": "折角矩形"
+        }
+      ],
+      "inherit": true,
+      "group": "左侧"
+    },
+    {
+      "path": "TabEdgeLeft.tabAlignment",
+      "label": "左侧标签对齐",
+      "page": "appearance",
+      "type": "select",
+      "default": "TopLeft",
+      "options": [
+        {
+          "value": "TopLeft",
+          "label": "起始端"
+        },
+        {
+          "value": "TopRight",
+          "label": "末端"
+        }
+      ],
+      "inherit": true,
+      "group": "左侧"
+    },
+    {
+      "path": "TabEdgeLeft.tabDirection",
+      "label": "左侧标签位置",
+      "page": "appearance",
+      "type": "select",
+      "default": "outside",
+      "options": [
+        {
+          "value": "outside",
+          "label": "窗口外侧"
+        },
+        {
+          "value": "inside",
+          "label": "窗口内侧"
+        }
+      ],
+      "inherit": true,
+      "group": "左侧"
+    },
+    {
+      "path": "TabEdgeLeft.tabText",
+      "label": "左侧文字方向",
+      "page": "appearance",
+      "type": "select",
+      "default": "horizontal",
+      "options": [
+        {
+          "value": "horizontal",
+          "label": "横向"
+        },
+        {
+          "value": "vertical",
+          "label": "纵向"
+        }
+      ],
+      "inherit": true,
+      "group": "左侧"
+    },
+    {
+      "path": "TabEdgeLeft.tabOutsideDistanceStart",
+      "label": "左侧外侧起始边距",
+      "page": "appearance",
+      "type": "number",
+      "default": 10,
+      "min": 0,
+      "max": 2000,
+      "inherit": true,
+      "unit": "像素",
+      "group": "左侧"
+    },
+    {
+      "path": "TabEdgeLeft.tabOutsideDistanceEnd",
+      "label": "左侧外侧末端边距",
+      "page": "appearance",
+      "type": "number",
+      "default": 10,
+      "min": 0,
+      "max": 2000,
+      "inherit": true,
+      "unit": "像素",
+      "group": "左侧"
+    },
+    {
+      "path": "TabEdgeLeft.tabInsideDistanceStart",
+      "label": "左侧内侧起始边距",
+      "page": "appearance",
+      "type": "number",
+      "default": 10,
+      "min": 0,
+      "max": 2000,
+      "inherit": true,
+      "unit": "像素",
+      "group": "左侧"
+    },
+    {
+      "path": "TabEdgeLeft.tabInsideDistanceEnd",
+      "label": "左侧内侧末端边距",
+      "page": "appearance",
+      "type": "number",
+      "default": 10,
+      "min": 0,
+      "max": 2000,
+      "inherit": true,
+      "unit": "像素",
+      "group": "左侧"
+    },
+    {
+      "path": "TabEdgeLeft.hideTabsWhenDownByDefault",
+      "label": "左侧隐藏方式",
+      "page": "appearance",
+      "type": "select",
+      "default": "never",
+      "options": [
+        {
+          "value": "never",
+          "label": "始终显示"
+        },
+        {
+          "value": "down",
+          "label": "延时隐藏"
+        },
+        {
+          "value": "doubleclick",
+          "label": "双击隐藏"
+        }
+      ],
+      "inherit": true,
+      "group": "左侧"
+    },
+    {
+      "path": "TabEdgeLeft.hideTabsDelayMilliseconds",
+      "label": "左侧隐藏前等待",
+      "page": "appearance",
+      "type": "number",
+      "default": 3000,
+      "min": 0,
+      "max": 60000,
+      "scale": 1000,
+      "unit": "秒",
+      "inherit": true,
+      "group": "左侧"
+    },
+    {
+      "path": "TabEdgeRight.tabHeight",
+      "label": "右侧标签高度",
+      "page": "appearance",
+      "type": "number",
+      "default": 25,
+      "min": 8,
+      "max": 200,
+      "inherit": true,
+      "group": "右侧"
+    },
+    {
+      "path": "TabEdgeRight.tabMaxWidth",
+      "label": "右侧标签最大宽度",
+      "page": "appearance",
+      "type": "number",
+      "default": 200,
+      "min": 20,
+      "max": 2000,
+      "inherit": true,
+      "group": "右侧"
+    },
+    {
+      "path": "TabEdgeRight.tabPinnedTabWidth",
+      "label": "右侧固定标签宽度",
+      "page": "appearance",
+      "type": "number",
+      "default": 90,
+      "min": 20,
+      "max": 2000,
+      "inherit": true,
+      "group": "右侧"
+    },
+    {
+      "path": "TabEdgeRight.tabOverlap",
+      "label": "右侧标签重叠距离",
+      "page": "appearance",
+      "type": "number",
+      "default": 12,
+      "min": 0,
+      "max": 200,
+      "inherit": true,
+      "group": "右侧"
+    },
+    {
+      "path": "TabEdgeRight.tabPinnedTabWidthIcon",
+      "label": "右侧固定标签仅显示图标",
+      "page": "appearance",
+      "type": "boolean",
+      "default": false,
+      "inherit": true,
+      "group": "右侧"
+    },
+    {
+      "path": "TabEdgeRight.tabShape",
+      "label": "右侧标签形状",
+      "page": "appearance",
+      "type": "select",
+      "default": "Rounded vertical line",
+      "options": [
+        {
+          "value": "S-curve",
+          "label": "S 曲线"
+        },
+        {
+          "value": "Strong rounded vertical line",
+          "label": "大圆角竖线"
+        },
+        {
+          "value": "Trapezoid",
+          "label": "梯形"
+        },
+        {
+          "value": "Rounded vertical line",
+          "label": "圆角竖线"
+        },
+        {
+          "value": "Angular vertical line",
+          "label": "折角竖线"
+        },
+        {
+          "value": "Left-cut trapezoid",
+          "label": "左切梯形"
+        },
+        {
+          "value": "Right-cut trapezoid",
+          "label": "右切梯形"
+        },
+        {
+          "value": "Rectangle",
+          "label": "矩形"
+        },
+        {
+          "value": "Rounded rectangle",
+          "label": "圆角矩形"
+        },
+        {
+          "value": "Strong rounded rectangle",
+          "label": "大圆角矩形"
+        },
+        {
+          "value": "Angular rectangle",
+          "label": "折角矩形"
+        }
+      ],
+      "inherit": true,
+      "group": "右侧"
+    },
+    {
+      "path": "TabEdgeRight.tabAlignment",
+      "label": "右侧标签对齐",
+      "page": "appearance",
+      "type": "select",
+      "default": "TopLeft",
+      "options": [
+        {
+          "value": "TopLeft",
+          "label": "起始端"
+        },
+        {
+          "value": "TopRight",
+          "label": "末端"
+        }
+      ],
+      "inherit": true,
+      "group": "右侧"
+    },
+    {
+      "path": "TabEdgeRight.tabDirection",
+      "label": "右侧标签位置",
+      "page": "appearance",
+      "type": "select",
+      "default": "outside",
+      "options": [
+        {
+          "value": "outside",
+          "label": "窗口外侧"
+        },
+        {
+          "value": "inside",
+          "label": "窗口内侧"
+        }
+      ],
+      "inherit": true,
+      "group": "右侧"
+    },
+    {
+      "path": "TabEdgeRight.tabText",
+      "label": "右侧文字方向",
+      "page": "appearance",
+      "type": "select",
+      "default": "horizontal",
+      "options": [
+        {
+          "value": "horizontal",
+          "label": "横向"
+        },
+        {
+          "value": "vertical",
+          "label": "纵向"
+        }
+      ],
+      "inherit": true,
+      "group": "右侧"
+    },
+    {
+      "path": "TabEdgeRight.tabOutsideDistanceStart",
+      "label": "右侧外侧起始边距",
+      "page": "appearance",
+      "type": "number",
+      "default": 10,
+      "min": 0,
+      "max": 2000,
+      "inherit": true,
+      "unit": "像素",
+      "group": "右侧"
+    },
+    {
+      "path": "TabEdgeRight.tabOutsideDistanceEnd",
+      "label": "右侧外侧末端边距",
+      "page": "appearance",
+      "type": "number",
+      "default": 10,
+      "min": 0,
+      "max": 2000,
+      "inherit": true,
+      "unit": "像素",
+      "group": "右侧"
+    },
+    {
+      "path": "TabEdgeRight.tabInsideDistanceStart",
+      "label": "右侧内侧起始边距",
+      "page": "appearance",
+      "type": "number",
+      "default": 10,
+      "min": 0,
+      "max": 2000,
+      "inherit": true,
+      "unit": "像素",
+      "group": "右侧"
+    },
+    {
+      "path": "TabEdgeRight.tabInsideDistanceEnd",
+      "label": "右侧内侧末端边距",
+      "page": "appearance",
+      "type": "number",
+      "default": 10,
+      "min": 0,
+      "max": 2000,
+      "inherit": true,
+      "unit": "像素",
+      "group": "右侧"
+    },
+    {
+      "path": "TabEdgeRight.hideTabsWhenDownByDefault",
+      "label": "右侧隐藏方式",
+      "page": "appearance",
+      "type": "select",
+      "default": "never",
+      "options": [
+        {
+          "value": "never",
+          "label": "始终显示"
+        },
+        {
+          "value": "down",
+          "label": "延时隐藏"
+        },
+        {
+          "value": "doubleclick",
+          "label": "双击隐藏"
+        }
+      ],
+      "inherit": true,
+      "group": "右侧"
+    },
+    {
+      "path": "TabEdgeRight.hideTabsDelayMilliseconds",
+      "label": "右侧隐藏前等待",
+      "page": "appearance",
+      "type": "number",
+      "default": 3000,
+      "min": 0,
+      "max": 60000,
+      "scale": 1000,
+      "unit": "秒",
+      "inherit": true,
+      "group": "右侧"
+    },
+    {
+      "path": "TabEdgeBottom.tabHeight",
+      "label": "底部标签高度",
+      "page": "appearance",
+      "type": "number",
+      "default": 25,
+      "min": 8,
+      "max": 200,
+      "inherit": true,
+      "group": "底部"
+    },
+    {
+      "path": "TabEdgeBottom.tabMaxWidth",
+      "label": "底部标签最大宽度",
+      "page": "appearance",
+      "type": "number",
+      "default": 200,
+      "min": 20,
+      "max": 2000,
+      "inherit": true,
+      "group": "底部"
+    },
+    {
+      "path": "TabEdgeBottom.tabPinnedTabWidth",
+      "label": "底部固定标签宽度",
+      "page": "appearance",
+      "type": "number",
+      "default": 90,
+      "min": 20,
+      "max": 2000,
+      "inherit": true,
+      "group": "底部"
+    },
+    {
+      "path": "TabEdgeBottom.tabOverlap",
+      "label": "底部标签重叠距离",
+      "page": "appearance",
+      "type": "number",
+      "default": 12,
+      "min": 0,
+      "max": 200,
+      "inherit": true,
+      "group": "底部"
+    },
+    {
+      "path": "TabEdgeBottom.tabPinnedTabWidthIcon",
+      "label": "底部固定标签仅显示图标",
+      "page": "appearance",
+      "type": "boolean",
+      "default": false,
+      "inherit": true,
+      "group": "底部"
+    },
+    {
+      "path": "TabEdgeBottom.tabShape",
+      "label": "底部标签形状",
+      "page": "appearance",
+      "type": "select",
+      "default": "Rounded vertical line",
+      "options": [
+        {
+          "value": "S-curve",
+          "label": "S 曲线"
+        },
+        {
+          "value": "Strong rounded vertical line",
+          "label": "大圆角竖线"
+        },
+        {
+          "value": "Trapezoid",
+          "label": "梯形"
+        },
+        {
+          "value": "Rounded vertical line",
+          "label": "圆角竖线"
+        },
+        {
+          "value": "Angular vertical line",
+          "label": "折角竖线"
+        },
+        {
+          "value": "Left-cut trapezoid",
+          "label": "左切梯形"
+        },
+        {
+          "value": "Right-cut trapezoid",
+          "label": "右切梯形"
+        },
+        {
+          "value": "Rectangle",
+          "label": "矩形"
+        },
+        {
+          "value": "Rounded rectangle",
+          "label": "圆角矩形"
+        },
+        {
+          "value": "Strong rounded rectangle",
+          "label": "大圆角矩形"
+        },
+        {
+          "value": "Angular rectangle",
+          "label": "折角矩形"
+        }
+      ],
+      "inherit": true,
+      "group": "底部"
+    },
+    {
+      "path": "TabEdgeBottom.tabAlignment",
+      "label": "底部标签对齐",
+      "page": "appearance",
+      "type": "select",
+      "default": "TopLeft",
+      "options": [
+        {
+          "value": "TopLeft",
+          "label": "起始端"
+        },
+        {
+          "value": "TopRight",
+          "label": "末端"
+        }
+      ],
+      "inherit": true,
+      "group": "底部"
+    },
+    {
+      "path": "TabEdgeBottom.tabDirection",
+      "label": "底部标签位置",
+      "page": "appearance",
+      "type": "select",
+      "default": "outside",
+      "options": [
+        {
+          "value": "outside",
+          "label": "窗口外侧"
+        },
+        {
+          "value": "inside",
+          "label": "窗口内侧"
+        }
+      ],
+      "inherit": true,
+      "group": "底部"
+    },
+    {
+      "path": "TabEdgeBottom.tabTextBottomInside",
+      "label": "底部标签文字朝向窗口内",
+      "page": "appearance",
+      "type": "boolean",
+      "default": false,
+      "inherit": true,
+      "group": "底部"
+    },
+    {
+      "path": "TabEdgeBottom.tabOutsideDistanceStart",
+      "label": "底部外侧起始边距",
+      "page": "appearance",
+      "type": "number",
+      "default": 10,
+      "min": 0,
+      "max": 2000,
+      "inherit": true,
+      "unit": "像素",
+      "group": "底部"
+    },
+    {
+      "path": "TabEdgeBottom.tabOutsideDistanceEnd",
+      "label": "底部外侧末端边距",
+      "page": "appearance",
+      "type": "number",
+      "default": 10,
+      "min": 0,
+      "max": 2000,
+      "inherit": true,
+      "unit": "像素",
+      "group": "底部"
+    },
+    {
+      "path": "TabEdgeBottom.tabInsideDistanceStart",
+      "label": "底部内侧起始边距",
+      "page": "appearance",
+      "type": "number",
+      "default": 10,
+      "min": 0,
+      "max": 2000,
+      "inherit": true,
+      "unit": "像素",
+      "group": "底部"
+    },
+    {
+      "path": "TabEdgeBottom.tabInsideDistanceEnd",
+      "label": "底部内侧末端边距",
+      "page": "appearance",
+      "type": "number",
+      "default": 10,
+      "min": 0,
+      "max": 2000,
+      "inherit": true,
+      "unit": "像素",
+      "group": "底部"
+    },
+    {
+      "path": "TabEdgeBottom.hideTabsWhenDownByDefault",
+      "label": "底部隐藏方式",
+      "page": "appearance",
+      "type": "select",
+      "default": "never",
+      "options": [
+        {
+          "value": "never",
+          "label": "始终显示"
+        },
+        {
+          "value": "down",
+          "label": "延时隐藏"
+        },
+        {
+          "value": "doubleclick",
+          "label": "双击隐藏"
+        }
+      ],
+      "inherit": true,
+      "group": "底部"
+    },
+    {
+      "path": "TabEdgeBottom.hideTabsDelayMilliseconds",
+      "label": "底部隐藏前等待",
+      "page": "appearance",
+      "type": "number",
+      "default": 3000,
+      "min": 0,
+      "max": 60000,
+      "scale": 1000,
+      "unit": "秒",
+      "inherit": true,
+      "group": "底部"
+    },
+    {
+      "path": "TabAppearance.tabInactiveTextColor",
+      "label": "未选中 · 文字",
+      "page": "colors",
+      "type": "color",
+      "default": "808080",
+      "group": "未选中"
+    },
+    {
+      "path": "TabAppearance.tabInactiveTabColor",
+      "label": "未选中 · 背景",
+      "page": "colors",
+      "type": "color",
+      "default": "808080",
+      "group": "未选中"
+    },
+    {
+      "path": "TabAppearance.tabInactiveBorderColor",
+      "label": "未选中 · 边框",
+      "page": "colors",
+      "type": "color",
+      "default": "808080",
+      "group": "未选中"
+    },
+    {
+      "path": "TabAppearance.tabSelectedTextColor",
+      "label": "已选择 · 文字",
+      "page": "colors",
+      "type": "color",
+      "default": "808080",
+      "group": "已选择"
+    },
+    {
+      "path": "TabAppearance.tabSelectedTabColor",
+      "label": "已选择 · 背景",
+      "page": "colors",
+      "type": "color",
+      "default": "808080",
+      "group": "已选择"
+    },
+    {
+      "path": "TabAppearance.tabSelectedBorderColor",
+      "label": "已选择 · 边框",
+      "page": "colors",
+      "type": "color",
+      "default": "808080",
+      "group": "已选择"
+    },
+    {
+      "path": "TabAppearance.tabMouseOverTextColor",
+      "label": "鼠标停留 · 文字",
+      "page": "colors",
+      "type": "color",
+      "default": "808080",
+      "group": "鼠标停留"
+    },
+    {
+      "path": "TabAppearance.tabMouseOverTabColor",
+      "label": "鼠标停留 · 背景",
+      "page": "colors",
+      "type": "color",
+      "default": "808080",
+      "group": "鼠标停留"
+    },
+    {
+      "path": "TabAppearance.tabMouseOverBorderColor",
+      "label": "鼠标停留 · 边框",
+      "page": "colors",
+      "type": "color",
+      "default": "808080",
+      "group": "鼠标停留"
+    },
+    {
+      "path": "TabAppearance.tabActiveTextColor",
+      "label": "当前窗口 · 文字",
+      "page": "colors",
+      "type": "color",
+      "default": "808080",
+      "group": "当前窗口"
+    },
+    {
+      "path": "TabAppearance.tabActiveTabColor",
+      "label": "当前窗口 · 背景",
+      "page": "colors",
+      "type": "color",
+      "default": "808080",
+      "group": "当前窗口"
+    },
+    {
+      "path": "TabAppearance.tabActiveBorderColor",
+      "label": "当前窗口 · 边框",
+      "page": "colors",
+      "type": "color",
+      "default": "808080",
+      "group": "当前窗口"
+    },
+    {
+      "path": "TabAppearance.tabFlashTextColor",
+      "label": "提醒闪烁 · 文字",
+      "page": "colors",
+      "type": "color",
+      "default": "808080",
+      "group": "提醒闪烁"
+    },
+    {
+      "path": "TabAppearance.tabFlashTabColor",
+      "label": "提醒闪烁 · 背景",
+      "page": "colors",
+      "type": "color",
+      "default": "808080",
+      "group": "提醒闪烁"
+    },
+    {
+      "path": "TabAppearance.tabFlashBorderColor",
+      "label": "提醒闪烁 · 边框",
+      "page": "colors",
+      "type": "color",
+      "default": "808080",
+      "group": "提醒闪烁"
+    },
+    {
+      "path": "EnableCtrlNumberHotKey",
+      "label": "使用 Ctrl + 数字切换标签",
+      "page": "shortcuts",
+      "type": "boolean",
+      "default": false
+    },
+    {
+      "path": "EnableAltNumberHotKey",
+      "label": "使用 Alt + 数字切换标签",
+      "page": "shortcuts",
+      "type": "boolean",
+      "default": false
+    },
+    {
+      "path": "HotKeys.nextTab",
+      "label": "下一个标签",
+      "page": "shortcuts",
+      "type": "hotkey",
+      "default": 0,
+      "min": 0,
+      "max": 2047
+    },
+    {
+      "path": "HotKeys.prevTab",
+      "label": "上一个标签",
+      "page": "shortcuts",
+      "type": "hotkey",
+      "default": 0,
+      "min": 0,
+      "max": 2047
+    },
+    {
+      "path": "HotKeys.newTabRight",
+      "label": "在右侧新建窗口",
+      "page": "shortcuts",
+      "type": "hotkey",
+      "default": 0,
+      "min": 0,
+      "max": 2047
+    },
+    {
+      "path": "HotKeys.activateTab1",
+      "label": "切换到第 1 个标签",
+      "page": "shortcuts",
+      "type": "hotkey",
+      "default": 0,
+      "min": 0,
+      "max": 2047
+    },
+    {
+      "path": "HotKeys.activateTab2",
+      "label": "切换到第 2 个标签",
+      "page": "shortcuts",
+      "type": "hotkey",
+      "default": 0,
+      "min": 0,
+      "max": 2047
+    },
+    {
+      "path": "HotKeys.activateTab3",
+      "label": "切换到第 3 个标签",
+      "page": "shortcuts",
+      "type": "hotkey",
+      "default": 0,
+      "min": 0,
+      "max": 2047
+    },
+    {
+      "path": "HotKeys.activateTab4",
+      "label": "切换到第 4 个标签",
+      "page": "shortcuts",
+      "type": "hotkey",
+      "default": 0,
+      "min": 0,
+      "max": 2047
+    },
+    {
+      "path": "HotKeys.activateTab5",
+      "label": "切换到第 5 个标签",
+      "page": "shortcuts",
+      "type": "hotkey",
+      "default": 0,
+      "min": 0,
+      "max": 2047
+    },
+    {
+      "path": "HotKeys.activateTab6",
+      "label": "切换到第 6 个标签",
+      "page": "shortcuts",
+      "type": "hotkey",
+      "default": 0,
+      "min": 0,
+      "max": 2047
+    },
+    {
+      "path": "HotKeys.activateTab7",
+      "label": "切换到第 7 个标签",
+      "page": "shortcuts",
+      "type": "hotkey",
+      "default": 0,
+      "min": 0,
+      "max": 2047
+    },
+    {
+      "path": "HotKeys.activateTab8",
+      "label": "切换到第 8 个标签",
+      "page": "shortcuts",
+      "type": "hotkey",
+      "default": 0,
+      "min": 0,
+      "max": 2047
+    },
+    {
+      "path": "HotKeys.activateTab9",
+      "label": "切换到第 9 个标签",
+      "page": "shortcuts",
+      "type": "hotkey",
+      "default": 0,
+      "min": 0,
+      "max": 2047
+    },
+    {
+      "path": "EnableDarkMode",
+      "label": "深色界面",
+      "page": "general",
+      "type": "boolean",
+      "default": false
+    },
+    {
+      "path": "TabEdges",
+      "label": "可放置标签的位置",
+      "page": "appearance",
+      "type": "edges",
+      "default": [
+        "Top"
+      ]
+    }
+  ],
+  "contractVersion": 1
+}

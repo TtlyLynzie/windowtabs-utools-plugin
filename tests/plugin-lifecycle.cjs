@@ -14,11 +14,14 @@ async function test(root) {
   vm.runInNewContext(fs.readFileSync(filename, "utf8") + "\nmodule.exports = manager;", sandbox, { filename });
   const manager = sandbox.module.exports;
   const calls = [];
-  manager.stop = async () => { calls.push("stop"); };
   manager.dispose = () => { calls.push("dispose"); };
+  manager.child = { pid: 2468 };
+  manager.terminateProcessByPidSync = pid => { calls.push(`taskkill:${pid}`); return true; };
   onOut(false);
   onOut(true);
-  assert.deepEqual(calls, ["dispose", "dispose"]);
+  assert.deepEqual(calls, ["dispose", "taskkill:2468"]);
+  assert.equal(manager.child, null);
+  assert.equal(manager.lastStatus.state, "INSTALLED_STOPPED");
   assert.equal(manager.exitPromise, undefined);
 }
 

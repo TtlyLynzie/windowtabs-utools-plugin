@@ -1,0 +1,16 @@
+{
+  "sourceTag": "ss_2026.11.11",
+  "patches": ["patches/upstream-integrated-v12.txt", "patches/upstream-disable-runtime-updater-v1.patch"],
+  "configuration": "Release",
+  "platform": "AnyCPU",
+  "msbuild": {
+    "required": "Visual Studio 2022 MSBuild",
+    "discovery": "vswhere -latest -products * -requires Microsoft.Component.MSBuild -find MSBuild\\**\\Bin\\MSBuild.exe"
+  },
+  "arguments": ["/t:Rebuild", "/p:Configuration=Release", "/p:Platform=AnyCPU", "/v:minimal"],
+  "output": {
+    "WindowTabs.exe": "d6caa9ddd512028f1ac935458c73286129bb02ecae094a39e97a79f55e69fa93",
+    "settings-schema.json": "41c0daaf0025082e6b7d4f98fc2adc5ff159acd794a16aaa2b95a565a6f6383c"
+  },
+  "runtimeUpdatePolicy": "pending-windows-ci"
+}

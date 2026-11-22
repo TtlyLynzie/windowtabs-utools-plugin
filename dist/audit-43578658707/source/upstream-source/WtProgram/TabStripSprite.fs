@@ -1,0 +1,1424 @@
+﻿namespace Bemo
+open System
+open System.Drawing
+open System.Drawing.Drawing2D
+open System.Drawing.Imaging
+open System.Windows.Forms
+
+// Per group-thread, bounded cache of read-only icon pixels. Hover, capture,
+// pin and selection do not change IconSprite.image, so are not part of its key.
+module IconBitmapCache =
+    let private images = new Threading.ThreadLocal<Collections.Generic.Dictionary<IntPtr * int * int * float, Img>>(
+        fun () -> Collections.Generic.Dictionary<IntPtr * int * int * float, Img>())
+    let clear() =
+        let cache = images.Value
+        for image in cache.Values do image.bitmap.Dispose()
+        cache.Clear()
+    let get (icon: Icon) (size: Sz) scale render =
+        let handle = try icon.Handle with _ -> IntPtr.Zero
+        let key = handle, size.width, size.height, scale
+        let cache = images.Value
+        match cache.TryGetValue key with
+        | true, image ->
+            PerfTrace.count "sprite.iconHit"
+            image
+        | _ ->
+            let image = PerfTrace.time "sprite.icon" render
+            if cache.Count >= 128 then clear()
+            cache.Add(key, image)
+            image
+
+type IconSprite = {
+    icon: Icon
+    size: Sz
+    // Device-pixel scale of the strip's monitor (1.0 = 100%).
+    scale: float
+    } with
+    interface IBorrowedSpriteImage
+    interface ISprite with
+        member this.image = IconBitmapCache.get this.icon this.size this.scale <| fun () ->
+            let bitmap = Img(this.size)
+            use g = bitmap.graphics
+            // Fill with near-transparent color so entire icon area is hit-testable
+            g.Clear(Color.FromArgb(1, 0, 0, 0))
+            try
+                // At 100% the icon is drawn exactly as it always was, so a
+                // 100% monitor is untouched by this change. Above 100% the box
+                // is a size no application publishes (25 px at 150%, 33 px at
+                // 200%), so ask Windows to produce that size from the icon's
+                // own resource instead of stretching the 16 or 32 px handle.
+                let icon =
+                    if this.scale = 1.0 then this.icon
+                    else ScaledIcon.at this.icon this.size.width
+                let rect = new Rectangle(0, 0, this.size.width, this.size.height)
+                do g.DrawIcon(icon, rect)
+            with | e -> ()
+            bitmap
+        member this.children = List2()
+
+type CloseButtonSprite = {
+    hover: bool
+    captured: bool
+    size: Sz
+    // Device-pixel scale of the strip's monitor (1.0 = 100%). Every constant
+    // below is a 96-dpi design value multiplied by it.
+    scale: float
+    }
+    with
+    member private this.bgColor =
+        match this.hover, this.captured with
+        | true, true -> Some(Color.FromArgb(128, 128, 128))
+        | true, false -> Some(Color.FromArgb(90, 90, 90))
+        | _ -> None
+    member private this.penColor = if this.bgColor.IsSome then Color.White else Color.Gray
+    member private this.pen = new Pen(this.penColor, Dpi.pxf this.scale 1.7f)
+    interface ISprite with
+        member this.image = PerfTrace.time "sprite.button" <| fun () ->
+            let bitmap = Img(this.size)
+            use g = bitmap.graphics
+            g.SmoothingMode <- SmoothingMode.AntiAlias
+            // Draw rounded rectangle background
+            let bgColor = this.bgColor.def(Color.FromArgb(1, 1, 1, 1))
+            let r = Dpi.px this.scale 3
+            let rect = Rectangle(0, 0, this.size.width - 1, this.size.height - 1)
+            use path = new GraphicsPath()
+            path.AddArc(rect.X, rect.Y, r * 2, r * 2, 180.0f, 90.0f)
+            path.AddArc(rect.Right - r * 2, rect.Y, r * 2, r * 2, 270.0f, 90.0f)
+            path.AddArc(rect.Right - r * 2, rect.Bottom - r * 2, r * 2, r * 2, 0.0f, 90.0f)
+            path.AddArc(rect.X, rect.Bottom - r * 2, r * 2, r * 2, 90.0f, 90.0f)
+            path.CloseFigure()
+            g.FillPath(new SolidBrush(bgColor), path)
+            // Draw X mark centered on rounded rect
+            let cx = float32(this.size.width - 1) / 2.0f
+            let cy = float32(this.size.height - 1) / 2.0f
+            let half = Dpi.pxf this.scale 4.0f
+            g.DrawLine(this.pen, cx - half, cy - half, cx + half, cy + half)
+            g.DrawLine(this.pen, cx - half, cy + half, cx + half, cy - half)
+            bitmap
+        member this.children = List2()
+
+// Pin icon font: Segoe MDL2 Assets (the Windows 10/11 system icon font).
+//
+// Requested in PIXELS, not points. The old 12 pt request was 16 px only
+// because the destination bitmap happened to be 96 dpi; in a Per-Monitor-V2
+// process a plain `new Bitmap()` reports the system DPI instead, so the same
+// 12 pt would come out 24 px on a 150% primary - on every monitor - and a
+// version that also multiplied by the monitor scale would reach 36 px and
+// cover the tab title. 16 px * scale says exactly what is meant.
+module private PinIcon =
+    [<Literal>]
+    let private basePixelSize = 16.0f
+    let font (scale: float) : Font option =
+        Dpi.scaledFontFamily "Segoe MDL2 Assets" basePixelSize FontStyle.Regular scale
+
+type PinButtonSprite = {
+    hover: bool
+    captured: bool
+    size: Sz
+    scale: float
+    }
+    with
+    member private this.bgColor =
+        match this.hover, this.captured with
+        | true, true -> Some(Color.FromArgb(128, 128, 128))
+        | true, false -> Some(Color.FromArgb(90, 90, 90))
+        | _ -> None
+    member private this.penColor = if this.bgColor.IsSome then Color.White else Color.Gray
+    interface ISprite with
+        member this.image = PerfTrace.time "sprite.button" <| fun () ->
+            let bitmap = Img(this.size)
+            use g = bitmap.graphics
+            g.SmoothingMode <- SmoothingMode.AntiAlias
+            // Draw rounded rectangle background (same as close button)
+            let bgColor = this.bgColor.def(Color.FromArgb(1, 1, 1, 1))
+            let r = Dpi.px this.scale 3
+            let rect = Rectangle(0, 0, this.size.width - 1, this.size.height - 1)
+            use path = new GraphicsPath()
+            path.AddArc(rect.X, rect.Y, r * 2, r * 2, 180.0f, 90.0f)
+            path.AddArc(rect.Right - r * 2, rect.Y, r * 2, r * 2, 270.0f, 90.0f)
+            path.AddArc(rect.Right - r * 2, rect.Bottom - r * 2, r * 2, r * 2, 0.0f, 90.0f)
+            path.AddArc(rect.X, rect.Bottom - r * 2, r * 2, r * 2, 90.0f, 90.0f)
+            path.CloseFigure()
+            g.FillPath(new SolidBrush(bgColor), path)
+            // Draw pin icon
+            let color = this.penColor
+            use brush = new SolidBrush(color)
+            let pxf = Dpi.pxf this.scale
+            match PinIcon.font this.scale with
+            | Some font ->
+                // Use Segoe MDL2 Assets system font for pin icon (E718 = Pin glyph)
+                // Rotate -45 degrees (left tilt) around center
+                let cx = float32 this.size.width / 2.0f
+                let cy = float32 this.size.height / 2.0f
+                g.TextRenderingHint <- System.Drawing.Text.TextRenderingHint.AntiAliasGridFit
+                g.TranslateTransform(cx, cy)
+                g.RotateTransform(-45.0f)
+                g.TranslateTransform(-cx, -cy)
+                use format = new StringFormat()
+                format.Alignment <- StringAlignment.Center
+                format.LineAlignment <- StringAlignment.Center
+                let drawRect = RectangleF(pxf -1.0f, pxf 2.0f, float32 this.size.width, float32 this.size.height)
+                g.DrawString("\uE718", font, brush, drawRect, format)
+                g.ResetTransform()
+            | None ->
+                // Fallback: simple diagonal pushpin using GDI+
+                let cx = float32(this.size.width - 1) / 2.0f
+                let cy = float32(this.size.height - 1) / 2.0f
+                let dc = 0.707f
+                // s / p are design-unit offsets from the button centre, so they
+                // are scaled before the 45-degree rotation is applied.
+                let ptf s p = PointF(cx + (pxf s + pxf p) * dc, cy + (pxf s - pxf p) * dc)
+                use headPen = new Pen(color, pxf 1.8f)
+                headPen.StartCap <- Drawing2D.LineCap.Round
+                headPen.EndCap <- Drawing2D.LineCap.Round
+                g.DrawLine(headPen, ptf -3.5f -4.0f, ptf -3.5f 4.0f)
+                use bodyPath = new GraphicsPath()
+                bodyPath.AddPolygon([|
+                    ptf -3.5f -2.0f
+                    ptf -3.5f  2.0f
+                    ptf  1.0f  0.7f
+                    ptf  1.0f -0.7f
+                |])
+                g.FillPath(brush, bodyPath)
+                use needlePen = new Pen(color, pxf 1.2f)
+                g.DrawLine(needlePen, ptf 1.0f 0.0f, ptf 5.0f 0.0f)
+            bitmap
+        member this.children = List2()
+
+type TabDisplayInfo = {
+    bgColor : Color option
+    fillColor : Color option
+    underlineColor : Color option
+    borderColor : Color option
+    text: string
+    textFont: Font
+    textBrush: Brush
+    icon: Icon
+    }
+    
+type TabSprite<'id> = {
+    id: 'id
+    isTop: bool
+    isSelected: bool
+    buttonModes: string * string
+    appearance: TabAppearanceInfo
+    displayInfo: TabDisplayInfo
+    size: Sz
+    onlyIcon: bool
+    isPinned: bool
+    // The window is on another virtual desktop: the whole tab, icon and
+    // buttons included, is drawn at VirtualDesktopGroups.dimmedAlpha.
+    dimmed: bool
+    direction: TabDirection
+    hover: TabPart option
+    captured: TabPart option
+    // Device-pixel scale of the strip's monitor. `appearance` arrives already
+    // scaled (Dpi.scaleAppearance); this covers the constants written here.
+    scale: float
+    } with
+
+    // Design unit (96 dpi) -> device pixels, for this tab's monitor.
+    //
+    // ONE-DEVICE-PIXEL RULE. Two kinds of number live in this file and only
+    // the first one goes through px / pxf:
+    //
+    //  * DIMENSIONS - heights, widths, paddings, corner radii, glyph strokes
+    //    (the close "x" at 1.7, the fallback pin at 1.8 / 1.2). These are
+    //    apparent sizes and must grow with the monitor, or the strip shrinks
+    //    to two thirds of itself on a 150% monitor (requirement R2).
+    //
+    //  * HAIRLINES - the tab outline pen, and the single row that separates
+    //    the tab from the edge of the strip (`size.height - 1` here, mirrored
+    //    by tabYOffset, TabStripSprite.pinnedTabMinLen, the TabDown branch of
+    //    borderPath and the hit test in tryHitForTooltip). These are always
+    //    exactly ONE DEVICE PIXEL, at every scale.
+    //
+    // The second rule is not a compromise, it is what makes the separation
+    // legible: a scaled outline and an unscaled gap would read as different
+    // weights sitting next to each other. It is also the interpretation the
+    // measured 150% screenshots already show, because GDI+ rasterizes any
+    // aliased pen narrower than 2.0 as a single pixel - a 1.5 px pen and a
+    // 1.0 px pen produce identical output at 125% and 150%, and only diverge
+    // at 200% and above, where the old code would have drawn a 2 px outline
+    // beside a 1 px gap. Keeping the gap at one pixel also keeps the strip
+    // geometry that was measured on real hardware (38 px strip / 37 px tab at
+    // 150%) exactly reproducible, and keeps the gap identical to the value
+    // the hit test uses.
+    // (No pxf counterpart: every float32 constant a TabSprite draws itself is
+    // a hairline, and the child sprites scale their own glyph strokes.)
+    member private this.px value = Dpi.px this.scale value
+
+    member private this.iconSprite =
+        {
+            IconSprite.icon = this.displayInfo.icon
+            size = this.iconSize
+            scale = this.scale
+        } :> ISprite
+
+    member private this.closeButtonSprite =
+        {
+            CloseButtonSprite.size = this.closeButtonSize
+            hover = this.hover = Some(TabClose)
+            captured = this.captured = Some(TabClose)
+            scale = this.scale
+        } :> ISprite
+
+    member private this.pinButtonSprite =
+        let clickable = this.buttonDecision(this.hover.IsSome || this.captured.IsSome).pinClickable
+        {
+            PinButtonSprite.size = this.closeButtonSize
+            hover = clickable && this.hover = Some(TabPin)
+            captured = clickable && this.captured = Some(TabPin)
+            scale = this.scale
+        } :> ISprite
+
+    // Width of the band at each end of the tab that the neighbour overlaps
+    // into. The outline (TabShape) climbs across it or stands a side in it.
+    member private this.edgeWidth = this.px TabShape.edgeBand
+
+    // Color resolution priority for non-active, non-flashing tabs:
+    //   MouseOver (hover/capture)  >  Selected  >  Inactive
+    // The active tab and the flash state win unconditionally over the rest.
+    member private this.tabBgColor =
+        match this.displayInfo.bgColor with
+        | Some(color) -> color
+        | None ->
+            let active = this.appearance.tabActiveTabColor
+            let inactive = this.appearance.tabInactiveTabColor
+            let highlight = this.appearance.tabMouseOverTabColor
+            let selected = this.appearance.tabSelectedTabColor
+            if this.isTop then active
+            elif this.hover.IsSome || this.captured.IsSome then highlight
+            elif this.isSelected then selected
+            else inactive
+
+    member private this.bgBrush = SolidBrush(this.tabBgColor)
+
+    member private this.borderPen =
+        let color =
+            match this.displayInfo.bgColor with
+            | Some(_) -> this.appearance.tabFlashBorderColor
+            | None ->
+                let active = this.appearance.tabActiveBorderColor
+                let inactive = this.appearance.tabInactiveBorderColor
+                let highlight = this.appearance.tabMouseOverBorderColor
+                let selected = this.appearance.tabSelectedBorderColor
+                if this.isTop then active
+                elif this.hover.IsSome || this.captured.IsSome then highlight
+                elif this.isSelected then selected
+                else inactive
+        // HAIRLINE, deliberately NOT scaled - see the note above TabSprite.size
+        // about the one-device-pixel rule.
+        new Pen(new SolidBrush(color), 1.0f)
+
+    member private this.borderPath =
+        let path = new GraphicsPath()
+        let bottom,top =
+            match this.direction with
+            | TabUp -> float32(this.size.height),float32(0)
+            | TabDown -> float32(-1), float32(this.size.height - 1)
+        TabShape.outline this.appearance.tabShape (float32(this.size.width)) bottom top (float32(this.edgeWidth))
+        |> TabShape.addToPath path
+        path
+
+    member private this.iconSize =
+        // Calculate icon size based on tab height, leaving some padding
+        let iconHeight = max (this.px 16) (this.size.height - this.px 8)
+        let iconHeight = min iconHeight (this.px 24)  // Cap at 24 design pixels
+        Sz(iconHeight, iconHeight)
+
+    member private this.iconLocation =
+        let y = (this.size.height - this.iconSize.height) / 2
+        Pt(this.edgeWidth, y)
+
+    member private this.closeButtonSize =
+        let s = this.px 18
+        Sz(s, s)
+
+    member private this.closeButtonLocation =
+        let x = this.size.width - this.edgeWidth - this.closeButtonSize.width + this.px 3
+        let y = (this.size.height - this.closeButtonSize.height) / 2
+        Pt(x, y)
+
+    // Pin button location: same as close button but never overlaps with program icon
+    member private this.pinButtonLocation =
+        let normalX = this.closeButtonLocation.x
+        let minX = this.iconLocation.x + this.iconSize.width + this.px 2
+        let x = max normalX minX
+        let y = (this.size.height - this.closeButtonSize.height) / 2
+        Pt(x, y)
+
+    member private this.buttonDecision hover : TabButtonPolicy.Decision =
+        let closeMode, pinMode = this.buttonModes
+        let closeRoom = this.closeButtonLocation.x >= this.iconLocation.x + this.iconSize.width
+        let pinRoom = this.pinButtonLocation.x + this.closeButtonSize.width <= this.size.width
+        TabButtonPolicy.decide closeMode pinMode this.isTop hover this.isPinned this.onlyIcon closeRoom pinRoom
+
+    member this.textLocation =
+        let x = this.iconLocation.x + this.iconSize.width + this.px 5
+        Pt(x, 0)
+
+    member this.textSize =
+        let width =
+            if this.isPinned then
+                // Pin button always visible: text area ends where pin button starts
+                this.pinButtonLocation.x - this.textLocation.x
+            elif this.buttonDecision(this.hover.IsSome || this.captured.IsSome).showClose then
+                // Reserve room only while the close button is visible
+                this.closeButtonLocation.x - this.textLocation.x
+            else
+                // Not hovered: extend text closer to right edge (fade handles visual boundary)
+                this.size.width - this.textLocation.x - this.px 18
+        let width = max 0 width
+        Sz(width, this.size.height)
+
+    member this.tabTextBrush =
+        let color =
+            match this.displayInfo.bgColor with
+            | Some(_) -> this.appearance.tabFlashTextColor  // Flash state uses flash text color
+            | None ->
+                let active = this.appearance.tabActiveTextColor
+                let inactive = this.appearance.tabInactiveTextColor
+                let highlight = this.appearance.tabMouseOverTextColor
+                let selected = this.appearance.tabSelectedTextColor
+                if this.isTop then active
+                elif this.hover.IsSome || this.captured.IsSome then highlight
+                elif this.isSelected then selected
+                else inactive
+        new SolidBrush(color)
+
+    member private this.fullImage = PerfTrace.time "sprite.tab" <| fun () ->
+            let img = Img(this.size)
+            use g = img.graphics
+            // Fill with near-transparent color so entire rectangular area is hit-testable
+            // This prevents mouse events from passing through the gap between tab curves
+            g.Clear(Color.FromArgb(1, 0, 0, 0))
+            do g.FillPath(this.bgBrush, this.borderPath)
+            // Draw fill color overlay (semi-transparent) between background and text
+            match this.displayInfo.fillColor with
+            | Some(fillColor) ->
+                let state = g.Save()
+                g.SetClip(this.borderPath)
+                use fillBrush = new SolidBrush(fillColor)
+                g.FillRectangle(fillBrush, Rectangle(0, 0, this.size.width, this.size.height))
+                g.Restore(state)
+            | None -> ()
+            if this.onlyIcon.not && this.textSize.width > 0 then
+                //the text can't be drawn as a separate bitmap because clearcase fonts
+                //can't be drawn by gdi+ to a transparent background, need to draw directly on the tab background
+                let text = this.displayInfo.text
+                let font = this.displayInfo.textFont
+                let brush = this.tabTextBrush
+                let format = new StringFormat()
+                do format.LineAlignment <- StringAlignment.Center
+                do format.Alignment <- StringAlignment.Near
+                do format.Trimming <- StringTrimming.None
+                do format.FormatFlags <- format.FormatFlags ||| StringFormatFlags.NoWrap
+                let bounds = Rect(this.textLocation, this.textSize)
+                do g.DrawString(text, font, brush, bounds.Rectangle.RectangleF, format)
+                // Draw fade-out gradient at right edge of text area (VSCode-style)
+                let textMeasured = g.MeasureString(text, font)
+                if textMeasured.Width > float32(bounds.size.width) then
+                    let fadeWidth = min (this.px 15) this.textSize.width
+                    if fadeWidth > 0 then
+                        let fadeX = this.textLocation.x + this.textSize.width - fadeWidth
+                        // Compute effective background color considering fill color overlay
+                        let bgColor =
+                            match this.displayInfo.fillColor with
+                            | Some(fc) ->
+                                let a = float fc.A / 255.0
+                                let bg = this.tabBgColor
+                                Color.FromArgb(255,
+                                    int(float fc.R * a + float bg.R * (1.0 - a)),
+                                    int(float fc.G * a + float bg.G * (1.0 - a)),
+                                    int(float fc.B * a + float bg.B * (1.0 - a)))
+                            | None -> this.tabBgColor
+                        let fadeRect = Rectangle(fadeX, 0, fadeWidth + 1, this.size.height)
+                        let state = g.Save()
+                        g.SetClip(this.borderPath)
+                        use fadeBrush = new LinearGradientBrush(
+                            fadeRect,
+                            Color.FromArgb(0, int bgColor.R, int bgColor.G, int bgColor.B),
+                            bgColor,
+                            LinearGradientMode.Horizontal)
+                        g.FillRectangle(fadeBrush, fadeRect)
+                        g.Restore(state)
+            // Draw border after text and gradient so border is never affected by fade
+            do g.DrawPath(this.borderPen, this.borderPath)
+            // Draw underline color at bottom/top of tab with gradient (opaque left half, fading to transparent on right)
+            match this.displayInfo.underlineColor with
+            | Some(underlineColor) ->
+                let underlineHeight = this.px 3
+                let state = g.Save()
+                g.SetClip(this.borderPath)
+                let y =
+                    match this.direction with
+                    | TabUp -> this.size.height - underlineHeight
+                    | TabDown -> 0
+                let rect = Rectangle(0, y, this.size.width, underlineHeight)
+                let opaqueColor = underlineColor
+                let transparentColor = Color.FromArgb(0, int underlineColor.R, int underlineColor.G, int underlineColor.B)
+                use gradientBrush = new LinearGradientBrush(
+                    Rectangle(0, y, this.size.width + 1, underlineHeight),
+                    opaqueColor, transparentColor,
+                    LinearGradientMode.Horizontal)
+                // Opaque from left to 60%, then fade to 80% transparent on right
+                let blend = new ColorBlend(3)
+                blend.Positions <- [| 0.0f; 0.6f; 1.0f |]
+                let rightColor = Color.FromArgb(int(255.0f * 0.2f), int underlineColor.R, int underlineColor.G, int underlineColor.B)
+                blend.Colors <- [| opaqueColor; opaqueColor; rightColor |]
+                gradientBrush.InterpolationColors <- blend
+                g.FillRectangle(gradientBrush, rect)
+                g.Restore(state)
+            | None -> ()
+            // Draw colored border around tab (normal width for tab shape, underline-style bottom edge)
+            match this.displayInfo.borderColor with
+            | Some(borderColor) ->
+                let state = g.Save()
+                // Draw the tab shape border (top and sides): the same
+                // one-device-pixel hairline as borderPen, so a coloured tab
+                // outline and an uncoloured one have identical weight.
+                use shapePen = new Pen(new SolidBrush(borderColor), 1.0f)
+                g.DrawPath(shapePen, this.borderPath)
+                // Draw bottom/top edge using same logic as underline (SetClip + FillRectangle + gradient)
+                let underlineHeight = this.px 3
+                g.SetClip(this.borderPath)
+                let y =
+                    match this.direction with
+                    | TabUp -> this.size.height - underlineHeight
+                    | TabDown -> 0
+                let rect = Rectangle(0, y, this.size.width, underlineHeight)
+                let opaqueColor = borderColor
+                let rightColor = Color.FromArgb(int(255.0f * 0.2f), int borderColor.R, int borderColor.G, int borderColor.B)
+                use gradientBrush = new LinearGradientBrush(
+                    Rectangle(0, y, this.size.width + 1, underlineHeight),
+                    opaqueColor, rightColor,
+                    LinearGradientMode.Horizontal)
+                let blend = new ColorBlend(3)
+                blend.Positions <- [| 0.0f; 0.6f; 1.0f |]
+                blend.Colors <- [| opaqueColor; opaqueColor; rightColor |]
+                gradientBrush.InterpolationColors <- blend
+                g.FillRectangle(gradientBrush, rect)
+                g.Restore(state)
+            | None -> ()
+            img
+
+    member private this.parts =
+            let buttons = this.buttonDecision(this.hover.IsSome || this.captured.IsSome)
+            List2([
+                Some(this.iconLocation, this.iconSprite)
+                (if buttons.showClose then Some(this.closeButtonLocation, this.closeButtonSprite) else None)
+                (if buttons.showPin then Some(this.pinButtonLocation, this.pinButtonSprite) else None)
+                ]).choose(id)
+
+    // A dimmed tab is one flat image: its parts are drawn into it first and
+    // the result faded as a whole, since the icon is a shared, cached surface
+    // that must not be altered. Which part the cursor is over does not depend
+    // on child sprites (partAt). A pixel that was drawn stays just visible to
+    // the hit test, which looks for a non-zero alpha.
+    member private this.dimmedImage =
+        let img = this.fullImage
+        try
+            (use g = img.graphics
+             this.parts.reverse.iter (fun (location: Pt, part: ISprite) ->
+                let image = part.render
+                try g.DrawImageUnscaled(image.bitmap, location.Point)
+                finally image.bitmap.Dispose()))
+            let bitmap = img.bitmap
+            let data =
+                bitmap.LockBits(Rectangle(0, 0, bitmap.Width, bitmap.Height),
+                                Imaging.ImageLockMode.ReadWrite, Imaging.PixelFormat.Format32bppArgb)
+            try
+                let bytes : byte[] = Array.zeroCreate (abs data.Stride * data.Height)
+                System.Runtime.InteropServices.Marshal.Copy(data.Scan0, bytes, 0, bytes.Length)
+                let mutable i = 3
+                while i < bytes.Length do
+                    let a = int bytes.[i]
+                    if a > 0 then bytes.[i] <- byte (max 1 (a * VirtualDesktopGroups.dimmedAlpha / 255))
+                    i <- i + 4
+                System.Runtime.InteropServices.Marshal.Copy(bytes, 0, data.Scan0, bytes.Length)
+            finally
+                bitmap.UnlockBits(data)
+            img
+        with _ ->
+            img.bitmap.Dispose()
+            reraise()
+
+    interface ISprite with
+        member this.image = if this.dimmed then this.dimmedImage else this.fullImage
+        member this.children = if this.dimmed then List2() else this.parts
+
+    // Resolve which interactive part a tab-local point hits, by RECTANGLE (not
+    // glyph alpha). The sprite-tree hit tests non-transparent pixels, so a point
+    // landing in the transparent gaps of the close "x" / pin glyph falls through
+    // to the background. That is invisible at 1:1, but once the strip is
+    // DPI-compressed for display (non-integer scales) the crisp hit-test glyph
+    // and the resampled on-screen glyph disagree at the sub-pixel level and the
+    // Close/Pin hover flickers. Testing the full button rectangle is stable at
+    // any DPI. Visibility rules mirror `children`; the buttons never overlap the
+    // icon, so test order is immaterial.
+    member this.containsOutline (local: Pt, includeBorder: bool) =
+        if local.x < -1 || local.x > this.size.width || local.y < -1 || local.y > this.size.height then false
+        else
+            use path = this.borderPath
+            if path.IsVisible(float32 local.x, float32 local.y) then true
+            elif includeBorder then
+                // Rasterized borders cover pixels just outside the mathematical
+                // fill. Conservatively reserve that one-device-pixel fringe.
+                use pen = new Pen(Color.Black, 2.0f)
+                path.IsOutlineVisible(float32 local.x, float32 local.y, pen)
+            else false
+
+    member this.partAt (local: Pt) : TabPart =
+        let inRect (loc: Pt) (sz: Sz) =
+            local.x >= loc.x && local.x < loc.x + sz.width &&
+            local.y >= loc.y && local.y < loc.y + sz.height
+        // Use the current pointer's hover state, not the previous frame's,
+        // so entering a button rectangle cannot alternate with the background.
+        let buttons = this.buttonDecision true
+        if buttons.showClose && inRect this.closeButtonLocation this.closeButtonSize then TabClose
+        elif buttons.pinClickable && inRect this.pinButtonLocation this.closeButtonSize then TabPin
+        elif inRect this.iconLocation this.iconSize then TabIcon
+        else TabBackground
+
+type TabStripSprite<'id> when 'id : equality = {
+    tabs: Map2<'id, TabDisplayInfo>
+    buttonModes: string * string
+    appearance: TabAppearanceInfo
+    hover: ('id * TabPart) option
+    captured : ('id * TabPart) option
+    visualOrder: List2<'id>
+    zorder: List2<'id>
+    // None preserves strip-local activation; Some carries the group's active tab.
+    activeTabOverride: 'id option option
+    size: Sz
+    slide: ('id * int) option
+    forcedSlideAlignment: TabAlign option
+    tabAlignments: Map2<'id, TabAlign>
+    direction: TabDirection
+    transparent: bool
+    pinnedTabs: Set2<'id>
+    selectedTabs: Set2<'id>
+    dimmedTabs: Set2<'id>
+    // Multi-tab drag group (variant A boundary): the pivot tab is
+    // dragGroup.[0] and matches slide.tab. Other elements are dragged
+    // along with the pivot, drawn at pivot.x + their relative offset.
+    // Empty list = no group drag (= single-tab slide, existing behavior).
+    dragGroup: 'id list
+    // Device-pixel scale of the strip's monitor (1.0 = 100%). `appearance` is
+    // already scaled by it; this is for the constants written here and for the
+    // per-tab sprites.
+    scale: float
+    } with
+
+    // Compare values, not the identity of Map2/List2/Set2 wrappers. Exclude
+    // placement and alpha: neither is an input to this sprite's pixels.
+    member this.renderKey : (string * obj) list =
+        [ "tabs", box (this.tabs.items.list |> List.map (fun (id, info) ->
+              let font = info.textFont
+              let icon = try Some(info.icon.Handle, info.icon.Size) with _ -> None
+              let brush = match info.textBrush with | :? SolidBrush as b -> box b.Color | b -> box b
+              id, info.text, icon, (font.Name, font.Size, font.Style, font.Unit, font.GdiCharSet, font.GdiVerticalFont),
+              brush, info.bgColor, info.fillColor, info.underlineColor, info.borderColor))
+          "appearance", box this.appearance
+          "buttons", box this.buttonModes
+          "hover", box (this.hover, this.captured)
+          "order", box (this.visualOrder.list, this.zorder.list)
+          "geometry", box (this.size.record, this.scale, this.direction, this.tabAlignments.items.list)
+          "transparent", box this.transparent
+          "pins", box this.pinnedTabs.items.list
+          "selection", box this.selectedTabs.items.list
+          "dimmed", box this.dimmedTabs.items.list
+          "drag", box (this.slide, this.dragGroup, this.forcedSlideAlignment) ]
+        @ (match this.activeTabOverride with
+           | Some active -> [ "activeTab", box active ]
+           | None -> [])
+
+    member private this.px value = Dpi.px this.scale value
+
+    member private this.tabOverlap = float(this.appearance.tabOverlap)
+    member private this.unpinnedTabMaxLen = float(this.appearance.tabMaxWidth)
+    // Where a tab's icon ends, from the tab's left end: the edge band plus
+    // the icon (mirrors TabSprite.iconLocation / iconSize, hence the same
+    // scaling). An icon-only tab is this plus a band of padding; the hit
+    // test keeps a squeezed tab clickable up to here.
+    member private this.iconRight =
+        let tabHeight = this.size.height - 1
+        let iconHeight = min (max (this.px 16) (tabHeight - this.px 8)) (this.px 24)
+        float(this.px 18 + iconHeight)
+    member private this.pinnedTabMinLen =
+        this.iconRight + float(this.px 18)  // left edge + icon width + right padding
+    member private this.pinnedTabSettingLen = float(this.appearance.tabPinnedTabWidth)
+    member private this.pinnedTabMaxLen =
+        if this.appearance.tabPinnedTabWidthIcon then this.pinnedTabMinLen
+        else max this.pinnedTabMinLen this.pinnedTabSettingLen
+
+    member private this.count = this.visualOrder.length
+    member private this.pinnedCount =
+        this.visualOrder.where(fun tab -> this.pinnedTabs.contains(tab)).length
+    member private this.unpinnedCount = this.count - this.pinnedCount
+
+    member private this.isPinned (tab: 'id) = this.pinnedTabs.contains(tab)
+
+    member private this.getTabAlign (tab: 'id) =
+        match this.tabAlignments.tryFind(tab) with
+        | Some(a) -> a
+        | None -> TopLeft
+
+    member private this.getAdjustedAlignment (tab: 'id) =
+        match this.movedTab with
+        | Some(t, _, alignment) when t = tab -> alignment
+        // Group members follow the pivot's adjusted alignment.
+        | Some(pivot, _, alignment) when this.isDragGroupMember tab && this.dragGroupPivot = Some pivot ->
+            alignment
+        | _ -> this.getTabAlign(tab)
+
+    // --- Multi-tab drag group helpers ---
+    // The pivot tab is whichever tab is being dragged (= slide.tab). It may
+    // sit anywhere within dragGroup (e.g. dragGroup = [A; B; C] with B as
+    // pivot). All offsets are computed relative to the pivot's position so
+    // group members render at pivot.x + signed offset.
+    member private this.dragGroupPivot : 'id option =
+        match this.slide with
+        | Some(t, _) -> Some t
+        | None -> None
+
+    member private this.isDragGroupMember (tab: 'id) =
+        this.dragGroup |> List.contains tab
+
+    // Signed offset of a group member from the pivot.
+    // - Pivot itself: 0
+    // - Members to the right of pivot in dragGroup: positive (Σ tabLen - overlap)
+    // - Members to the left of pivot in dragGroup: negative (-Σ tabLen - overlap)
+    // Uses Chrome-style tab overlap so the rendered group matches the
+    // visual spacing of normal (non-dragged) tabs.
+    member private this.dragGroupOffsetOf (tab: 'id) : float =
+        match this.dragGroupPivot with
+        | None -> 0.0
+        | Some pivot ->
+            let pIdx = this.dragGroup |> List.tryFindIndex ((=) pivot) |> Option.defaultValue 0
+            let tIdx = this.dragGroup |> List.tryFindIndex ((=) tab) |> Option.defaultValue 0
+            if tIdx = pIdx then 0.0
+            elif tIdx > pIdx then
+                // Right of pivot: accumulate positive step widths
+                let mutable offset = 0.0
+                for i in pIdx .. tIdx - 1 do
+                    let t = this.dragGroup.[i]
+                    let tLen = if this.isPinned(t) then this.pinnedTabLength else this.unpinnedTabLength
+                    offset <- offset + tLen - this.tabOverlap
+                offset
+            else
+                // Left of pivot: accumulate negative step widths
+                let mutable offset = 0.0
+                for i in tIdx .. pIdx - 1 do
+                    let t = this.dragGroup.[i]
+                    let tLen = if this.isPinned(t) then this.pinnedTabLength else this.unpinnedTabLength
+                    offset <- offset - (tLen - this.tabOverlap)
+                offset
+
+    member private this.calcGroupWidth (tabs: List2<'id>) =
+        if tabs.isEmpty then 0.0
+        else
+            let totalLen =
+                tabs.list |> List.sumBy (fun t ->
+                    if this.isPinned(t) then this.pinnedTabLength else this.unpinnedTabLength)
+            totalLen - float(tabs.length - 1) * this.tabOverlap
+
+    member private this.tabOffsetInGroup (tabs: List2<'id>) (tab: 'id) =
+        let idx = tabs.list |> List.findIndex ((=) tab)
+        tabs.list
+        |> Seq.take idx
+        |> Seq.fold (fun acc t ->
+            let tLen = if this.isPinned(t) then this.pinnedTabLength else this.unpinnedTabLength
+            acc + tLen - this.tabOverlap
+        ) 0.0
+
+    member private this.hitInGroup (tabs: List2<'id>) (groupStartX: float) (x: float) : Option<'id> =
+        if tabs.isEmpty then None
+        else
+            let relX = x - groupStartX
+            let tabList = tabs.list
+            let mutable offset = 0.0
+            let mutable result = tabList |> List.last
+            let mutable found = false
+            for i in 0 .. tabList.Length - 1 do
+                if not found then
+                    let t = tabList.[i]
+                    let tLen = if this.isPinned(t) then this.pinnedTabLength else this.unpinnedTabLength
+                    let boundary = offset + tLen - this.tabOverlap / 2.0
+                    if relX < boundary || i = tabList.Length - 1 then
+                        result <- t
+                        found <- true
+                    offset <- offset + tLen - this.tabOverlap
+            Some(result)
+
+    // Pinned tab width: fixed at pinnedTabMaxLen unless space is too tight
+    member private this.pinnedTabLength =
+        if this.pinnedCount = 0 then this.pinnedTabMaxLen
+        else
+            let totalOverlap = float(max 0 (this.count - 1)) * this.tabOverlap
+            let availableWidth = float(this.size.width) + totalOverlap
+            let pinnedMaxTotal = float(this.pinnedCount) * this.pinnedTabMaxLen
+            let unpinnedRemaining = availableWidth - pinnedMaxTotal
+            // If unpinned tabs still have at least 1px each, keep pinned at max
+            if this.unpinnedCount = 0 || unpinnedRemaining / float(this.unpinnedCount) >= 1.0 then
+                this.pinnedTabMaxLen
+            else
+                // Everything too tight, use uniform width
+                availableWidth / float(this.count)
+
+    // Unpinned tab width: fills remaining space after pinned tabs
+    member private this.unpinnedTabLength =
+        if this.unpinnedCount = 0 then this.unpinnedTabMaxLen
+        else
+            let totalOverlap = float(max 0 (this.count - 1)) * this.tabOverlap
+            let availableWidth = float(this.size.width) + totalOverlap
+            let pinnedTotal = float(this.pinnedCount) * this.pinnedTabLength
+            let unpinnedAvailable = availableWidth - pinnedTotal
+            min (unpinnedAvailable / float(this.unpinnedCount)) this.unpinnedTabMaxLen
+
+    member this.tabSpriteRec (tab:'id) : TabSprite<'id> =
+        let isPinned = this.isPinned(tab)
+        let tabLen = if isPinned then this.pinnedTabLength else this.unpinnedTabLength
+        {
+            TabSprite.id = tab
+            isTop =
+                match this.activeTabOverride with
+                | Some active -> active = Some tab
+                | None ->
+                    match this.zorder.tryHead with
+                    | Some(top) -> top = tab
+                    | None -> false
+            isSelected = this.selectedTabs.contains(tab)
+            displayInfo = this.tabs.find(tab)
+            buttonModes = this.buttonModes
+            appearance =
+                if isPinned then
+                    { this.appearance with tabMaxWidth = int(this.pinnedTabLength) }
+                else
+                    this.appearance
+            // - 1: the one-device-pixel hairline that separates the tab from
+            // the far edge of the strip. Never scaled (see TabSprite.px), and
+            // the same expression appears in pinnedTabMinLen and in
+            // tryHitForTooltip so drawing and hit testing cannot drift apart.
+            size = Sz(int(tabLen), (this.size.height) - 1)
+            onlyIcon = isPinned && this.appearance.tabPinnedTabWidthIcon
+            isPinned = isPinned
+            dimmed = this.dimmedTabs.contains(tab)
+            direction = this.direction
+            hover =
+                match this.hover with
+                | Some(id, part) when id = tab -> Some(part)
+                | _ -> None
+            captured =
+                match this.captured with
+                | Some(id, part) when id = tab -> Some(part)
+                | _ -> None
+            scale = this.scale
+        }
+    member private this.tabSprite (tab:'id) = this.tabSpriteRec(tab) :> ISprite
+
+    member private this.bgImage =
+        let bgColor =
+            if this.transparent then Color.FromArgb(0, 0, 0, 0)
+            else Color.FromArgb(1, 1, 1, 1)
+        // Img rather than a bare Bitmap so this surface is pinned to 96 dpi
+        // like every other one (see Drawing.fs).
+        let img = Img(if this.size.isEmptyArea then Sz(1, 1) else this.size)
+        use gr = img.graphics
+        do gr.SmoothingMode <- SmoothingMode.AntiAlias
+        let bounds = Rect(Pt(), this.size)
+        do  gr.FillRectangle(new SolidBrush(bgColor), bounds.Rectangle)
+        img
+
+    // Which end of the strip the one-pixel hairline sits at: below the tabs
+    // when they point up, above them when they point down. One device pixel
+    // at every scale, like the "- 1" it complements (see TabSprite.px).
+    member private this.tabYOffset =
+        match this.direction with
+        | TabUp -> 0
+        | TabDown -> 1
+
+    member this.tabLocation tab =
+        match this.slide with
+        | Some(slideTab, x) when tab = slideTab && this.forcedSlideAlignment.IsNone ->
+            // Pivot tab: render at drag x, clamped to its own single-tab
+            // width. Group members may extend beyond the strip edge — that
+            // is the natural consequence of dragging a group near an edge
+            // and the user can drag back.
+            let tabLen = if this.isPinned(tab) then this.pinnedTabLength else this.unpinnedTabLength
+            let bounds = (0, this.size.width - int(tabLen))
+            Pt(between bounds x, this.tabYOffset)
+        | Some(pivotTab, pivotX) when tab <> pivotTab && this.isDragGroupMember tab && this.forcedSlideAlignment.IsNone ->
+            // Group member: pivot.x + signed offset (left = negative,
+            // right = positive). Use the same single-tab clamp as the
+            // pivot so the group members track the visible pivot.
+            let pivotLen = if this.isPinned(pivotTab) then this.pinnedTabLength else this.unpinnedTabLength
+            let pivotBounds = (0, this.size.width - int(pivotLen))
+            let clampedPivot = between pivotBounds pivotX
+            let offset = this.dragGroupOffsetOf tab
+            Pt(clampedPivot + int(offset), this.tabYOffset)
+        | _ ->
+            let adjusted = this.adjustedVisualOrder
+            let tabAlignment = this.getAdjustedAlignment(tab)
+            let groupTabs = adjusted.where(fun t -> this.getAdjustedAlignment(t) = tabAlignment)
+            let groupStartX =
+                match tabAlignment with
+                | TopLeft -> 0.0
+                | TopRight ->
+                    let groupWidth = this.calcGroupWidth(groupTabs)
+                    max 0.0 (float(this.size.width) - groupWidth)
+            let offset = this.tabOffsetInGroup groupTabs tab
+            Pt(int(groupStartX + offset), this.tabYOffset)
+
+    member this.tabSize = Sz(int(this.unpinnedTabLength), (this.size.height) - 1)
+
+    // The lengths this strip lays its tabs out with, for a caller that has to
+    // judge a drop by the tabs as they are drawn (TabEdges.StripLengths):
+    // (pinned tab length, unpinned tab length).
+    member this.tabLengths = this.pinnedTabLength, this.unpinnedTabLength
+
+    member this.lengthOf (tab: 'id) =
+        if this.isPinned(tab) then this.pinnedTabLength else this.unpinnedTabLength
+
+    // The part of `tab` at a point given in that tab's own coordinates, as
+    // it is drawn unturned (TabSprite.partAt). A strip that draws its tabs
+    // turned maps the point back first.
+    member this.partOf (tab: 'id) (localPt: Pt) = (this.tabSpriteRec tab).partAt(localPt)
+
+    member this.movedTab : ('id * int * TabAlign) option =
+        match this.slide with
+        | Some(tab, x) when this.forcedSlideAlignment.IsSome ->
+            let align = this.forcedSlideAlignment.Value
+            let strip : TabEdges.StripTab<_> list = this.visualOrder.list |> List.map (fun t ->
+                { tab = t
+                  tabAlign = (if this.getTabAlign t = TopLeft then TabEdges.AlignStart else TabEdges.AlignEnd)
+                  tabPinned = this.isPinned t })
+            let lengths : TabEdges.StripLengths =
+                { stripLength = float this.size.width; tabOverlap = this.tabOverlap
+                  pinnedLength = this.pinnedTabLength; unpinnedLength = this.unpinnedTabLength }
+            let index, _ = TabEdges.dropPositionWithAlignment
+                                (Some(if align = TopLeft then TabEdges.AlignStart else TabEdges.AlignEnd))
+                                lengths strip this.dragGroup tab x
+            Some(tab, index, align)
+        | Some(tab, x) ->
+            if this.count = 0 then Some(tab, 0, TopLeft)
+            else
+                // Group-drag detection: judge by the GROUP HEAD's center
+                // (= dragGroup.[0]), not the pivot's. This keeps the drop
+                // index stable regardless of which group member the user
+                // grabbed: a stationary [C,D,E] should give the same
+                // visualIdx whether the user pivots on C or D.
+                //
+                // Concretely, pivot.x is the mouse x; the head sits at
+                // pivot.x + dragGroupOffsetOf(head) (negative if head is
+                // left of pivot). The center used for boundary tests is
+                // the head's center.
+                let groupTabs =
+                    if List.isEmpty this.dragGroup then [tab] else this.dragGroup
+                let inGroup t = List.contains t groupTabs
+                let groupHead =
+                    if List.isEmpty this.dragGroup then tab else List.head this.dragGroup
+                let dragTabLen =
+                    if this.isPinned(groupHead) then this.pinnedTabLength else this.unpinnedTabLength
+                let groupHeadX = float(x) + this.dragGroupOffsetOf groupHead
+                let centerX = groupHeadX + dragTabLen / 2.0
+
+                // Calculate group tabs and widths (exclude every tab in the
+                // drag group, not just the pivot).
+                let leftWithout = this.visualOrder.where(fun t -> not (inGroup t) && this.getTabAlign(t) = TopLeft).list
+                let rightWithout = this.visualOrder.where(fun t -> not (inGroup t) && this.getTabAlign(t) = TopRight).list
+                let calcWidth (tabs: 'id list) =
+                    if tabs.IsEmpty then 0.0
+                    else
+                        let total = tabs |> List.sumBy (fun t ->
+                            if this.isPinned(t) then this.pinnedTabLength else this.unpinnedTabLength)
+                        total - float(tabs.Length - 1) * this.tabOverlap
+                let leftWidthWithout = calcWidth leftWithout
+                let rightWidthWithout = calcWidth rightWithout
+
+                // For alignment detection, use widths without the dragged tab(s)
+                let rightStartXWithout = float(this.size.width) - rightWidthWithout
+                let emptyCenterWithout = (leftWidthWithout + rightStartXWithout) / 2.0
+
+                // Determine target alignment
+                let targetAlignment = if centerX >= emptyCenterWithout then TopRight else TopLeft
+
+                // For position calculation within the group, include the dragged blob's
+                // width in the target alignment group to match how tabLocation renders
+                let leftWidthFull =
+                    if targetAlignment = TopLeft then
+                        let overlap = if leftWithout.IsEmpty then 0.0 else this.tabOverlap
+                        leftWidthWithout + dragTabLen - overlap
+                    else leftWidthWithout
+                let rightWidthFull =
+                    if targetAlignment = TopRight then
+                        let overlap = if rightWithout.IsEmpty then 0.0 else this.tabOverlap
+                        rightWidthWithout + dragTabLen - overlap
+                    else rightWidthWithout
+
+                // Calculate target index within the alignment group
+                let (groupList, groupStartX) =
+                    match targetAlignment with
+                    | TopLeft -> (leftWithout, 0.0)
+                    | TopRight ->
+                        let startX = float(this.size.width) - rightWidthFull
+                        (rightWithout, startX)
+
+                // Hybrid swap-judge basis (variant S / -19):
+                //   - Right-aligned + multi-tab drag: group CENTER
+                //     (variant R / -18 behaved well for this case because
+                //      the user reads the whole moving block, not its
+                //      left-aligned head).
+                //   - All other cases (single tab, or left-aligned drag):
+                //     group HEAD's LEFT EDGE (variant Q / -17 felt right
+                //      because the leftmost moving tab is the visual
+                //      anchor in those cases).
+                let isRightMulti =
+                    targetAlignment = TopRight && List.length groupTabs > 1
+                let groupTotalWidth =
+                    let n = List.length groupTabs
+                    let total =
+                        groupTabs |> List.sumBy (fun t ->
+                            if this.isPinned(t) then this.pinnedTabLength else this.unpinnedTabLength)
+                    total - float(max 0 (n - 1)) * this.tabOverlap
+                let judgeX =
+                    if isRightMulti then groupHeadX + groupTotalWidth / 2.0
+                    else groupHeadX
+                let groupIndex =
+                    if groupList.IsEmpty then 0
+                    else
+                        let mutable idx = groupList.Length
+                        let mutable offset = 0.0
+                        let mutable found = false
+                        for i in 0 .. groupList.Length - 1 do
+                            if not found then
+                                let t = groupList.[i]
+                                let tLen = if this.isPinned(t) then this.pinnedTabLength else this.unpinnedTabLength
+                                // Swap when judgeX crosses t's CENTER.
+                                // judgeX is the variant-specific basis
+                                // (group center for right-multi, group
+                                // head's left edge otherwise).
+                                let tCenter = groupStartX + offset + tLen / 2.0
+                                if judgeX < tCenter then
+                                    idx <- i
+                                    found <- true
+                                offset <- offset + (tLen - this.tabOverlap)
+                        max 0 (min idx groupList.Length)
+
+                // Convert group index to visual order index for splicing.
+                // visualWithout = visualOrder - the whole drag group.
+                let visualWithout = this.visualOrder.where(fun t -> not (inGroup t)).list
+                let mutable groupCount = 0
+                let mutable visualIdx = visualWithout.Length
+                let mutable found2 = false
+                for i in 0 .. visualWithout.Length - 1 do
+                    if not found2 then
+                        let t = visualWithout.[i]
+                        if this.getTabAlign(t) = targetAlignment then
+                            if groupCount = groupIndex then
+                                visualIdx <- i
+                                found2 <- true
+                            else
+                                groupCount <- groupCount + 1
+                                visualIdx <- i + 1
+
+                // visualIdx is where the pivot's center landed in
+                // visualWithout. Use it directly as the splice index for
+                // the whole group: the group's first member lands there
+                // and the pivot ends up at spliceIdx + pivotIdxInGroup.
+                //
+                // The previous "spliceIdx = visualIdx - pivotIdxInGroup"
+                // shift made it impossible to splice the group at the very
+                // end of visualWithout (the pivot's max visualIdx equals
+                // visualWithout.Length, and subtracting pivotIdxInGroup
+                // pulled the group back from the tail). Without the shift,
+                // the group correctly reaches the tail when the user drags
+                // the pivot past the last non-group tab.
+                let spliceIdx = max 0 (min visualWithout.Length visualIdx)
+
+                Some(tab, spliceIdx, targetAlignment)
+        | None -> None
+
+    member this.adjustedVisualOrder : List2<'id> =
+        match this.movedTab with
+        | Some(tab, index, _) ->
+            if List.isEmpty this.dragGroup then
+                this.visualOrder.move((=)tab, index)
+            else
+                // Splice the entire drag group at `index` of visualOrder-without-group
+                let grp = this.dragGroup
+                let cur = this.visualOrder.list
+                let withoutGroup = cur |> List.filter (fun t -> not (List.contains t grp))
+                let safeIndex = max 0 (min withoutGroup.Length index)
+                let newOrder =
+                    (withoutGroup |> List.truncate safeIndex)
+                    @ grp
+                    @ (withoutGroup |> List.skip safeIndex)
+                List2(newOrder)
+        | None -> this.visualOrder
+
+
+    member private this.renderOrder =
+        if List.isEmpty this.dragGroup then this.zorder
+        else
+            let grp = this.dragGroup
+            let nonGroup = this.zorder.where(fun t -> not (List.contains t grp))
+            let groupOrdered = this.visualOrder.where(fun t -> List.contains t grp)
+            nonGroup.appendList(groupOrdered)
+
+    member this.sprite =
+        {
+            new ISprite with
+            member x.image = this.bgImage
+            member x.children =
+                // Z-order: when a multi-tab drag group is active, bring its
+                // members to the front (end of children = topmost),
+                // ordered by visualOrder so left→right Chrome-style overlap
+                // is preserved within the group. Without this, a group
+                // member that sits behind the pivot in z-order would get
+                // covered by the pivot's overlap notch, producing the
+                // "[---A---]-B---]" artifact.
+                this.renderOrder.map <| fun (tab:'id) ->
+                    (this.tabLocation tab, this.tabSprite(tab))
+        }
+
+    member this.renderTab tab = this.tabSprite(tab).render
+
+    member this.render = this.sprite.render
+
+    member this.tryHit pt =
+        // Determine the owning tab purely geometrically (boundary at the
+        // midpoint of each tab overlap, independent of z-order) so a tab that
+        // is drawn on top never steals the exposed area — including the
+        // Close/Pin button — of the tab overlapped behind it. This uses the
+        // same partition as the tooltip hit test: every tab gets a constant
+        // hover width regardless of which tab is frontmost.
+        maybe {
+            let! tab = this.tryHitForTooltip pt
+            // Resolve the part (Close/Pin/Icon/Background) within that tab by
+            // rectangle (see TabSprite.partAt) at tab-local coordinates.
+            let part = (this.tabSpriteRec tab).partAt(pt.sub(this.tabLocation tab))
+            // Non-rectangular outlines may cross button rectangle corners.
+            // Never activate a part hidden by another tab or outside its outline.
+            // Keep the established S-curve ownership and hit behavior unchanged.
+            let resolvedPart =
+                if TabShape.needsOutlineHit this.appearance.tabShape && part <> TabBackground then
+                    let visible =
+                        this.renderOrder.list |> List.tryFind (fun id ->
+                            (this.tabSpriteRec id).containsOutline(pt.sub(this.tabLocation id), id <> tab))
+                    if visible = Some tab then part else TabBackground
+                else part
+            return tab,resolvedPart
+        }
+
+    // Tab-ownership hit test (used by both tooltip and tryHit): every tab's
+    // hover region is a uniform-width rectangle (width = tabLength - overlap),
+    // with boundaries at the overlap midpoints, ignoring z-order, so a tab drawn
+    // on top never steals the area of the tab behind it AND every tab reacts to
+    // hover over the same width. The LAST tab of a group has no right neighbour,
+    // so without adjustment it would own its full trapezoid (half an overlap
+    // wider than the interior tabs); trim its right limit by overlap/2 to keep
+    // the width uniform. The tab's slanted bottom-right corner beyond the trim
+    // is intentionally not hover-sensitive (drawing stays trapezoidal).
+    member this.tryHitForTooltip (pt: Pt) : Option<'id> =
+        if this.count = 0 then None
+        else
+            let yOff = this.tabYOffset
+            let tabH = (this.size.height) - 1
+            if pt.y >= yOff && pt.y < yOff + tabH then
+                let x = float(pt.x)
+                let adjusted = this.adjustedVisualOrder
+                let leftTabs = adjusted.where(fun t -> this.getAdjustedAlignment(t) = TopLeft)
+                let rightTabs = adjusted.where(fun t -> this.getAdjustedAlignment(t) = TopRight)
+                let leftWidth = this.calcGroupWidth(leftTabs)
+                let rightWidth = this.calcGroupWidth(rightTabs)
+                let rightStartX = float(this.size.width) - rightWidth
+                // The box shape (TabShape) draws nothing in the outer half of
+                // the edge band, so both outer ends of a group stop at the
+                // box's side instead: the first and last box are hit exactly
+                // where they are drawn, whatever the Tab Overlap. Between
+                // tabs the overlap midpoint (hitInGroup) is already where two
+                // boxes meet, or the middle of the gap between them.
+                let isBox = TabShape.isBox this.appearance.tabShape
+                let inset = float(TabShape.boxInset (this.px 18))
+                let trimAfter (tabs: List2<'id>) =
+                    if not isBox then max 0.0 (this.tabOverlap / 2.0)
+                    elif tabs.isEmpty then inset
+                    else
+                        // A tab squeezed narrower than its content draws its
+                        // icon past the box's side (as every shape does);
+                        // that part stays clickable.
+                        let last = tabs.list |> List.last
+                        let len = if this.isPinned(last) then this.pinnedTabLength else this.unpinnedTabLength
+                        max 0.0 (min inset (len - this.iconRight))
+                // (The first tab sits at the whole pixel below the group's
+                // start, as tabLocation places it.)
+                let pastLead (groupStartX: float) = not isBox || x >= Math.Floor(groupStartX) + inset
+                let hit =
+                    if x < leftWidth - trimAfter leftTabs && pastLead 0.0 && not leftTabs.isEmpty then
+                        this.hitInGroup leftTabs 0.0 x
+                    elif x >= rightStartX && pastLead rightStartX && x < float(this.size.width) - trimAfter rightTabs && not rightTabs.isEmpty then
+                        this.hitInGroup rightTabs rightStartX x
+                    else
+                        None
+                match hit with
+                | None when TabShape.normalize this.appearance.tabShape = TabShape.rounded ->
+                    // The rounded feet extend outside the box inset. Include
+                    // their outline and rasterized border at each group end,
+                    // preserving the existing ownership between neighbours.
+                    let ends =
+                        [leftTabs; rightTabs]
+                        |> List.collect (fun tabs ->
+                            if tabs.isEmpty then [] else [List.head tabs.list; List.last tabs.list])
+                    this.renderOrder.list |> List.tryFind (fun tab ->
+                        List.contains tab ends &&
+                        (this.tabSpriteRec tab).containsOutline(pt.sub(this.tabLocation tab), true))
+                | _ -> hit
+            else
+                None
+
+// A row of a left or right strip written across (four-edge tabs, 6-1): the
+// name runs left to right as on a top tab - icon, name, close or pin button -
+// and the outline is the tab shape turned a quarter, standing on the side
+// that faces the window: its sides are the row's upper and lower ends, and
+// it uses the top tab's corner band, limited only by the available geometry.
+// Transparent margins stay on the horizontal axis as on the top tab.
+type AcrossTabSprite<'id> = {
+    id: 'id
+    isTop: bool
+    isSelected: bool
+    buttonModes: string * string
+    appearance: TabAppearanceInfo
+    displayInfo: TabDisplayInfo
+    // (width across the strip, length along it)
+    size: Sz
+    isPinned: bool
+    // The side the row stands on: the right for a left strip, the left for
+    // a right one - the side of the window.
+    standsOnRight: bool
+    band: int
+    iconSide: int
+    hover: TabPart option
+    captured: TabPart option
+    scale: float
+    } with
+
+    member private this.px value = Dpi.px this.scale value
+
+    // A top tab's icon starts an edge band in, from a body that starts half a
+    // band in (TabShape.boxInset). A row's body spans its whole width, so the
+    // icon and the right end keep only that visible gap.
+    member this.padding =
+        let band = this.px TabShape.edgeBand
+        band - TabShape.boxInset band
+
+    member this.bodyHeight = max 1 (this.appearance.tabHeight - 1)
+
+    member this.bodyOffset =
+        TabShape.sideMargins this.appearance.tabMaxWidth this.band |> fst
+
+    member this.iconSize =
+        let s = this.iconSide
+        Sz(s, s)
+
+    member this.iconLocation = Pt(this.padding, this.bodyOffset + (this.bodyHeight - this.iconSize.height) / 2)
+
+    member private this.buttonSize =
+        let s = max 1 (min (this.px 18) (this.bodyHeight - 2))
+        Sz(s, s)
+
+    member this.closeButtonLocation =
+        Pt(this.size.width - this.padding - this.buttonSize.width + this.px 3, this.bodyOffset + (this.bodyHeight - this.buttonSize.height) / 2)
+
+    member private this.iconRight = this.iconLocation.x + this.iconSize.width
+
+    member private this.canShowButton = this.closeButtonLocation.x >= this.iconRight + this.px 2
+
+    member private this.buttonDecision hover : TabButtonPolicy.Decision =
+        let closeMode, pinMode = this.buttonModes
+        TabButtonPolicy.decide closeMode pinMode this.isTop hover this.isPinned false
+            this.canShowButton this.canShowButton
+
+    member this.textLocation = Pt(this.iconRight + this.px 5, this.bodyOffset)
+
+    member this.textSize =
+        let buttons = this.buttonDecision(this.hover.IsSome || this.captured.IsSome)
+        let right =
+            if buttons.showPin || buttons.showClose then this.closeButtonLocation.x
+            else this.size.width - this.padding
+        Sz(max 0 (right - this.textLocation.x), this.bodyHeight)
+
+    member private this.state =
+        match this.displayInfo.bgColor with
+        | Some(_) -> 0
+        | None ->
+            if this.isTop then 1
+            elif this.hover.IsSome || this.captured.IsSome then 2
+            elif this.isSelected then 3
+            else 4
+
+    member private this.tabBgColor =
+        match this.displayInfo.bgColor with
+        | Some(color) -> color
+        | None ->
+            let a = this.appearance
+            match this.state with
+            | 1 -> a.tabActiveTabColor
+            | 2 -> a.tabMouseOverTabColor
+            | 3 -> a.tabSelectedTabColor
+            | _ -> a.tabInactiveTabColor
+
+    member private this.borderColor =
+        let a = this.appearance
+        match this.state with
+        | 0 -> a.tabFlashBorderColor
+        | 1 -> a.tabActiveBorderColor
+        | 2 -> a.tabMouseOverBorderColor
+        | 3 -> a.tabSelectedBorderColor
+        | _ -> a.tabInactiveBorderColor
+
+    member private this.textColor =
+        let a = this.appearance
+        match this.state with
+        | 0 -> a.tabFlashTextColor
+        | 1 -> a.tabActiveTextColor
+        | 2 -> a.tabMouseOverTextColor
+        | 3 -> a.tabSelectedTextColor
+        | _ -> a.tabInactiveTextColor
+
+    member this.borderPath =
+        let path = new GraphicsPath()
+        TabShape.sideOutline this.appearance.tabShape (float32 this.size.width)
+            (float32 this.size.height) this.standsOnRight (float32 this.band)
+        |> TabShape.addToPath path
+        path
+
+    member this.containsOutline (local: Pt, includeBorder: bool) =
+        if local.x < 0 || local.x >= this.size.width || local.y < 0 || local.y >= this.size.height then false
+        else
+            use path = this.borderPath
+            use pen = new Pen(Color.Black, 2.0f)
+            path.IsVisible(float32 local.x, float32 local.y) ||
+                (includeBorder && path.IsOutlineVisible(float32 local.x, float32 local.y, pen))
+
+    // Every horizontal row underlines its text along the bottom of the body.
+    member private this.baseBand (color: Color) (g: Graphics) =
+        let thickness = this.px 3
+        let y = this.bodyOffset + this.bodyHeight - thickness
+        let rect = Rectangle(0, y, this.size.width, thickness)
+        let gradient = Rectangle(0, y, this.size.width + 1, thickness)
+        let direction = LinearGradientMode.Horizontal
+        let rightColor = Color.FromArgb(int (255.0f * 0.2f), int color.R, int color.G, int color.B)
+        use brush = new LinearGradientBrush(gradient, color, rightColor, direction)
+        let blend = new ColorBlend(3)
+        blend.Positions <- [| 0.0f; 0.6f; 1.0f |]
+        blend.Colors <- [| color; color; rightColor |]
+        brush.InterpolationColors <- blend
+        g.FillRectangle(brush, rect)
+
+    // Rasterize only the outline in the same axes as the top tab. GDI+'s
+    // antialiasing is axis-dependent; rotating this shape-only layer preserves
+    // the foot pixels. Text, icons and buttons are drawn in physical axes.
+    member private this.drawOutline (target: Graphics) paint =
+        use layer = new Bitmap(this.size.height, this.size.width, Imaging.PixelFormat.Format32bppArgb)
+        layer.SetResolution(96.0f, 96.0f)
+        use path = this.borderPath
+        use transform =
+            if this.standsOnRight then new Matrix(0.0f, 1.0f, 1.0f, 0.0f, 0.0f, 0.0f)
+            else new Matrix(0.0f, -1.0f, 1.0f, 0.0f, 0.0f, float32(this.size.width - 1))
+        path.Transform(transform)
+        do
+            use graphics = Graphics.FromImage(layer)
+            graphics.SmoothingMode <- SmoothingMode.AntiAlias
+            paint graphics path
+        layer.RotateFlip(if this.standsOnRight then RotateFlipType.Rotate90FlipX else RotateFlipType.Rotate90FlipNone)
+        target.DrawImageUnscaled(layer, 0, 0)
+
+    member this.image =
+        let img = Img(Sz(max 1 this.size.width, max 1 this.size.height))
+        let g = img.graphics
+        g.Clear(Color.FromArgb(1, 0, 0, 0))
+        use path = this.borderPath
+        use bg = new SolidBrush(this.tabBgColor)
+        this.drawOutline g (fun graphics outline -> graphics.FillPath(bg, outline))
+        this.displayInfo.fillColor |> Option.iter (fun fill ->
+            let state = g.Save()
+            g.SetClip(path)
+            use brush = new SolidBrush(fill)
+            g.FillRectangle(brush, Rectangle(0, 0, this.size.width, this.size.height))
+            g.Restore(state))
+        if this.textSize.width > 0 then
+            let text = this.displayInfo.text
+            let font = this.displayInfo.textFont
+            use brush = new SolidBrush(this.textColor)
+            use format = new StringFormat()
+            format.LineAlignment <- StringAlignment.Center
+            format.Alignment <- StringAlignment.Near
+            format.Trimming <- StringTrimming.None
+            format.FormatFlags <- format.FormatFlags ||| StringFormatFlags.NoWrap
+            let bounds = Rect(this.textLocation, this.textSize)
+            g.DrawString(text, font, brush, bounds.Rectangle.RectangleF, format)
+            let measured = g.MeasureString(text, font)
+            if measured.Width > float32 bounds.size.width then
+                let fadeWidth = min (this.px 15) this.textSize.width
+                if fadeWidth > 0 then
+                    let bgColor =
+                        match this.displayInfo.fillColor with
+                        | Some(fc) ->
+                            let a = float fc.A / 255.0
+                            let b = this.tabBgColor
+                            Color.FromArgb(255,
+                                int (float fc.R * a + float b.R * (1.0 - a)),
+                                int (float fc.G * a + float b.G * (1.0 - a)),
+                                int (float fc.B * a + float b.B * (1.0 - a)))
+                        | None -> this.tabBgColor
+                    let fadeRect = Rectangle(this.textLocation.x + this.textSize.width - fadeWidth, this.bodyOffset, fadeWidth + 1, this.bodyHeight)
+                    let state = g.Save()
+                    g.SetClip(path)
+                    use fade = new LinearGradientBrush(fadeRect, Color.FromArgb(0, int bgColor.R, int bgColor.G, int bgColor.B), bgColor, LinearGradientMode.Horizontal)
+                    g.FillRectangle(fade, fadeRect)
+                    g.Restore(state)
+        use pen = new Pen(this.borderColor, 1.0f)
+        this.drawOutline g (fun graphics outline -> graphics.DrawPath(pen, outline))
+        this.displayInfo.underlineColor |> Option.iter (fun color ->
+            let state = g.Save()
+            g.SetClip(path)
+            this.baseBand color g
+            g.Restore(state))
+        this.displayInfo.borderColor |> Option.iter (fun color ->
+            let state = g.Save()
+            use shapePen = new Pen(color, 1.0f)
+            this.drawOutline g (fun graphics outline -> graphics.DrawPath(shapePen, outline))
+            g.SetClip(path)
+            this.baseBand color g
+            g.Restore(state))
+        img
+
+    member this.children : (Pt * ISprite) list =
+        let icon = this.iconLocation, ({ IconSprite.icon = this.displayInfo.icon; size = this.iconSize; scale = this.scale } :> ISprite)
+        let buttons = this.buttonDecision(this.hover.IsSome || this.captured.IsSome)
+        let button =
+            if buttons.showPin then
+                Some(this.closeButtonLocation, ({ PinButtonSprite.size = this.buttonSize; hover = (buttons.pinClickable && this.hover = Some(TabPin)); captured = (buttons.pinClickable && this.captured = Some(TabPin)); scale = this.scale } :> ISprite))
+            elif buttons.showClose then
+                Some(this.closeButtonLocation, ({ CloseButtonSprite.size = this.buttonSize; hover = (this.hover = Some(TabClose)); captured = (this.captured = Some(TabClose)); scale = this.scale } :> ISprite))
+            else None
+        icon :: Option.toList button
+
+    member this.render : Img =
+        let img = this.image
+        let g = img.graphics
+        for (pt, child) in List.rev this.children do
+            g.DrawImageUnscaled(child.render.bitmap, pt.Point)
+        img
+
+    /// The part of the row at a point of it, by rectangle (TabSprite.partAt).
+    member this.partAt (local: Pt) : TabPart =
+        let inRect (loc: Pt) (sz: Sz) =
+            local.x >= loc.x && local.x < loc.x + sz.width && local.y >= loc.y && local.y < loc.y + sz.height
+        let buttons = this.buttonDecision true
+        if buttons.showClose && inRect this.closeButtonLocation this.buttonSize then TabClose
+        elif buttons.pinClickable && inRect this.closeButtonLocation this.buttonSize then TabPin
+        elif inRect this.iconLocation this.iconSize then TabIcon
+        else TabBackground

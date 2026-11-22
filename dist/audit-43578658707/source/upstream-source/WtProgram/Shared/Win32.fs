@@ -1,0 +1,871 @@
+﻿namespace Bemo
+open System
+open System.Drawing
+open System.IO
+open System.Runtime.InteropServices
+open System.Text
+open System.Windows.Forms
+
+// Only ordinary background siblings use the new asynchronous path. State
+// transitions and shared-desktop following retain their existing protocols.
+module BackgroundPlacementPolicy =
+    let useAsync requested background foreignThread normalSource normalTarget shared =
+        requested && background && foreignThread && normalSource && normalTarget && not shared
+    let needsSecondPass queuedAsync minimizedAtEntry minimizedNow =
+        not queuedAsync && not minimizedAtEntry && not minimizedNow
+
+    // Scheduler and native operations are supplied separately so ordering,
+    // cancellation and timeout can be checked without moving real windows.
+    let move (readDpi: unit -> uint32) targetDpi (elapsed: unit -> int64)
+             (later: int -> (unit -> unit) -> unit) valid position bounds completed =
+        let finish() =
+            try if valid() then bounds()
+            finally completed()
+        let initialDpi = readDpi()
+        if not (valid()) || initialDpi = targetDpi then finish()
+        else
+            position()
+            let rec poll() =
+                if not (valid()) then completed()
+                elif readDpi() <> initialDpi then later 20 finish
+                elif elapsed() >= 200L then finish()
+                else later 10 poll
+            later 10 poll
+
+type MouseAction =
+    | MouseDown
+    | MouseUp
+    | MouseDblClick
+
+type MouseButton =
+    | MouseLeft
+    | MouseMiddle
+    | MouseRight
+
+type MouseEvent =
+    | MouseMove of Pt
+    | MouseClick of (Pt * MouseButton * MouseAction)
+    | MouseLeave
+
+type OSMouse = {
+    pt : Pt
+    btns : Set2<MouseButton>
+    }
+
+and OSWindowPlacement = {
+    flags : int
+    showCmd: int
+    ptMinPosition: Pt
+    ptMaxPosition: Pt
+    rcNormalPosition: Rect
+}
+
+type WinEvent =
+    | EVENT_SYSTEM_FOREGROUND = 0x0003
+    | EVENT_SYSTEM_MOVESIZESTART = 0x000A
+    | EVENT_SYSTEM_MOVESIZEEND = 0x000B
+    | EVENT_SYSTEM_SWITCHSTART = 0x0014
+    | EVENT_SYSTEM_SWITCHEND = 0x0015
+    | EVENT_OBJECT_CREATE = 0x8000
+    | EVENT_OBJECT_DESTROY = 0x8001
+    | EVENT_OBJECT_SHOW = 0x8002
+    | EVENT_OBJECT_HIDE = 0x8003
+    | EVENT_OBJECT_REORDER = 0x8004
+    | EVENT_OBJECT_LOCATIONCHANGE = 0x800B
+    | EVENT_OBJECT_NAMECHANGE = 0x800C
+    // The shell cloaks the windows of the desktop being left and uncloaks
+    // those of the one being switched to: the earliest public sign of a
+    // virtual desktop switch.
+    | EVENT_OBJECT_CLOAKED = 0x8017
+    | EVENT_OBJECT_UNCLOAKED = 0x8018
+    | EVENT_SYSTEM_MINIMIZESTART = 0x0016
+    | EVENT_SYSTEM_MINIMIZEEND = 0x0017
+
+type ShellEvent =
+    | HSHELL_WINDOWCREATED = 1
+    | HSHELL_WINDOWDESTROYED = 2
+    | HSHELL_ACTIVATESHELLWINDOW = 3
+    | HSHELL_WINDOWACTIVATED = 4
+    | HSHELL_GETMINRECT = 5
+    | HSHELL_REDRAW = 6
+    | HSHELL_TASKMAN = 7
+    | HSHELL_LANGUAGE = 8
+    | HSHELL_SYSMENU = 9
+    | HSHELL_ENDTASK = 10
+    | HSHELL_FLASH = 0x8006
+    //sent for maximized windows
+    | HSHELL_RUDEAPPACTIVATED = 0x8004
+
+type IWindow =
+    abstract member hwnd : IntPtr
+
+// Shared native hooks and routing live on WinEventPump, never a UI thread.
+module WinEventHooks =
+    [<DllImport("kernel32.dll")>]
+    extern nativeint private OpenThread(uint32 access, bool inheritHandle, uint32 threadId)
+    [<DllImport("kernel32.dll")>]
+    extern uint32 private GetProcessIdOfThread(nativeint handle)
+    [<DllImport("kernel32.dll")>]
+    extern bool private CloseHandle(nativeint handle)
+
+    let private gate = WinEventDeliveryGate()
+    let private sourcePid (evt: HubEvent) =
+        // The source is the event thread, not necessarily the window owner
+        // (notably console hosting). The common case needs only one query.
+        let mutable pid = 0
+        let tid = WinUserApi.GetWindowThreadProcessId(evt.Hwnd, &pid)
+        if tid <> 0 && tid = evt.ThreadId then pid
+        else
+            let handle = OpenThread(0x0800u, false, uint32 evt.ThreadId)
+            if handle = IntPtr.Zero then 0
+            else
+                try int (GetProcessIdOfThread handle)
+                finally CloseHandle handle |> ignore
+
+    let private registrationFailures = System.Collections.Generic.HashSet<int * int>()
+
+    let mutable private registrationFailuresSuppressed = false
+
+    let private register number pid dispatch =
+#if DEBUG
+        let burst = PerfTrace.WinEventBurstCounter(number, number, pid, 0)
+        let callbackCount = PerfTrace.winEventCallback
+#endif
+        let callback hook event hwnd idObject idChild tid tick =
+#if DEBUG
+            callbackCount.Increment()
+            burst.Record(event, (idObject = IntPtr.Zero), tid)
+#endif
+            if idObject = IntPtr.Zero && gate.IsCurrent(gate.Stamp) then
+                dispatch { Hook = hook; Number = event; Hwnd = hwnd; ObjectId = idObject
+                           ChildId = idChild; ThreadId = tid; Time = tick }
+        let del = WINEVENTPROC(callback)
+        let root = GCHandle.Alloc(del)
+        // Own-process reorder/foreground events are used by strip/guard repair.
+        let wineventOutOfContext = 0
+        let hook = WinUserApi.SetWinEventHook(number, number, IntPtr.Zero, del, pid, 0, wineventOutOfContext)
+        if hook = IntPtr.Zero then
+            root.Free()
+            if not registrationFailuresSuppressed && not (registrationFailures.Contains((number, pid))) then
+                if registrationFailures.Count < 20 then
+                    registrationFailures.Add((number, pid)) |> ignore
+                    ShutdownTrace.winEventRegistrationFailed number pid
+                else
+                    registrationFailuresSuppressed <- true
+                    ShutdownTrace.winEventRegistrationFailuresSuppressed()
+            None
+        else
+#if DEBUG
+            let traceHook = PerfTrace.registerWinEventBurst burst
+#endif
+            Some (fun () ->
+                if WinUserApi.UnhookWinEvent(hook) then
+                    ShutdownTrace.write "WinEvent hook removed"
+#if DEBUG
+                    if traceHook <> 0 then PerfTrace.unregisterWinEventBurst traceHook
+#endif
+                    root.Free()
+                    true
+                else false)
+
+    let private hub = WinEventHub(register, sourcePid, WinEventPump.defer, fun () -> Environment.TickCount)
+    let private traceSubscribers() =
+#if DEBUG
+        PerfTrace.winEventSubscribers hub.SubscriptionCount
+#else
+        ()
+#endif
+
+    let setEnabled enabled =
+        // Cancel already-posted work immediately on the calling UI thread.
+        gate.SetEnabled enabled
+        WinEventPump.post(fun () -> hub.SetEnabled enabled; traceSubscribers())
+
+    let stop() =
+        gate.SetEnabled false
+        WinEventPump.stop(fun () ->
+            hub.SetEnabled false
+            ShutdownTrace.write (sprintf "WinEvent hooks remaining=%d" hub.HookCount))
+
+    let subscribe minEvent maxEvent pid tid target beforePost proc =
+        let receiver = InvokerService.invoker
+        new QueuedSubscription(WinEventPump.post, fun active ->
+            let deliver (evt: HubEvent) =
+                let stamp = gate.Stamp
+                if active() && gate.IsCurrent stamp then
+                    let accepted =
+                        match beforePost with
+                        | None -> true
+                        | Some filter -> filter evt.Hwnd
+                    if accepted then
+                        let posted = receiver.tryAsyncInvoke(fun () ->
+                            if active() && gate.IsCurrent stamp then
+                                proc evt.Hook evt.Number evt.Hwnd evt.ObjectId evt.ChildId evt.ThreadId evt.Time)
+#if DEBUG
+                        if posted then PerfTrace.winEventPosted.Increment()
+#else
+                        posted |> ignore
+#endif
+#if DEBUG
+                    else PerfTrace.winEventFiltered.Increment()
+#endif
+            let subscription = hub.Subscribe {
+                Min = minEvent; Max = maxEvent; Pid = pid; Tid = tid; Hwnd = target
+                Active = active; Deliver = deliver }
+            traceSubscribers()
+            { new IDisposable with
+                member _.Dispose() =
+                    subscription.Dispose()
+                    traceSubscribers() }) :> IDisposable
+
+type OS() as this= 
+    static let dosDevicesLock = obj()
+    static let mutable cachedDosDevices = None
+    static let mutable dosDevicesCacheUntil = DateTime.MinValue
+
+    let Cell = CellScope()
+
+    let readDosDevices() =
+        let driveLetters = List2([0..25]).map(fun i -> char(int('A') + i))
+        driveLetters.choose <| fun driveLetter ->
+            let pathLength = 512
+            let path = StringBuilder(pathLength)
+            if WinBaseApi.QueryDosDevice(driveLetter.ToString() + ":", path, pathLength) then
+                Some(path.ToString(), driveLetter)
+            else
+                None
+
+    member this.getTaskbar() = if this.isWin7OrHigher then Some(ShellApi.GetTaskbar()) else None
+    
+    // Compare (Major, Minor) as a pair, not each field independently: the old
+    // "Major >= 6 && Minor >= 1" is false on Windows 10/11, which report 10.0,
+    // because Minor 0 fails the second test. It only ever worked because an
+    // executable without a <supportedOS> manifest entry is told 6.2 by the OS
+    // compatibility shim. Adding such an entry - as a DPI-awareness manifest
+    // does - would flip this to false and silently disable the taskbar
+    // integration, DWM iconic thumbnails and MOD_NOREPEAT hotkeys.
+    member this.isWin7OrHigher =
+        let v = System.Environment.OSVersion.Version
+        v.Major > 6 || (v.Major = 6 && v.Minor >= 1)
+    
+    member this.lockForeground() = WinUserApi.LockSetForegroundWindow(1)
+    member this.unlockForeground() = WinUserApi.LockSetForegroundWindow(2).ignore
+
+    member this.nullWindow = this.windowFromHwnd(IntPtr.Zero)
+
+    member this.pid = WinBaseApi.GetCurrentProcessId()
+
+    member this.createWindow wndProc style exStyle =
+        let hModule = WinBaseApi.GetModuleHandle(IntPtr.Zero)
+        let className = Guid.NewGuid().ToString()
+        let wndProcDelegate = 
+            let wndProc hwnd msg wParam lParam =
+                let m = {hwnd=hwnd; msg=msg; wParam=wParam; lParam=lParam}
+                wndProc(m)
+            WNDPROC(wndProc)
+        let delHandle = GCHandle.Alloc(wndProcDelegate)
+        let mutable wc = WNDCLASS()
+        wc.style <- ClassStyles.CS_DBLCLKS
+        wc.lpfnWndProc <- wndProcDelegate
+        wc.cbClsExtra <- 0
+        wc.cbWndExtra <- 0
+        wc.hInstance <- hModule
+        wc.hIcon <- IntPtr.Zero
+        wc.hCursor <- WinUserApi.LoadCursor(IntPtr.Zero, CursorIds.IDC_ARROW)
+        wc.hbrBackground <- IntPtr.Zero
+        wc.lpszMenuName <- ""
+        wc.lpszClassName <- className
+        WinUserApi.RegisterClass(ref wc) |> ignore
+
+        let hwnd = WinUserApi.CreateWindowEx(
+            exStyle,
+            className,
+            "",
+            style,
+            0, 0,
+            0, 0,
+            IntPtr.Zero,
+            IntPtr.Zero,
+            hModule,
+            IntPtr.Zero
+            )
+
+        { 
+            new IWindow with
+                member this.hwnd = hwnd
+            interface IDisposable with
+                member this.Dispose() =
+                    WinUserApi.DestroyWindow(hwnd).ignore
+                    WinUserApi.UnregisterClass(className, hModule).ignore
+                    delHandle.Free()
+        }
+
+
+    member this.windowFromHwnd = Cell.cacheThis this <| fun(hwnd) -> Window(hwnd, this)
+
+    member this.registerShellHooks proc : IDisposable =
+        let shellHookMsg = WinUserApi.RegisterWindowMessage("SHELLHOOK")
+        let handler (msg:Win32Message) =
+            if msg.msg = shellHookMsg then
+                let hwnd = msg.lParam
+                let shellEvent = enum<ShellEvent>(int(msg.wParam))
+                proc(hwnd,shellEvent)
+            msg.def()
+
+        let iWindow = this.createWindow handler 0 0
+        let window = this.windowFromHwnd(iWindow.hwnd)
+        window.registerShellHookWindow()
+        iWindow :?> IDisposable
+
+    member this.screenRegion =
+        Mon.all.fold (Rgn()) <| fun rgn mon ->
+            rgn.union(Rgn(mon.displayRect))
+
+    member this.isOnScreen (bounds:Rect) = this.screenRegion.containsRect(bounds)
+
+    member this.capture =
+        let hwnd = WinUserApi.GetCapture()
+        if hwnd = IntPtr.Zero then None
+        else Some(hwnd)
+    
+    member this.foreground =
+        this.windowFromHwnd(WinUserApi.GetForegroundWindow())
+
+    member this.windowAtPt (pt:Pt) =
+        this.windowFromHwnd(WinUserApi.WindowFromPoint(pt.POINT))
+
+    member this.windowsInZorder = 
+        List2(List.ofArray (TabGlassBackdrops.without (Win32Helper.GetWindowsInZOrder()))).map(this.windowFromHwnd)
+
+    member this.windowZorders =
+        Map2(this.windowsInZorder.enumerate.map(fun(z, window) -> window.hwnd,z))
+
+    member this.setZorder(hwnds:List2<IntPtr>) =
+        let hdswp = ref(WinUserApi.BeginDeferWindowPos(hwnds.length))
+        hwnds.pairwise.iter <| fun (hwndPrev, hwnd) ->
+            hdswp := WinUserApi.DeferWindowPos(!hdswp,
+                hwnd,
+                hwndPrev, 0, 0, 0, 0,
+                SetWindowPosFlags.SWP_NOOWNERZORDER |||
+                SetWindowPosFlags.SWP_NOMOVE |||
+                SetWindowPosFlags.SWP_NOSIZE |||
+                SetWindowPosFlags.SWP_NOACTIVATE)
+                // NOTE: do not add SWP_ASYNCWINDOWPOS here — posting the
+                // repositions to each window's own thread loses the relative
+                // ordering of the batch, and the restored-window-to-front
+                // ordering silently breaks.
+        WinUserApi.EndDeferWindowPos(!hdswp).ignore
+        // A window may now lie between a strip and its glass backdrop.
+        TabGlassHost.reordered()
+
+
+    // targetHwnd exposes the existing equality filter to the hub's index.
+    member this.setWinEventHook(min:WinEvent, max:WinEvent, proc, pid, tid,
+                                ?beforePost: IntPtr -> bool, ?targetHwnd: IntPtr) =
+        WinEventHooks.subscribe (int min) (int max) pid tid targetHwnd beforePost proc
+
+    member this.dosDevices = 
+        lock dosDevicesLock <| fun() ->
+            let now = DateTime.UtcNow
+            match cachedDosDevices with
+            | Some(devices) when now < dosDevicesCacheUntil -> devices
+            | _ ->
+                let devices = readDosDevices()
+                cachedDosDevices <- Some(devices)
+                // Drive mappings can change while WindowTabs is running, so
+                // avoid a process-lifetime cache while removing scan bursts.
+                dosDevicesCacheUntil <- now.AddSeconds(30.0)
+                devices
+
+    member this.setSingleWinEvent (event:WinEvent) proc =
+        let proc hWinEventHook _ hwnd idObject idChild dwEventThread dwmsEventTime =
+            proc(hwnd)
+        this.setWinEventHook(event, event, proc, 0, 0)
+
+and
+    Window(hwnd:nativeint, os:OS) as this =
+    let Cell = CellScope()
+
+    member this.hwnd = hwnd
+    
+    member this.mon = Mon.fromHwnd(hwnd)
+
+    override this.ToString() = this.hwnd.ToString()
+
+    member this.pid = Cell.cacheProp this <| fun() -> Pid(Win32Helper.GetWindowProcessId(hwnd))
+
+    member this.tid = Win32Helper.GetWindowThreadId(hwnd)
+
+    member this.zorder = os.windowsInZorder.tryFindIndex(fun w -> w.hwnd = hwnd).def(9999)
+
+    member this.dwmSetIconicLivePreview (image:Img) =
+        if os.isWin7OrHigher then
+            let mutable ptClient = POINT(0, 0)
+            let hbitmap = image.hbitmap
+            DwmApi.DwmSetIconicLivePreviewBitmap(hwnd, hbitmap, ref ptClient, 0) |> ignore
+            WinGdiApi.DeleteObject(hbitmap) |> ignore
+
+    member this.dwmSetIconicThumbnail (image:Img) =
+        if os.isWin7OrHigher then
+            let hbitmap = image.hbitmap
+            DwmApi.DwmSetIconicThumbnail(hwnd, hbitmap, 0) |> ignore
+            WinGdiApi.DeleteObject(hbitmap) |> ignore
+
+    member this.style = WinUserApi.GetWindowLong(hwnd, WindowLongFieldOffset.GWL_STYLE)
+    member this.styleEx = WinUserApi.GetWindowLong(hwnd, WindowLongFieldOffset.GWL_EXSTYLE)
+
+    member this.hasStyle style = 
+        Win32Helper.IntPtrAnd(this.style, nativeint(style)) = nativeint(style)
+
+    member this.hasStyleEx style = 
+        Win32Helper.IntPtrAnd(this.styleEx, nativeint(style)) = nativeint(style)
+
+    member this.ptToClient (pt:Pt) = 
+        let pt = pt.POINT
+        let pt = Win32Helper.ScreenToClient(hwnd, pt)
+        pt.ToPoint().Pt
+
+    member this.ptToScreen (pt:Pt) =
+        let pt = pt.POINT
+        let pt = Win32Helper.ClientToScreen(hwnd, pt)
+        pt.ToPoint().Pt
+
+    member this.isWindow = WinUserApi.IsWindow(hwnd)
+
+    member this.isVisible = WinUserApi.IsWindowVisible(hwnd)
+
+    // Check if window is cloaked (UWP apps, virtual desktops, suspended apps)
+    // Cloaked windows have WS_VISIBLE style but are not actually rendered on screen
+    member this.isCloaked =
+        let mutable cloaked = 0
+        let result = DwmApi.DwmGetWindowAttribute(hwnd, DWMWINDOWATTRIBUTE.DWMWA_CLOAKED, &cloaked, sizeof<int>)
+        result = 0 && cloaked <> 0
+
+    // Check if window is truly visible (visible and not cloaked)
+    member this.isVisibleOnScreen = this.isVisible && not this.isCloaked
+
+    // DWMWA_CLOAKED as it is, None when the call failed. The shell's bit
+    // (DWM_CLOAKED_SHELL) is what a window on another virtual desktop has.
+    member this.cloakedValue =
+        let mutable cloaked = 0
+        let result = DwmApi.DwmGetWindowAttribute(hwnd, DWMWINDOWATTRIBUTE.DWMWA_CLOAKED, &cloaked, sizeof<int>)
+        if result = 0 then Some(cloaked) else None
+
+    // Check if window is on the current virtual desktop using IVirtualDesktopManager COM API
+    member this.isOnCurrentVirtualDesktop =
+        // Counted and timed in perf_trace.log (debug builds; a plain call otherwise).
+        PerfTrace.time "vd.isOnCurrent" (fun () -> VirtualDesktopHelper.IsWindowOnCurrentVirtualDesktop(hwnd))
+
+    // The same, None when the call failed (the plain one says "yes" then).
+    member this.onCurrentVirtualDesktopOrNone =
+        let mutable onCurrent = false
+        if VirtualDesktopHelper.TryIsWindowOnCurrentVirtualDesktop(hwnd, &onCurrent) = 0 then Some(onCurrent)
+        else None
+
+    // Whether the window is on the desktop being looked at, from both public
+    // signals (VirtualDesktopGroups.presence).
+    member this.desktopPresence =
+        VirtualDesktopGroups.presence this.onCurrentVirtualDesktopOrNone this.cloakedValue
+
+    // GetWindowDesktopId, None when the call failed or named nothing.
+    member this.desktopIdOrNone =
+        let mutable id = Guid.Empty
+        let hr = VirtualDesktopHelper.TryGetWindowDesktopId(hwnd, &id)
+        if hr = 0 && id <> Guid.Empty then Some(id) else None
+
+    // Get the virtual desktop ID for this window
+    member this.virtualDesktopId = VirtualDesktopHelper.GetWindowDesktopId(hwnd)
+
+    // The same, with the HRESULT: Guid.Empty comes back both for a window
+    // Windows will not talk about and for a call it refused, and the two have
+    // to be told apart when a group looks as if it straddles desktops.
+    member this.virtualDesktopIdWithHr =
+        let mutable id = Guid.Empty
+#if DEBUG
+        // How long one desktop reading takes, into perf_trace.log.
+        let sw = System.Diagnostics.Stopwatch.StartNew()
+#endif
+        let hr = VirtualDesktopHelper.TryGetWindowDesktopId(hwnd, &id)
+#if DEBUG
+        let ms = sw.Elapsed.TotalMilliseconds
+        PerfTrace.count "vd.read"
+        if ms >= 1000.0 then PerfTrace.count "vd.read1000+"
+        elif ms >= 100.0 then PerfTrace.count "vd.read100+"
+        elif ms >= 10.0 then PerfTrace.count "vd.read10+"
+#endif
+        (hr, id)
+
+    member this.isMinimized = WinUserApi.IsIconic(hwnd)
+
+    member this.showWindow(cmd:int) = WinUserApi.ShowWindow(hwnd, cmd).ignore
+
+    // Non-blocking show-state change: posts to the target window's thread and
+    // returns immediately (ShowWindow waits for the app to process it, which
+    // stalls the caller on a busy app).
+    member this.showWindowAsync(cmd:int) = WinUserApi.ShowWindowAsync(hwnd, cmd) |> ignore
+
+    member this.isMaximized = WinUserApi.IsZoomed(hwnd)
+
+    // Check if window is fullscreen (covers entire monitor, not just maximized)
+    member this.isFullscreen =
+        if this.isMinimized then false
+        else
+            match this.mon with
+            | Some(monitor) ->
+                let windowBounds : Rect = this.bounds
+                let monitorBounds : Rect = monitor.displayRect
+                // Window is fullscreen if it covers the entire monitor display area
+                windowBounds.x <= monitorBounds.x &&
+                windowBounds.y <= monitorBounds.y &&
+                windowBounds.x + windowBounds.width >= monitorBounds.x + monitorBounds.width &&
+                windowBounds.y + windowBounds.height >= monitorBounds.y + monitorBounds.height
+            | None -> false
+
+    member this.isOwned = WinUserApi.GetWindowLong(hwnd, WindowLongFieldOffset.GWL_HWNDPARENT) <> IntPtr.Zero
+
+    member this.bounds = Win32Helper.GetWindowRectangle(hwnd).Rect  
+
+    member this.size = this.bounds.size
+    
+    member this.location = this.bounds.location
+
+    member this.uiThreadInfo = Win32Helper.GetGUIThreadInfo(this.tid)
+
+    member this.isInMoveSize = this.uiThreadInfo.hwndMoveSize = hwnd
+
+    member this.icon iconType = 
+        Ico.fromHandle(Win32Helper.GetWindowIcon(hwnd, iconType)).def(System.Drawing.SystemIcons.Application)
+
+    member this.iconSmall = this.icon IconTypeCodes.ICON_SMALL
+
+    member this.iconBig = this.icon IconTypeCodes.ICON_BIG
+
+    member this.text = Win32Helper.GetWindowText(hwnd)
+        
+    // A tab glass backdrop belongs to the strip directly above it and is
+    // passed over (TabGlassBackdrops).
+    member this.prevZorder =
+        let previous h = WinUserApi.GetWindow(h, GetWindowConstants.GW_HWNDPREV)
+        os.windowFromHwnd(TabGlassBackdrops.skip previous (previous hwnd))
+
+    member this.placement = 
+        let wpStruct = Win32Helper.GetWindowPlacement(hwnd)
+        {
+            flags = wpStruct.flags
+            showCmd = wpStruct.showCmd
+            ptMinPosition = wpStruct.ptMinPosition.Pt
+            ptMaxPosition = wpStruct.ptMaxPosition.Pt
+            rcNormalPosition = wpStruct.rcNormalPosition.Rect
+        }
+
+    member this.setPlacement wp =
+        let mutable wpStruct = WINDOWPLACEMENT()
+        wpStruct.length <- Marshal.SizeOf(wpStruct)
+        wpStruct.flags <- wp.flags
+        wpStruct.showCmd <- wp.showCmd
+        wpStruct.ptMinPosition <- wp.ptMinPosition.POINT
+        wpStruct.ptMaxPosition <- wp.ptMaxPosition.POINT
+        wpStruct.rcNormalPosition <- wp.rcNormalPosition.RECT
+        WinUserApi.SetWindowPlacement(hwnd, ref wpStruct)
+
+    member this.setForeground(force) =
+        if force then
+            let foregroundWindow = WinUserApi.GetForegroundWindow()
+            let foregroundTID = Win32Helper.GetWindowThreadId(foregroundWindow)
+            let targetTID = Win32Helper.GetWindowThreadId(hwnd)
+            if foregroundTID = targetTID then
+                WinUserApi.SetForegroundWindow(hwnd).ignore
+            else
+                //this is the most reliable way to ensure we can set foreground, case #729
+                //does not matter what key code we send
+                WinUserApi.keybd_event(0x3A, 0, 0, 0)              
+                WinUserApi.keybd_event(0x3A, 0, SendInputConstants.KEYEVENTF_KEYUP, 0)
+                WinUserApi.SetForegroundWindow(hwnd).ignore
+        else
+            WinUserApi.SetForegroundWindow(hwnd).ignore
+
+    member this.minimize() = WinUserApi.ShowWindow(hwnd, ShowWindowCommands.SW_MINIMIZE).ignore
+    
+    member this.restore() = 
+        WinUserApi.ShowWindow(hwnd, ShowWindowCommands.SW_RESTORE).ignore
+
+    member this.close() = WinUserApi.PostMessage(hwnd, WindowMessages.WM_SYSCOMMAND, IntPtr(SystemMenuCommandValues.SC_CLOSE), IntPtr.Zero).ignore
+
+    member this.setForegroundOrRestore(force) =
+        if this.isMinimized then
+            WinUserApi.ShowWindow(this.hwnd, ShowWindowCommands.SW_RESTORE).ignore
+        else 
+            this.setForeground(force)
+    
+    member this.setCapture() = WinUserApi.SetCapture(hwnd).ignore
+
+    member this.releaseCapture() = if this.hasCapture then WinUserApi.ReleaseCapture().ignore
+
+    member this.hasCapture = WinUserApi.GetCapture() = hwnd
+
+    member this.bringToTop() = 
+        WinUserApi.BringWindowToTop(hwnd).ignore
+    
+    member this.tryInsertAfter(hwndInsertAfter:IntPtr) =
+        let placed =
+            WinUserApi.SetWindowPos(hwnd,
+                hwndInsertAfter, 0, 0, 0, 0,
+                SetWindowPosFlags.SWP_NOOWNERZORDER |||
+                SetWindowPosFlags.SWP_NOMOVE |||
+                SetWindowPosFlags.SWP_NOSIZE |||
+                SetWindowPosFlags.SWP_NOACTIVATE)
+        // A window may now lie between a strip and its glass backdrop.
+        TabGlassHost.reordered()
+        placed
+
+    member this.insertAfter(hwndInsertAfter:IntPtr) =
+        this.tryInsertAfter(hwndInsertAfter) |> ignore
+
+    // Async z-order insert (posted to this window's thread): place this window
+    // directly behind hwndInsertAfter without waiting on the app. Used when
+    // restoring group siblings so each surfaces already behind the window the
+    // user restored (no flicker on top).
+    member this.insertAfterAsync(hwndInsertAfter:IntPtr) =
+        WinUserApi.SetWindowPos(hwnd,
+            hwndInsertAfter, 0, 0, 0, 0,
+            SetWindowPosFlags.SWP_NOOWNERZORDER |||
+            SetWindowPosFlags.SWP_NOMOVE |||
+            SetWindowPosFlags.SWP_NOSIZE |||
+            SetWindowPosFlags.SWP_NOACTIVATE |||
+            SetWindowPosFlags.SWP_ASYNCWINDOWPOS) |> ignore
+
+    member this.makeTopMost() =
+        this.insertAfter(WindowHandleTypes.HWND_TOPMOST)
+
+    member this.makeNotTopMost() =
+        if this.isTopMost then
+            this.insertAfter(WindowHandleTypes.HWND_NOTOPMOST)
+
+    member this.isTopMost = this.hasStyleEx WindowsExtendedStyles.WS_EX_TOPMOST
+
+    member this.insertAfter(prev:Window) =
+        WinUserApi.SetWindowPos(hwnd,
+            prev.hwnd, 0, 0, 0, 0,
+            SetWindowPosFlags.SWP_NOOWNERZORDER |||
+            SetWindowPosFlags.SWP_NOMOVE |||
+            SetWindowPosFlags.SWP_NOSIZE |||
+            SetWindowPosFlags.SWP_NOACTIVATE) |> ignore
+        TabGlassHost.reordered()
+
+    member this.parent = os.windowFromHwnd(WinUserApi.GetWindowLong(hwnd, WindowLongFieldOffset.GWL_HWNDPARENT))
+
+    member this.setParent (parent:Window, ?reason: string) =
+        let previous = this.parent.hwnd
+        let owned = TopEdgeGuardPlacement.reownStrip hwnd parent.hwnd (defaultArg reason "window-parent")
+        if owned && previous <> parent.hwnd && parent.hwnd <> IntPtr.Zero then
+            this.insertAfter(parent.prevZorder)
+
+    member this.showNoActivate() = WinUserApi.ShowWindow(hwnd, ShowWindowCommands.SW_SHOWNOACTIVATE).ignore
+
+    member this.update(image:Img, location:Pt, alpha) =
+        // Build a fresh bitmap with a transparent background and the rendered
+        // image composited on top, then push it to the layered window.
+        // `UpdateLayeredWindow` below internally calls GetHbitmap and cleans up
+        // the resulting HBITMAP/DC, so once it returns we own nothing but the
+        // managed Bitmap/Graphics/SolidBrush — all disposed by `use`. Without
+        // this the per-frame allocation leaked LOH pixel buffers, which used
+        // to be masked by a forced GC.Collect on every render.
+        use imageWithBg = new Bitmap(image.width, image.height)
+        // 96 dpi like every Img (see Drawing.fs) and DrawImageUnscaled rather
+        // than DrawImage: this composite must stay 1:1 whatever DPI awareness
+        // the process runs with. DrawImage(bitmap, point) scales by the
+        // source/destination resolution ratio, which would silently resize the
+        // strip if the two surfaces ever disagreed.
+        imageWithBg.SetResolution(96.0f, 96.0f)
+        use gfx = Graphics.FromImage(imageWithBg)
+        use b = new SolidBrush(Color.Transparent)
+        gfx.FillRectangle(b, new Rectangle(Point.Empty, image.size.Size))
+        gfx.DrawImageUnscaled(image.bitmap, Point.Empty)
+        PerfTrace.time "layered.update" (fun () -> Win32Helper.UpdateLayeredWindow(hwnd, location.Point, imageWithBg, alpha))
+        if not this.isVisible then this.showNoActivate()
+    
+    member this.updateLocation(location:Pt) =       
+        PerfTrace.time "layered.move" (fun () -> Win32Helper.UpdateLayeredWindow(hwnd, location.Point))
+
+    member this.hide() = WinUserApi.ShowWindow(hwnd, ShowWindowCommands.SW_HIDE) |> ignore
+
+    member this.destroy() = 
+        WinUserApi.DestroyWindow(hwnd).ignore
+
+    member this.defWndProc(msg, wParam, lParam) = WinUserApi.DefWindowProc(hwnd, msg, wParam, lParam)
+        
+    member this.setAppId appId = Win32Helper.SetWindowAppId(hwnd, appId) |> ignore
+    
+    member this.dwmInvalidateIconicBitmaps() = 
+        if os.isWin7OrHigher then
+            DwmApi.DwmInvalidateIconicBitmaps(hwnd) |> ignore
+
+    member this.dwmSetAttribute attribute value =
+        if os.isWin7OrHigher then
+            let mutable value = value
+            DwmApi.DwmSetWindowAttribute(
+                hwnd, 
+                attribute,
+                ref value,
+                Marshal.SizeOf(typeof<int>)) |> ignore
+
+    member this.move (bounds:Rect) =
+        OffScreenTrap.check "move" hwnd bounds
+        WinUserApi.MoveWindow(
+            hwnd,
+            bounds.x,
+            bounds.y,
+            bounds.width,
+            bounds.height,
+            true) |> ignore
+
+    member this.setPositionOnly (x:int) (y:int) =
+        OffScreenTrap.check "setPositionOnly" hwnd (Rect(Pt(x, y), this.size))
+        // Move position only without changing size to avoid DPI scaling
+        WinUserApi.SetWindowPos(
+            hwnd,
+            WindowHandleTypes.HWND_TOP,
+            x,
+            y,
+            0,
+            0,
+            SetWindowPosFlags.SWP_NOSIZE ||| SetWindowPosFlags.SWP_NOACTIVATE ||| SetWindowPosFlags.SWP_NOZORDER) |> ignore
+
+    member this.setPositionOnlyAsync (x:int) (y:int) =
+        WinUserApi.SetWindowPos(hwnd, IntPtr.Zero, x, y, 0, 0,
+            SetWindowPosFlags.SWP_NOSIZE ||| SetWindowPosFlags.SWP_NOACTIVATE |||
+            SetWindowPosFlags.SWP_NOZORDER ||| SetWindowPosFlags.SWP_NOOWNERZORDER |||
+            SetWindowPosFlags.SWP_ASYNCWINDOWPOS) |> ignore
+
+    // Position + size change posted to the target window's thread instead of
+    // waiting on it. Safe where z-order is not being changed (SWP_NOZORDER):
+    // used to correct the size of just-restored group siblings without
+    // blocking the strip thread on each busy app (Excel, Visual Studio).
+    member this.moveAsync (bounds:Rect) =
+        WinUserApi.SetWindowPos(
+            hwnd,
+            IntPtr.Zero,
+            bounds.x,
+            bounds.y,
+            bounds.width,
+            bounds.height,
+            SetWindowPosFlags.SWP_NOACTIVATE |||
+            SetWindowPosFlags.SWP_NOZORDER |||
+            SetWindowPosFlags.SWP_NOOWNERZORDER |||
+            SetWindowPosFlags.SWP_ASYNCWINDOWPOS) |> ignore
+
+    member this.setText text = WinUserApi.SetWindowText(hwnd, text) |> ignore
+    
+    member this.className = Win32Helper.GetClassName(hwnd)
+
+    member this.isConsoleWindow = this.className = "ConsoleWindowClass"
+
+    member this.isAltTabWindow =
+        WinUserApi.IsWindowVisible(hwnd) &&
+        this.isOwned.not &&
+        int(this.styleEx) &&& WindowsExtendedStyles.WS_EX_TOOLWINDOW = 0
+    
+    member this.registerShellHookWindow() = WinUserApi.RegisterShellHookWindow(this.hwnd) |> ignore 
+
+    member this.registerHotKey(id, fsModifiers, vk, noRepeat) =  
+        let fsModifiers = 
+            if noRepeat && os.isWin7OrHigher then fsModifiers ||| HotKeyConstants.MOD_NOREPEAT
+            else fsModifiers
+        WinUserApi.RegisterHotKey(hwnd, id, fsModifiers, vk)
+
+    member this.unregisterHotKey(id) =
+        WinUserApi.UnregisterHotKey(hwnd, id)
+
+    member this.setWinEventHook (event:WinEvent) handler =
+        // Capture the handle value, not the Window instance, in the filter.
+        let target = hwnd
+        let winEventProc hWinEventHook event _hwnd idObject idChild dwEventThread dwmsEventTime =
+            if hwnd = _hwnd then 
+                handler()
+        let pid,tid =
+            //console winevents come from CONHOST.exe on windows 7, a different
+            //pid/tid than the window owner so can't filter on pid tid
+            if this.isConsoleWindow then 0,0 else this.pid.pid, this.tid
+        os.setWinEventHook(event, event, winEventProc, pid, tid, beforePost = (fun eventHwnd -> eventHwnd = target), targetHwnd = target)
+
+    member this.trackMouseLeave() =
+        let mutable tme = TRACKMOUSEEVENT()
+        tme.cbSize <- Marshal.SizeOf(tme)
+        tme.dwFlags <- TrackMouseEventFlags.TME_LEAVE
+        tme.hwndTrack <- hwnd
+        WinUserApi.TrackMouseEvent(ref tme) |> ignore
+
+    member this.hideOffScreen (size:Sz option) =
+        // ParkedWindow.isParked recognises a window left here from the same
+        // arithmetic, so the two cannot drift apart.
+        let workAreas =
+            Mon.all.list |> List.map (fun monitor ->
+                let r = monitor.workRect in ParkedWindow.ofXYWH r.x r.y r.width r.height)
+        let (x, y) = ParkedWindow.parkPoint workAreas
+        let corner = Pt(x, y)
+
+        if this.isMinimized || this.isMaximized then
+            this.showWindow(ShowWindowCommands.SW_RESTORE)
+
+        // Deliberately outside the desktop; see OffScreenTrap.
+        OffScreenTrap.parkingScope (fun () -> this.setPositionOnly corner.x corner.y)
+
+    override this.Equals(yobj) =
+        match yobj with
+        | :? Window as yobj -> this.hwnd = yobj.hwnd
+        | _ -> false
+    override this.GetHashCode() = hash this.hwnd
+    interface System.IComparable with
+      member this.CompareTo yobj =
+          match yobj with
+          | :? Window as yobj -> compare this.hwnd yobj.hwnd
+          | _ -> failwith "cannot compare values of different types"
+
+and Pid(pid:int) =
+    let os = OS()
+    let Cell = CellScope()
+
+    member this.pid = pid
+    
+    member this.isCurrentProcess = this.pid = os.pid
+
+    member this.canQueryProcess = Cell.cacheProp this <| fun() ->
+        let hProcess = WinBaseApi.OpenProcess(ProcessAccessRights.PROCESS_QUERY_INFORMATION, false, this.pid)
+        let result = hProcess <> IntPtr.Zero
+        WinBaseApi.CloseHandle(hProcess) |> ignore
+        result
+
+    member private this.processKernelPath = 
+        let hProcess = WinBaseApi.OpenProcess(ProcessAccessRights.PROCESS_QUERY_INFORMATION, false, this.pid)
+        let size = 1024
+        let sb = StringBuilder(size)
+        Psapi.GetProcessImageFileName(hProcess, sb, size) |> ignore
+        let processPath = sb.ToString()
+        WinBaseApi.CloseHandle(hProcess) |> ignore
+        processPath
+
+    member this.processPath = Cell.cacheProp this <| fun() ->
+        let path = os.dosDevices.tryPick <| fun (device, drive) ->
+            if this.processKernelPath.StartsWith(device) then
+                Some(this.processKernelPath.Replace(device, drive.ToString() + ":"))
+            else
+                None
+        path.def(this.processKernelPath)
+
+    member this.exeName = Path.GetFileName(this.processPath).ToLower()
+
+and Win32Message = {
+    hwnd : IntPtr
+    msg : int
+    wParam : nativeint
+    lParam : nativeint
+    } with
+    member this.def() = WinUserApi.DefWindowProc(this.hwnd, this.msg, this.wParam, this.lParam)
+
+[<AutoOpen>]
+module WindowExtensions =
+    type System.IntPtr with
+        member this.hiword = WinDefApi.HIWORD(this)
+        member this.loword = WinDefApi.LOWORD(this)
+        member this.size = Sz(this.hiword.int32, this.loword.int32)
+        member this.location = Pt(this.loword.int32, this.hiword.int32)

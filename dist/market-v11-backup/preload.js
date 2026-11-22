@@ -1,0 +1,869 @@
+"use strict";
+
+const fs = require("fs");
+const path = require("path");
+const os = require("os");
+const net = require("net");
+const crypto = require("crypto");
+const { spawn } = require("child_process");
+
+const PLUGIN_ROOT = __dirname;
+const PROTOCOL_VERSION = 1;
+const REQUEST_TIMEOUT_MS = 2000;
+const START_TIMEOUT_MS = 5000;
+const STOP_TIMEOUT_MS = 3000;
+const LEGACY_GRACE_MS = 900;
+const MAX_FRAME_BYTES = 1024 * 1024;
+const NATIVE_PLATFORM = "win32";
+const PLUGIN_VERSION = "0.3.0";
+
+function makeError(code, message, details) {
+  const error = new Error(message);
+  // Error.message is normally non-enumerable and disappears from diagnostics.
+  Object.defineProperty(error, "message", { value: message, enumerable: true, configurable: true });
+  error.code = code;
+  if (details !== undefined) error.details = details;
+  return error;
+}
+
+function hash(value) {
+  return crypto.createHash("sha256").update(value).digest("hex").slice(0, 16);
+}
+
+function getPluginDataPath() {
+  if (global.utools && typeof utools.getPluginLocalDataPath === "function") {
+    return utools.getPluginLocalDataPath();
+  }
+  return path.join(os.tmpdir(), "windowtabs-utools-plugin");
+}
+
+function getPipeName() {
+  if (process.env.WINDOWTABS_PIPE_NAME) return process.env.WINDOWTABS_PIPE_NAME;
+  const identity = `${os.userInfo().username}|${getPluginDataPath()}`;
+  return `\\\\.\\pipe\\windowtabs-${hash(identity)}`;
+}
+
+function fileExists(filePath) {
+  try { return fs.existsSync(filePath); } catch (_) { return false; }
+}
+
+function copyTreeSync(source, target) {
+  const stat = fs.statSync(source);
+  if (stat.isDirectory()) {
+    fs.mkdirSync(target, { recursive: true });
+    for (const entry of fs.readdirSync(source)) {
+      copyTreeSync(path.join(source, entry), path.join(target, entry));
+    }
+    return;
+  }
+  fs.mkdirSync(path.dirname(target), { recursive: true });
+  fs.copyFileSync(source, target);
+}
+
+function writeJsonAtomic(filePath, value) {
+  const temporary = `${filePath}.${process.pid}.tmp`;
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  fs.writeFileSync(temporary, JSON.stringify(value, null, 2) + "\n", "utf8");
+  fs.renameSync(temporary, filePath);
+}
+
+function readJson(filePath, fallback = null) {
+  try {
+    const text = fs.readFileSync(filePath, "utf8").replace(/^\uFEFF/, "");
+    return JSON.parse(text);
+  } catch (_) { return fallback; }
+}
+
+class PipeClient {
+  constructor(pipeName) {
+    this.pipeName = pipeName;
+    this.socket = null;
+    this.buffer = "";
+    this.nextId = 1;
+    this.pending = new Map();
+    this.listeners = new Set();
+    this.connecting = null;
+    this.trace = [];
+    this.legacyResponseIdCount = 0;
+  }
+
+  record(event, details = {}) {
+    this.trace.push({ time: new Date().toISOString(), event, ...details });
+    if (this.trace.length > 30) this.trace.shift();
+  }
+
+  onEvent(listener) {
+    this.listeners.add(listener);
+    return () => this.listeners.delete(listener);
+  }
+
+  isConnected() {
+    return Boolean(this.socket && !this.socket.destroyed);
+  }
+
+  connect(timeoutMs = REQUEST_TIMEOUT_MS) {
+    if (this.isConnected()) return Promise.resolve();
+    if (this.connecting) return this.connecting;
+    this.connecting = new Promise((resolve, reject) => {
+      let settled = false;
+      const socket = net.createConnection(this.pipeName);
+      const timer = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        socket.destroy();
+        reject(makeError("PIPE_UNAVAILABLE", "无法连接 WindowTabs 命名管道"));
+      }, timeoutMs);
+
+      const finish = (error) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        if (error) reject(error); else resolve();
+      };
+
+      socket.setEncoding("utf8");
+      socket.on("connect", () => {
+        this.socket = socket;
+        finish();
+      });
+      socket.on("data", (chunk) => { if (this.socket === socket) this.handleData(chunk); });
+      socket.on("error", (error) => {
+        if (!settled) finish(makeError("PIPE_UNAVAILABLE", error.message));
+        if (this.socket === socket) this.handleDisconnect(error);
+      });
+      socket.on("close", () => {
+        if (!settled) finish(makeError("PIPE_UNAVAILABLE", "WindowTabs 命名管道已关闭"));
+        if (this.socket === socket) this.handleDisconnect();
+      });
+    }).finally(() => {
+      this.connecting = null;
+    });
+    return this.connecting;
+  }
+
+  handleData(chunk) {
+    this.buffer += chunk;
+    if (Buffer.byteLength(this.buffer, "utf8") > MAX_FRAME_BYTES) {
+      this.handleDisconnect(makeError("FRAME_TOO_LARGE", "WindowTabs IPC 响应超过大小限制"));
+      return;
+    }
+    let newline;
+    while ((newline = this.buffer.indexOf("\n")) >= 0) {
+      const line = this.buffer.slice(0, newline).trim();
+      this.buffer = this.buffer.slice(newline + 1);
+      if (!line) continue;
+      let message;
+      // Be tolerant of a legacy/native server that prepends a UTF-8 BOM.
+      // The pipe protocol itself is BOM-free, but stripping it here prevents
+      // one malformed first frame from becoming an opaque request timeout.
+      try { message = JSON.parse(line.replace(/^\uFEFF/, "")); } catch (_) {
+        this.record("invalidJson");
+        continue;
+      }
+      if (!message || typeof message !== "object") { this.record("invalidResponse"); continue; }
+      if (message.type === "event") {
+        for (const listener of this.listeners) {
+          try { listener({ event: message.event, payload: message.payload }); } catch (_) {}
+        }
+        continue;
+      }
+      let responseId = message.id;
+      // Compatibility with shipped v9 cores: decode exactly one JSON-string
+      // wrapper, and only accept it if it matches an outstanding request.
+      if (!this.pending.has(responseId) && typeof responseId === "string") {
+        try {
+          const decoded = JSON.parse(responseId);
+          if (typeof decoded === "string" && this.pending.has(decoded)) {
+            responseId = decoded;
+            this.legacyResponseIdCount++;
+            this.record("legacyResponseId", { id: decoded });
+          }
+        } catch (_) {}
+      }
+      const pending = this.pending.get(responseId);
+      if (!pending) {
+        this.record("unmatchedResponse", { id: String(message.id).slice(0, 120) });
+        continue;
+      }
+      this.record("response", { id: responseId, method: pending.method, ok: message.ok });
+      this.pending.delete(responseId);
+      clearTimeout(pending.timer);
+      if (message.ok === false || message.error) {
+        const error = makeError(
+          message.error?.code || "CORE_ERROR",
+          message.error?.message || "WindowTabs 核心返回错误",
+          message.error?.details
+        );
+        pending.reject(error);
+      } else {
+        pending.resolve(message.result);
+      }
+    }
+  }
+
+  handleDisconnect(reason) {
+    if (this.socket && !this.socket.destroyed) this.socket.destroy();
+    this.socket = null;
+    this.buffer = "";
+    const disconnectError = reason?.code
+      ? reason
+      : makeError("PIPE_UNAVAILABLE", reason?.message || "WindowTabs 命名管道已断开");
+    for (const [id, pending] of this.pending) {
+      clearTimeout(pending.timer);
+      pending.reject(disconnectError);
+      this.pending.delete(id);
+    }
+  }
+
+  async request(method, params = {}, timeoutMs = REQUEST_TIMEOUT_MS) {
+    await this.connect(timeoutMs);
+    const id = `req-${Date.now()}-${this.nextId++}`;
+    const message = JSON.stringify({ id, version: PROTOCOL_VERSION, method, params }) + "\n";
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.pending.delete(id);
+        this.record("timeout", { id, method, timeoutMs });
+        reject(makeError("REQUEST_TIMEOUT", `WindowTabs 请求超时：${method}`, { id, method, timeoutMs }));
+      }, timeoutMs);
+      this.pending.set(id, { resolve, reject, timer, method });
+      this.record("request", { id, method });
+      try { this.socket.write(message); } catch (error) {
+        clearTimeout(timer);
+        this.pending.delete(id);
+        reject(makeError("PIPE_UNAVAILABLE", error.message));
+      }
+    });
+  }
+
+  close() {
+    this.connecting = null;
+    this.handleDisconnect();
+  }
+}
+
+class HelperManager {
+  constructor() {
+    this.pipeName = getPipeName();
+    this.pipe = new PipeClient(this.pipeName);
+    this.child = null;
+    this.helperManifest = null;
+    this.startPromise = null;
+    this.stopPromise = null;
+    this.restartPromise = null;
+    this.logLines = [];
+    this.state = "INSTALLED_STOPPED";
+    this.lastStatus = {
+      state: this.state,
+      message: "WindowTabs 尚未运行",
+      protocol: PROTOCOL_VERSION,
+      groupCount: 0
+    };
+    this.capabilities = [];
+    this.listeners = new Set();
+    this.pipe.onEvent((event) => this.emit(event.event, event.payload));
+  }
+
+  onEvent(listener) {
+    this.listeners.add(listener);
+    return () => this.listeners.delete(listener);
+  }
+
+  emit(event, payload) {
+    if (event === "stateChanged" && payload) {
+      if (payload.state) this.state = payload.state;
+      this.lastStatus = payload;
+    }
+    for (const listener of this.listeners) {
+      try { listener({ event, payload }); } catch (_) {}
+    }
+  }
+
+  appendLog(value) {
+    const lines = String(value).split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+    if (!lines.length) return;
+    this.logLines.push(...lines);
+    if (this.logLines.length > 100) this.logLines.splice(0, this.logLines.length - 100);
+    this.emit("log", lines.join("\n"));
+  }
+
+  setState(state, patch = {}) {
+    this.state = state;
+    this.lastStatus = {
+      ...this.lastStatus,
+      ...patch,
+      state,
+      protocol: PROTOCOL_VERSION
+    };
+    this.emit("stateChanged", this.lastStatus);
+  }
+
+  isChildAlive() {
+    if (!this.child || this.child.exitCode !== null || this.child.signalCode !== null) return false;
+    if (this.child.killed) return false;
+    return true;
+  }
+
+  findExistingProcessPid() {
+    if (process.platform !== NATIVE_PLATFORM) return Promise.resolve(null);
+    return new Promise((resolve) => {
+      const tasklist = spawn("tasklist", ["/FI", "IMAGENAME eq WindowTabs.exe", "/FO", "CSV", "/NH"], {
+        windowsHide: true,
+        stdio: ["ignore", "pipe", "ignore"]
+      });
+      let output = "";
+      tasklist.stdout?.on("data", (chunk) => { output += chunk; });
+      tasklist.once("error", () => resolve(null));
+      tasklist.once("exit", () => {
+        const match = output.match(/"WindowTabs\.exe"\s*,\s*"(\d+)"/i);
+        resolve(match ? Number(match[1]) : null);
+      });
+    });
+  }
+
+  resolveHelper() {
+    this.helperManifest = null;
+    const override = process.env.WINDOWTABS_HELPER_PATH;
+    if (override && fileExists(override)) return override;
+    if (process.platform !== "win32") return null;
+
+    const bundledRoot = path.join(PLUGIN_ROOT, "helper");
+    const bundledManifestPath = path.join(bundledRoot, "current.json");
+    const bundledManifest = readJson(bundledManifestPath);
+    const localRoot = path.join(getPluginDataPath(), "helper");
+    const localManifest = readJson(path.join(localRoot, "current.json"));
+    const resolveManifestPath = (root, manifest) => {
+      if (!manifest) return null;
+      if (manifest.path) return path.isAbsolute(manifest.path) ? manifest.path : path.join(root, manifest.path);
+      if (manifest.version) return path.join(root, manifest.version, "WindowTabs.exe");
+      return null;
+    };
+    const sameVersion = (left, right) => Boolean(left && right &&
+      left.version === right.version &&
+      left.buildId === right.buildId &&
+      (!right.sha256 || right.sha256 === "pending-local-build" || left.sha256 === right.sha256));
+    const localPath = resolveManifestPath(localRoot, localManifest);
+    const bundledPath = resolveManifestPath(bundledRoot, bundledManifest);
+
+    // Prefer the bundled manifest as the source of truth. This prevents a
+    // persisted uTools data directory from pinning the plugin to an old core
+    // after a plugin upgrade.
+    if (bundledManifest && fileExists(bundledPath)) {
+      if (sameVersion(localManifest, bundledManifest) && fileExists(localPath)) {
+        this.helperManifest = localManifest;
+        return localPath;
+      }
+      try {
+        const versionDir = path.basename(path.dirname(bundledPath));
+        const localVersionDir = path.join(localRoot, versionDir);
+        copyTreeSync(path.dirname(bundledPath), localVersionDir);
+        writeJsonAtomic(path.join(localRoot, "current.json"), bundledManifest);
+        this.helperManifest = bundledManifest;
+        return path.join(localVersionDir, path.basename(bundledPath));
+      } catch (_) {
+        // Read-only plugin installs can still run directly from the bundle.
+        this.helperManifest = bundledManifest;
+        return bundledPath;
+      }
+    }
+
+    if (localManifest && fileExists(localPath)) {
+      this.helperManifest = localManifest;
+      return localPath;
+    }
+
+    const bundled = path.join(PLUGIN_ROOT, "helper", "WindowTabs.exe");
+    return fileExists(bundled) ? bundled : null;
+  }
+
+  verifyHelper(helperPath) {
+    const expected = this.helperManifest?.sha256;
+    if (!expected || expected === "pending-local-build") return;
+    const actual = crypto.createHash("sha256").update(fs.readFileSync(helperPath)).digest("hex");
+    if (actual.toLowerCase() !== String(expected).toLowerCase()) {
+      throw makeError("HELPER_INTEGRITY", "WindowTabs helper 校验失败，请重新安装插件");
+    }
+  }
+
+  isNativePlatform() {
+    return process.platform === NATIVE_PLATFORM || Boolean(process.env.WINDOWTABS_HELPER_PATH);
+  }
+
+  async getStatus() {
+    if (!this.isNativePlatform()) {
+      this.setState("UNSUPPORTED_PLATFORM", {
+        message: "WindowTabs 原生核心仅支持 Windows",
+        error: null
+      });
+      return this.lastStatus;
+    }
+    if (this.state === "LEGACY_RUNNING" && this.isChildAlive()) {
+      return this.lastStatus;
+    }
+    try {
+      const hello = await this.pipe.request("hello");
+      if (Number(hello?.protocolVersion) !== PROTOCOL_VERSION) {
+        throw makeError("PROTOCOL_MISMATCH", "WindowTabs IPC 协议版本不兼容", hello);
+      }
+      this.capabilities = Array.isArray(hello.capabilities) ? hello.capabilities : [];
+      const result = await this.pipe.request("status");
+      const bundledManifest = readJson(path.join(PLUGIN_ROOT, "helper", "current.json"));
+      const runningVersion = result?.coreVersion || hello?.coreVersion;
+      const updateAvailable = Boolean(bundledManifest?.version && runningVersion &&
+        (bundledManifest.version !== runningVersion || (bundledManifest.buildId && hello?.buildId !== bundledManifest.buildId)));
+      this.setState("READY", {
+        ...result,
+        capabilities: this.capabilities,
+        updateAvailable,
+        message: updateAvailable
+          ? "WindowTabs 正在运行，重启后应用新版本"
+          : "WindowTabs 正在运行",
+        error: null
+      });
+      return this.lastStatus;
+    } catch (error) {
+      if (error.code === "PIPE_UNAVAILABLE") {
+        // Always refresh the bundled manifest before classifying a running
+        // process. This is important when an older plugin instance started
+        // the legacy helper and the current instance inherits that process.
+        const helperPath = this.resolveHelper();
+        if (this.isChildAlive() && this.helperManifest?.supportsIpc !== true) {
+          this.setState("LEGACY_RUNNING", {
+            message: "WindowTabs 已启动（兼容模式，状态控制由系统托盘提供）",
+            pid: this.child.pid,
+            coreVersion: this.helperManifest?.version || "legacy",
+            updateAvailable: Boolean(helperPath && this.helperManifest?.ipc === true),
+            error: null
+          });
+        } else {
+          const existingPid = await this.findExistingProcessPid();
+          if (existingPid && helperPath && this.helperManifest?.supportsIpc !== true) {
+            this.setState("LEGACY_RUNNING", {
+              message: "检测到旧版 WindowTabs，准备切换到插件核心",
+              pid: existingPid,
+              coreVersion: this.helperManifest?.version || "legacy",
+              updateAvailable: this.helperManifest?.ipc === true,
+              error: {
+                code: "IPC_UNAVAILABLE",
+                message: "检测到未启用 uTools IPC 的旧版核心，启动时将自动替换"
+              }
+            });
+          } else if (helperPath && this.helperManifest?.supportsIpc === true && (existingPid || this.isChildAlive())) {
+            this.setState("DEGRADED", {
+              message: "带 IPC 的 WindowTabs 核心未能连接",
+              error: makeError("CORE_IPC_START_FAILED", "核心进程已启动，但未提供 uTools IPC")
+            });
+          } else if (helperPath) {
+            this.setState("INSTALLED_STOPPED", { message: "WindowTabs 尚未运行", error: null });
+          } else {
+            this.setState("NOT_INSTALLED", { message: "未找到 WindowTabs helper", error });
+          }
+        }
+      } else {
+        this.setState("DEGRADED", { message: "WindowTabs 连接异常", error });
+      }
+      return this.lastStatus;
+    }
+  }
+
+  async waitForReady(timeoutMs = START_TIMEOUT_MS) {
+    const deadline = Date.now() + timeoutMs;
+    let lastError;
+    while (Date.now() < deadline) {
+      try {
+        const hello = await this.pipe.request("hello", {}, 800);
+        if (Number(hello?.protocolVersion) !== PROTOCOL_VERSION) {
+          throw makeError("PROTOCOL_MISMATCH", "WindowTabs IPC 协议版本不兼容", hello);
+        }
+        this.capabilities = Array.isArray(hello.capabilities) ? hello.capabilities : [];
+        const result = await this.pipe.request("status", {}, 800);
+        const bundledManifest = readJson(path.join(PLUGIN_ROOT, "helper", "current.json"));
+        const runningVersion = result?.coreVersion || hello?.coreVersion;
+        const updateAvailable = Boolean(bundledManifest?.version && runningVersion &&
+          (bundledManifest.version !== runningVersion || (bundledManifest.buildId && hello?.buildId !== bundledManifest.buildId)));
+        this.setState("READY", {
+          ...result,
+          capabilities: this.capabilities,
+          updateAvailable,
+          message: updateAvailable
+            ? "WindowTabs 正在运行，重启后应用新版本"
+            : "WindowTabs 正在运行",
+          error: null
+        });
+        return this.lastStatus;
+      } catch (error) {
+        lastError = error;
+        await new Promise((resolve) => setTimeout(resolve, 180));
+      }
+    }
+    throw lastError || makeError("CORE_NOT_READY", "WindowTabs 未在规定时间内完成启动");
+  }
+
+  async start() {
+    if (this.startPromise) return this.startPromise;
+    this.startPromise = this.startInternal();
+    try {
+      return await this.startPromise;
+    } finally {
+      this.startPromise = null;
+    }
+  }
+
+  async startInternal() {
+    if (!this.isNativePlatform()) {
+      throw makeError("UNSUPPORTED_PLATFORM", "WindowTabs 原生核心仅支持 Windows");
+    }
+    const current = await this.getStatus();
+    if (current.state === "READY") {
+      const bundled = readJson(path.join(PLUGIN_ROOT, "helper", "current.json"));
+      const required = bundled?.capabilities || [];
+      const outdated = bundled?.contractVersion === 1 &&
+        required.some(capability => !this.capabilities.includes(capability));
+      if (!outdated) return current;
+      await this.stop();
+    }
+    if (current.state === "LEGACY_RUNNING") {
+      // A plugin upgrade can leave an old helper process alive. If the
+      // bundled manifest says the new helper has IPC, replace the old one
+      // automatically before launching the new core.
+      if (this.helperManifest?.ipc === true) {
+        await this.stop();
+      } else {
+        return current;
+      }
+    }
+    const helperPath = this.resolveHelper();
+    if (!helperPath) throw makeError("NOT_INSTALLED", "未找到 WindowTabs.exe，请将原生核心放入 helper 目录");
+    this.verifyHelper(helperPath);
+
+    this.setState("STARTING", { message: "正在启动 WindowTabs", error: null });
+    try {
+      const settingsPath = path.join(getPluginDataPath(), "settings", "WindowTabsSettings.json");
+      // Migrate once by copying; never delete or overwrite a standalone user's file.
+      if (!fileExists(settingsPath) && !fileExists(settingsPath.replace(/\.json$/, ".txt"))) {
+        const oldRoot = path.join(process.env.APPDATA || getPluginDataPath(), "WindowTabs");
+        for (const ext of ["json", "txt"]) {
+          const source = path.join(oldRoot, `WindowTabsSettings.${ext}`);
+          if (fileExists(source)) {
+            fs.mkdirSync(path.dirname(settingsPath), { recursive: true });
+            fs.copyFileSync(source, settingsPath.replace(/\.json$/, `.${ext}`), fs.constants.COPYFILE_EXCL);
+            break;
+          }
+        }
+      }
+      const helperArgs = [`--windowtabs-ipc-pipe=${this.pipeName}`, `--windowtabs-settings=${settingsPath}`];
+      const command = helperPath.toLowerCase().endsWith(".js") ? process.execPath : helperPath;
+      const commandArgs = helperPath.toLowerCase().endsWith(".js")
+        ? [helperPath, ...helperArgs]
+        : helperArgs;
+      this.child = spawn(command, commandArgs, {
+        cwd: path.dirname(helperPath),
+        detached: true,
+        windowsHide: true,
+        stdio: ["ignore", "pipe", "pipe"]
+      });
+      this.child.stdout?.on("data", (chunk) => this.appendLog(chunk));
+      this.child.stderr?.on("data", (chunk) => this.appendLog(chunk));
+      this.child.on("error", (error) => {
+        this.setState("DEGRADED", { message: "WindowTabs 启动失败", error: makeError("CORE_START_FAILED", error.message) });
+      });
+      this.child.on("exit", (code, signal) => {
+        this.child = null;
+        if (this.state !== "STOPPING") {
+          this.setState("DEGRADED", { message: `WindowTabs 已退出（code=${code ?? "-"}, signal=${signal ?? "-"}）`, error: makeError("CORE_CRASHED", "WindowTabs 核心已退出") });
+          this.emit("error", this.lastStatus.error);
+        }
+      });
+      this.child.unref();
+      try {
+        return await this.waitForReady();
+      } catch (error) {
+        // Older WindowTabs builds do not know the IPC argument. Keep them
+        // usable from uTools and expose a clear degraded/legacy state instead
+        // of treating a successfully running tray process as a failed start.
+        if (this.isChildAlive() && this.helperManifest?.supportsIpc !== true) {
+          await new Promise((resolve) => setTimeout(resolve, LEGACY_GRACE_MS));
+          if (this.isChildAlive() && !this.pipe.isConnected()) {
+            this.setState("LEGACY_RUNNING", {
+              message: "WindowTabs 已启动（兼容模式，状态控制由系统托盘提供）",
+              pid: this.child.pid,
+              coreVersion: this.helperManifest?.version || "legacy",
+              updateAvailable: this.helperManifest?.ipc === true,
+              error: {
+                code: "IPC_UNAVAILABLE",
+                message: "当前 WindowTabs 版本未启用 uTools IPC；可通过系统托盘使用完整功能"
+              }
+            });
+            return this.lastStatus;
+          }
+        }
+        throw error;
+      }
+    } catch (error) {
+      this.setState("DEGRADED", { message: "WindowTabs 启动超时", error });
+      throw error;
+    }
+  }
+
+  waitForChildExit(child, timeoutMs = STOP_TIMEOUT_MS) {
+    if (!child || child.exitCode !== null || child.signalCode !== null) return Promise.resolve(true);
+    return new Promise((resolve) => {
+      let settled = false;
+      const finish = (value) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        child.removeListener("exit", onExit);
+        resolve(value);
+      };
+      const onExit = () => finish(true);
+      const timer = setTimeout(() => finish(false), timeoutMs);
+      child.once("exit", onExit);
+    });
+  }
+
+  terminateProcessByPid(pid, timeoutMs = STOP_TIMEOUT_MS) {
+    if (!pid || process.platform !== NATIVE_PLATFORM) return Promise.resolve(true);
+    return new Promise((resolve) => {
+      let settled = false;
+      const finish = (value) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve(value);
+      };
+      const timer = setTimeout(() => finish(false), timeoutMs);
+      const taskkill = spawn("taskkill", ["/PID", String(pid), "/T", "/F"], {
+        windowsHide: true,
+        stdio: "ignore"
+      });
+      taskkill.once("error", () => finish(false));
+      taskkill.once("exit", (code) => finish(code === 0 || code === 128));
+    });
+  }
+
+  isProcessRunning(pid) {
+    if (!pid || process.platform !== NATIVE_PLATFORM) return Promise.resolve(false);
+    return new Promise((resolve) => {
+      const tasklist = spawn("tasklist", ["/FI", `PID eq ${pid}`, "/FO", "CSV", "/NH"], {
+        windowsHide: true, stdio: ["ignore", "pipe", "ignore"]
+      });
+      let output = "";
+      tasklist.stdout?.on("data", chunk => { output += chunk; });
+      tasklist.once("error", () => resolve(false));
+      tasklist.once("exit", () => resolve(new RegExp(`[,\"]${pid}[\",]`).test(output)));
+    });
+  }
+
+  async waitForProcessExit(pid, timeoutMs = STOP_TIMEOUT_MS) {
+    const deadline = Date.now() + timeoutMs;
+    while (await this.isProcessRunning(pid)) {
+      if (Date.now() >= deadline) return false;
+      await new Promise(resolve => setTimeout(resolve, 100));
+    }
+    return true;
+  }
+
+  async stop() {
+    if (this.stopPromise) return this.stopPromise;
+    this.stopPromise = this.stopInternal();
+    try {
+      return await this.stopPromise;
+    } finally {
+      this.stopPromise = null;
+    }
+  }
+
+  async stopInternal() {
+    const current = await this.getStatus();
+    if (current.state === "LEGACY_RUNNING") {
+      this.setState("STOPPING", { message: "正在停止 WindowTabs", error: null });
+      const child = this.child;
+      try {
+        if (child && this.isChildAlive()) {
+          child.kill();
+          if (!(await this.waitForChildExit(child))) {
+            throw makeError("CORE_STOP_TIMEOUT", "WindowTabs 进程未在规定时间内退出");
+          }
+        } else if (current.pid) {
+          if (!(await this.terminateProcessByPid(current.pid))) {
+            throw makeError("CORE_STOP_TIMEOUT", "旧版 WindowTabs 进程未在规定时间内退出");
+          }
+        }
+        this.pipe.close();
+        this.child = null;
+        this.setState("INSTALLED_STOPPED", { message: "WindowTabs 已停止", pid: null, groupCount: 0, error: null });
+        return this.lastStatus;
+      } catch (error) {
+        this.setState("DEGRADED", { message: "WindowTabs 停止失败", error });
+        throw error;
+      }
+    }
+    if (current.state !== "READY") {
+      this.setState("INSTALLED_STOPPED", { message: "WindowTabs 尚未运行", error: null });
+      return this.lastStatus;
+    }
+    this.setState("STOPPING", { message: "正在停止 WindowTabs", error: null });
+    try {
+      const child = this.child;
+      await this.pipe.request("shutdown", {}, STOP_TIMEOUT_MS);
+      this.pipe.close();
+      if (child && !(await this.waitForChildExit(child))) {
+        throw makeError("CORE_STOP_TIMEOUT", "WindowTabs 进程未在规定时间内退出");
+      }
+      if (!child && current.pid && !(await this.waitForProcessExit(current.pid))) {
+        throw makeError("CORE_STOP_TIMEOUT", "WindowTabs 进程未在规定时间内退出");
+      }
+      this.child = null;
+      this.setState("INSTALLED_STOPPED", { message: "WindowTabs 已停止", pid: null, groupCount: 0, error: null });
+      return this.lastStatus;
+    } catch (error) {
+      this.setState("DEGRADED", { message: "WindowTabs 停止失败", error });
+      throw error;
+    }
+  }
+
+  async restart() {
+    if (this.restartPromise) return this.restartPromise;
+    this.restartPromise = this.restartInternal();
+    try {
+      return await this.restartPromise;
+    } finally {
+      this.restartPromise = null;
+    }
+  }
+
+  async restartInternal() {
+    await this.stop();
+    return await this.start();
+  }
+
+  async openSettings() {
+    this.emit("navigate", { page: "general" });
+    return this.getStatus();
+  }
+
+  async integrated(method, params = {}) {
+    const methods = ["settingsSnapshot", "settingsApply", "themesUpdate", "setEnabled",
+      "applications", "applicationUpdate", "windowUpdate", "workspaces", "workspaceCapture",
+      "workspaceUpdate", "workspaceRestore", "workspaceRestoreStatus", "storageInfo", "storageTransfer"];
+    if (!methods.includes(method)) throw makeError("INVALID_REQUEST", "不支持此操作");
+    if (!this.capabilities.includes("integrated-settings-v1")) {
+      await this.requireIpc();
+      if (!this.capabilities.includes("integrated-settings-v1"))
+        throw makeError("CORE_UPDATE_REQUIRED", "需要更新插件内置组件，请安装新版插件");
+    }
+    return this.pipe.request(method, params, 12000);
+  }
+
+  async requireIpc() {
+    const current = await this.getStatus();
+    if (current.state !== "READY") await this.start();
+    if (this.state === "LEGACY_RUNNING") {
+      throw makeError("IPC_UNAVAILABLE", "当前 WindowTabs 版本未启用 uTools IPC");
+    }
+  }
+
+  async getConfig() {
+    await this.requireIpc();
+    if (this.capabilities.length && !this.capabilities.includes("config")) {
+      throw makeError("CAPABILITY_UNAVAILABLE", "当前 WindowTabs 核心不支持配置读取");
+    }
+    return await this.pipe.request("getConfig");
+  }
+
+  async updateConfig(patch) {
+    await this.requireIpc();
+    if (this.capabilities.length && !this.capabilities.includes("config")) {
+      throw makeError("CAPABILITY_UNAVAILABLE", "当前 WindowTabs 核心不支持配置更新");
+    }
+    if (!patch || typeof patch !== "object" || Array.isArray(patch)) {
+      throw makeError("INVALID_CONFIG", "配置更新必须是对象");
+    }
+    return await this.pipe.request("updateConfig", { patch });
+  }
+
+  async getDiagnostics() {
+    const helperPath = this.resolveHelper();
+    const bundledManifest = readJson(path.join(PLUGIN_ROOT, "helper", "current.json"));
+    return {
+      pluginVersion: PLUGIN_VERSION,
+      state: this.state,
+      pipeName: this.pipeName,
+      helperPath,
+      helperExists: Boolean(helperPath),
+      helperVersion: this.helperManifest?.version || null,
+      bundledHelperVersion: bundledManifest?.version || null,
+      helperSource: this.helperManifest?.source || null,
+      helperBuildId: this.helperManifest?.buildId || null,
+      helperPatchId: this.helperManifest?.patchId || null,
+      helperSha256: this.helperManifest?.sha256 || null,
+      bundledHelperBuildId: bundledManifest?.buildId || null,
+      bundledHelperPatchId: bundledManifest?.patchId || null,
+      ipcTrace: this.pipe.trace.slice(),
+      legacyResponseIdCount: this.pipe.legacyResponseIdCount,
+      childPid: this.child?.pid || null,
+      childAlive: this.isChildAlive(),
+      recentLogs: this.logLines.slice(-30),
+      platform: process.platform,
+      arch: process.arch,
+      node: process.version,
+      uToolsVersion: global.utools && typeof global.utools.getAppVersion === "function"
+        ? global.utools.getAppVersion()
+        : null,
+      lastStatus: this.lastStatus
+    };
+  }
+
+  dispose() {
+    this.pipe.close();
+  }
+}
+
+const manager = new HelperManager();
+
+function expose() {
+  window.windowTabs = {
+    getSchema: () => readJson(path.join(PLUGIN_ROOT, "settings-schema.json")),
+    integrated: (method, params) => manager.integrated(method, params),
+    exportBackup: async (data) => {
+      if (!global.utools?.showSaveDialog) throw makeError("SAVE_DIALOG_UNAVAILABLE", "当前环境无法保存文件");
+      const selected = await utools.showSaveDialog({ title: "导出窗口标签设置", defaultPath: "窗口标签设置.json", filters: [{name:"设置备份",extensions:["json"]}] });
+      const file = Array.isArray(selected) ? selected[0] : selected;
+      if (file) writeJsonAtomic(file, data);
+      return Boolean(file);
+    },
+    copyDiagnostics: async () => {
+      const diagnostics = await manager.getDiagnostics();
+      if (global.utools?.copyText) utools.copyText(JSON.stringify(diagnostics, null, 2));
+    },
+    getStatus: () => manager.getStatus(),
+    start: () => manager.start(),
+    stop: () => manager.stop(),
+    restart: () => manager.restart(),
+    openSettings: () => manager.openSettings(),
+    getConfig: () => manager.getConfig(),
+    updateConfig: (patch) => manager.updateConfig(patch),
+    getDiagnostics: () => manager.getDiagnostics(),
+    onEvent: (listener) => manager.onEvent(listener)
+  };
+}
+
+expose();
+
+if (global.utools && typeof utools.onPluginEnter === "function") {
+  utools.onPluginEnter(async ({ code }) => {
+    try {
+      if (code === "windowtabs") await manager.start();
+      if (code === "windowtabs-settings") { manager.emit("navigate", {page:"general"}); await manager.start(); }
+    } catch (error) {
+      manager.emit("error", error);
+    }
+  });
+}
+
+if (global.utools && typeof utools.onPluginOut === "function") {
+  utools.onPluginOut((isKill) => {
+    if (isKill) manager.dispose();
+  });
+}
+

@@ -1,0 +1,4518 @@
+//namespace Bemo
+open Bemo
+open System
+open System.Collections.Generic
+open System.Drawing
+open System.Diagnostics
+open System.IO
+open System.Text
+open System.Reflection
+open System.Runtime.InteropServices
+open System.Threading
+open System.Windows.Forms
+open Microsoft.FSharp.Reflection
+open Bemo.Win32
+//open Bemo.Licensing
+open Newtonsoft.Json
+open Newtonsoft.Json.Linq
+open Microsoft.Win32
+open System.Globalization
+
+type ExplicitDestination =
+    | JoinGroup of IntPtr * IntPtr
+    | FreshGroup of (IntPtr -> unit)
+
+type ProgramInput =
+    | WinEvent of (IntPtr * WinEvent)
+    | ShellEvent of (IntPtr * ShellEvent)
+    | Timer
+
+type ProgramVersion(parts:List2<int>)=
+    new(versionString:string) =
+        ProgramVersion(List2(versionString.Split([|'.'|])).map(Int32.Parse))
+
+    member this.parts = parts
+
+    member this.compare(v2:ProgramVersion) =
+        let maxLen = max this.parts.length v2.parts.length
+        let zeroPad (parts:List2<_>) =
+            if parts.length < maxLen then parts.appendList(List2(Seq.init (maxLen - parts.length) (fun _ -> 0)))
+            else parts
+        let v1 = zeroPad this.parts
+        let v2 = zeroPad v2.parts
+        v1.zip(v2).tryPick(fun(v1,v2) -> 
+            if v1 > v2 then Some(1)
+            elif v2 > v1 then Some(-1)
+            else None).def(0)
+
+    member this.isNewerThan(v2:ProgramVersion) =
+        this.compare(v2) > 0
+
+// Parse RRGGBBAA hex string to Color. The text half of the conversion is in
+// SavedTabState.Rgba, next to the record that carries it, so that the byte
+// order the file is written in and the byte order it is read in are one piece
+// of code and can be checked without starting WindowTabs.
+let parseColorRRGGBBAA (s: string) : Color option =
+    SavedTabState.Rgba.parse s
+    |> Option.map (fun (r, g, b, a) -> Color.FromArgb(int a, int r, int g, int b))
+
+// Convert Color to RRGGBBAA hex string
+let colorToRRGGBBAA (c: Color) : string =
+    SavedTabState.Rgba.format (c.R, c.G, c.B, c.A)
+
+// TabAlign as the settings file knows it, and back. Two cases each way, so
+// that SavedTabState can stay free of System.Drawing and be loadable by a
+// script (see the note at the head of that file).
+let savedAlignOfTabAlign =
+    function TopLeft -> SavedTabState.AlignLeft | TopRight -> SavedTabState.AlignRight
+
+let tabAlignOfSavedAlign =
+    function SavedTabState.AlignLeft -> TopLeft | SavedTabState.AlignRight -> TopRight
+
+// Which group a closed-tab entry belongs to. Both cases carry a window
+// handle and neither can be told from the other by value, which is the whole
+// reason they are separate cases: a saved token is the first window handle of
+// a group as it was written to the settings file, and Windows is free to hand
+// that same number to a live tab strip days later. Matching on the case makes
+// the two impossible to compare by mistake - it had been got wrong twice.
+type GroupRef =
+    // The real handle of a tab strip that exists now.
+    | LiveStrip of IntPtr
+    // A token standing for a saved group, resolved only through seededGroupMap.
+    | SavedToken of IntPtr
+
+// The handle either case carries, for keying and for tracing. Never for
+// deciding which group an entry belongs to - match on the case for that.
+let groupRefHandle = function LiveStrip(h) | SavedToken(h) -> h
+
+// State snapshot of a tab whose window was closed while WindowTabs runs,
+// used to restore the tab (state + group + position) when the same app
+// window (same exe path + window title) reappears.
+type ClosedTabInfo = {
+    exePath: string
+    windowTitle: string
+    renamedTabName: string option
+    isPinned: bool
+    fillColor: Color option
+    underlineColor: Color option
+    borderColor: Color option
+    tabAlign: TabAlign option
+    // The edge the tab was on, in its group. Used by the restore and by
+    // nothing else (1-4-1): unlike the alignment there is no per-window
+    // memory of it, since one window can be on different edges in the
+    // groups of different virtual desktops.
+    tabEdge: TabEdges.Edge
+    groupRef: GroupRef
+    tabIndex: int
+    closedHwnd: IntPtr
+    closedAt: DateTime
+    // True for an entry SEEDED by the startup restore (a saved window whose
+    // application has not started yet), false for a tab the user closed by
+    // hand. Only seeds are written back to the settings file, and only seeds
+    // may be matched by exe path alone: resurrecting a hand-closed tab, or
+    // handing an unrelated window to one, would both be wrong.
+    isRestoreSeed: bool
+    // Kept for saving but never applied while another group contests it.
+    isAmbiguous: bool
+    // Saved rectangle (x, y, width, height) of a seeded window. Kept so the
+    // twin disambiguation and the title-less fallback still have a position
+    // to compare against.
+    savedRect: (int * int * int * int) option
+    savedDesktop: Guid option
+    savedGroupIndex: int option
+    // When this entry began waiting: the startup restore found the window
+    // closed, or the user closed the tab. Entries outlive restarts by being
+    // written back to the settings file, so without a date of their own their
+    // age would reset at every start and one whose window is never opened
+    // again would hold its place for ever.
+    seedSince: DateTime option
+    // Full tab order (hwnds) of the group at close time. Restore placement is
+    // computed RELATIVE to this snapshot (count of current tabs that came
+    // before this one), which keeps surviving tabs in their original relative
+    // position instead of being displaced by absolute-index insertion.
+    orderSnapshot: IntPtr list
+    // Whether the name and colours on this entry are known to belong to
+    // whichever window claims it. False for an entry read back from the
+    // settings file whose application and title are shared with another saved
+    // window: the two cannot be told apart, so neither may wear the other's
+    // name. The state is still CARRIED - it is written back to the file
+    // unchanged, and an entry that is never claimed loses nothing - it is only
+    // held back from being put on a live window (see applicableState).
+    stateIsCertain: bool
+}
+
+// Restore compares application identities across package updates. The cache
+// and saved JSON still retain the original executable paths.
+let sameExePath (a: string) (b: string) = AppPath.sameApp a b
+
+// The same entry without the part of its state that names a particular
+// window. Used when more than one saved entry could have been the right one:
+// the window still rejoins its group at its saved position, but wearing a name
+// or a colour that may belong to its twin would be worse than wearing none.
+//
+// Alignment and pin are NOT dropped, although they were, and dropping them is
+// what made a jumbled group get worse at every restart instead of better.
+// They are not decoration, they are the position: TabStrip.visualZoneOf reads
+// the pair to decide which of the strip's four bands the tab is drawn in, and
+// a saved order can only be honoured inside a band. Keeping the position is
+// the one thing this function already promised to do, so keeping these two is
+// what that promise meant.
+//
+// It costs nothing to keep them, either. An identity that appears in more than
+// one saved group is refused outright (isCrossGroupIdentity), so the entries a
+// claim cannot choose between all belong to ONE group, and each of them
+// carries that group with it. Whichever way round the twins end up, the group
+// gets back exactly the set of (place, alignment, pin) it was saved with -
+// only possibly with two indistinguishable windows exchanged, which is the
+// trade already accepted for the place.
+//
+// Dropping them, by contrast, is not neutral: nothing else ever restores an
+// alignment. The tab falls back on whatever the group it was auto-grouped into
+// happened to be using, that inherited value is written to the global map, the
+// next save records it in place of the real one, and the value the user chose
+// is gone from the settings file for good. That is the difference between the
+// two halves of the state here - a name that is not applied is merely missing
+// for now, an alignment that is not applied is destroyed.
+let withoutIdentityState (info: ClosedTabInfo) =
+    { info with
+        renamedTabName = None
+        fillColor = None
+        underlineColor = None
+        borderColor = None }
+
+// The entry as it may be APPLIED to the window that has claimed it. The entry
+// itself always keeps everything that was saved, so that one which is never
+// claimed is written back to the settings file whole; only what is put on a
+// live window is held back. `claimIsCertain` is what the claim itself could
+// tell (an exact title match against a single candidate), `info.stateIsCertain`
+// what was already known when the entry was created (no other saved window
+// shares its application and title).
+let applicableState (claimIsCertain: bool) (info: ClosedTabInfo) =
+    if claimIsCertain && info.stateIsCertain then info else withoutIdentityState info
+
+// Titles are compared after removing VSCode's unsaved-changes marker
+// ("● "), so a document that closed clean and reopens dirty (or vice
+// versa) still matches.
+let normalizeClosedTabTitle (t: string) = t.Replace("● ", "")
+
+// Where one window is going while the pass that follows a grouping setting's
+// off-to-on edge is being applied.
+//
+// The window is taken out of its group and NOTHING else is done to it. This
+// entry is the answer findGroupForWindow gives when the ordinary pass picks
+// the window up again a moment later, so the whole of addWindowToGroup runs
+// for it - the alignment inherited from the group it joins, the place beside
+// its own application's tabs, a closed tab's saved state - exactly as it does
+// for a window that has just opened. That is what "treated as if it had just
+// opened" has to mean if it is to mean anything: the same code, not the same
+// intention.
+//
+// group is None for a set of windows that has no group to join and has to make
+// one. Whichever of them arrives first makes it and setId points the rest at
+// what it made; there is no other way round, because the removals complete on
+// the groups' own threads and the order they come back in is not ours to
+// choose.
+type PendingRegroup = {
+    group: IGroup option
+    setId: int
+    at: DateTime
+}
+
+type Program() as this =
+    let version = "ss_2026.11.11"
+    let isStandAlone = System.Diagnostics.Debugger.IsAttached
+
+    let Cell = CellScope()
+    let os = OS()
+    let invoker = InvokerService.invoker
+    let ownerThreadId = System.Threading.Thread.CurrentThread.ManagedThreadId
+    let readSnapshot (cell: Cell<'a>) (snapshot: PublishedSnapshot<'a>) =
+        // Keep dependency tracking for owner-thread computations.
+        if System.Threading.Thread.CurrentThread.ManagedThreadId = ownerThreadId then cell.value
+        else snapshot.value
+    let isTabMonitoringSuspendedCell = Cell.create(false)
+    // A tab-monitoring suspension is always meant to be paired with a resume,
+    // but the pairing is not always safe: several call sites hand the resume to
+    // a 200 ms WinForms timer created on the group's own UI thread, and that
+    // timer dies silently if the group (hence the thread) goes away first -
+    // exactly what a detach of the second-to-last tab does. A lost resume used
+    // to be permanent and invisible: for the rest of the session no window was
+    // ever auto-grouped again, so newly opened applications got no tab and a
+    // tab dragged out of a group never became a group of its own. The
+    // suspension is therefore given an expiry, well beyond the longest
+    // legitimate operation (a multi-tab detach waits up to about two seconds).
+    // Stopwatch rather than DateTime: the expiry must not be thrown off by a
+    // clock adjustment (a resume from sleep, a time sync, DST).
+    let monotonic = Diagnostics.Stopwatch.StartNew()
+    let mutable tabMonitoringSuspendedMs = 0L
+    // Overlapping operations each suspend; a delayed resume must only lift the
+    // suspension it belongs to, never one a later operation has since taken.
+    let mutable tabMonitoringSuspendGeneration = 0
+    let mutable workspaceRestorePending = false
+    let tabMonitoringSuspendMaxMs = 10000L
+    let mutable updateTraceCount = 0
+    let mutable shellTraceCount = 0
+    let mutable groupTraceCount = 0
+    let isDisabledCell = Cell.create(false)
+    let isDisabledCellSnapshot = isDisabledCell.createSnapshot()
+    let isRestoringTabGroups = Cell.create(false)
+    let needsRestoreOnStartup = Cell.create(false)
+    // A window pass that was skipped because a group was being moved or
+    // resized, and has to be made up for once the loop ends.
+    let mutable deferredWindowPass = false
+    let llMouseEvent = Event<_>()
+
+    // case 727 outlook calendar items appear behind outlook main window
+    let delayTabExeNames = Set2(List2(["outlook.exe"]))
+
+    let settingsManager = Settings(isStandAlone)
+
+    // One-time migration: legacy dark-mode keys have been replaced by a
+    // single "EnableDarkMode" key. Carry the old "EnableMenuDarkMode" value
+    // forward (so users who had menu dark mode on keep dark mode after the
+    // upgrade) and discard the old "EnableSettingsDialogDarkMode" key
+    // entirely. Old keys are removed from settings.json so they don't sit
+    // around as orphan data.
+    do
+        try
+            let json = settingsManager.settingsJson
+            match json.getBool("EnableDarkMode") with
+            | Some _ -> ()  // already on the new key — no migration needed
+            | None ->
+                match json.getBool("EnableMenuDarkMode") with
+                | Some(v) -> json.setBool("EnableDarkMode", v)
+                | None -> ()
+            // Always purge legacy keys regardless of migration outcome.
+            json.update("EnableMenuDarkMode", None)
+            json.update("EnableSettingsDialogDarkMode", None)
+            settingsManager.settingsJson <- json
+        with _ -> ()
+
+    // Load disabled state from settings
+    do
+        let savedDisabledState =
+            try
+                settingsManager.settingsJsonReadOnly.getBool("IsDisabled").def(false)
+            with
+            | _ -> false
+        isDisabledCell.set(savedDisabledState)
+        // Disabled, no startup restore and no desktop pass will hand the
+        // taskbar recovery list over: it is handled now.
+        if savedDisabledState then TaskbarAppId.recoverNow()
+
+    let keepAliveCell = Cell.create(List2())
+    let keepAlive (obj:obj) =
+        keepAliveCell.map(fun l -> l.append(obj))
+    let lastPing = Cell.create(DateTime.MinValue)
+    let notifiedOfUpgrade = Cell.create(false)
+    let inShutdown = Cell.create(false)
+    let inShutdownSnapshot = inShutdown.createSnapshot()
+    // Windows logoff / restart in progress (WM_QUERYENDSESSION, surfaced as
+    // SystemEvents.SessionEnding). From that moment other applications close
+    // one after another, each HSHELL_WINDOWDESTROYED shrinks the groups, and a
+    // periodic-save tick that fires during the teardown would overwrite
+    // SavedTabGroupsForRestart with the half-emptied state - which is exactly
+    // the state the next boot would then "restore". The last periodic snapshot
+    // is frozen; it is at most ten seconds old and was taken before teardown.
+    let inSessionEnd = Cell.create(false)
+    let isSubscribed = Cell.create(Map2<IntPtr,IDisposable>())
+    let isDroppedAndAwaitingGrouping = Cell.create(Set2())
+    let pendingDragEdges = Cell.create(Map2<IntPtr, TabEdges.Edge>())
+    let pendingDragSnapMargins = Cell.create(Map2<IntPtr, bool>())
+    // The lock of the group a tab was dragged out of, waiting for the group
+    // it lands in to be created (see IProgram.markDetachedLock).
+    let pendingDetachedLocks = Cell.create(Map2<IntPtr, bool>())
+    // Case C: hwnds recently placed into a group via the multi-select
+    // drag-detach path. removeUntabableWindows skips these for a short
+    // grace period so the dragExit off-screen parking doesn't cause the
+    // window to be stripped from the new group before it gets repositioned.
+    let recentlyPlacedHwnds = Cell.create(Map2() : Map2<IntPtr, DateTime>)
+    let recentlyPlacedGraceMs = 2000.0
+    let pendingExplicitLaunches = Cell.create<ExplicitLaunch.Request<ExplicitDestination> list>([])
+    // Retain launch provenance for post-expiry claims and full state replacement.
+    // Only ExplicitLaunch.active grants protection; expired requests are absent.
+    let explicitWindows = Cell.create(Map2<IntPtr, ExplicitLaunch.Request<ExplicitDestination>>())
+    let pendingNewTabInvokers = Cell.create(Map2<IntPtr, IntPtr>())
+    let pendingStandalonePostActions = Cell.create(Map2<IntPtr, IntPtr -> unit>())
+    // Destinations decided by a grouping setting's off-to-on edge, and by
+    // nothing else. Every entry is put here by regroupNow and consumed by the
+    // ordinary window pass; there is no other producer, which is what keeps a
+    // tab the user detached by hand from ever being drawn back in.
+    let pendingRegroups = Cell.create(Map2<IntPtr, PendingRegroup>())
+    // An entry whose window never comes back - it was closed while the removal
+    // was in flight, or it stopped being groupable - is dropped rather than
+    // kept for ever. Long enough that a slow group thread is not mistaken for
+    // a lost window.
+    let pendingRegroupMaxSeconds = 30.0
+    // A regroup asked for while the desktop is busy is held, not thrown away:
+    // isTabMonitoringSuspended is routinely still set for a few hundred
+    // milliseconds after a drag, and a click that produced nothing at all,
+    // with no way to see why, is the worst of the possible answers. Held only
+    // briefly, though - two seconds keeps the movement tied to the click that
+    // asked for it, which is the whole of requirement 5.
+    let regroupRetryMs = 500
+    let regroupRetries = 4
+    // Closed-tab restore: state + position of tabs whose windows were closed
+    // while WindowTabs runs, matched by exe path + window title when the app
+    // window reappears. In-memory only — a WindowTabs restart clears it.
+    let closedTabCache = Cell.create<ClosedTabInfo list>([])
+    let closedTabCacheLimit = 500
+    // When each window was first seen, so a match by exe path alone can be
+    // held back until the window's title has settled.
+    let windowFirstSeen = Cell.create(Map2() : Map2<IntPtr, int64>)
+    // An application shows a transient title for the first moments of its
+    // life: Windows Terminal starts on the shell's own name before the
+    // session's, VSCode on "Welcome" before the workspace. Claiming a saved
+    // entry by exe path alone during that time hands it - and with it a
+    // position in the group - to whichever same-exe window happened to
+    // appear first. After a restart a group of four terminals came back in
+    // the right slots with the wrong window in each. The fallback therefore
+    // waits for the title, unless it is the only candidate and there is
+    // nothing to take from anyone else.
+    let seedFallbackGraceMs = 20000L
+    // How long a saved window that has not reopened keeps its place in its
+    // group. It has to outlast the way applications are actually used - a
+    // machine left over a holiday, a project not opened for a fortnight -
+    // because dropping an entry too early costs the user a group they have
+    // to rebuild by hand, while keeping one too long costs an unseen line in
+    // the settings file. The asymmetry is why this is generous.
+    let seedMaxAgeDays = 30.0
+    // The same for a tab the user closed by hand, which is kept as well so
+    // that closing a tab and opening the window again days later still puts
+    // it back where it was. Shorter, because the two say different things: an
+    // unopened window is "not yet", a closed tab is "not now". Eight days
+    // carries a Sunday's work through to the next Sunday.
+    let closedTabMaxAgeDays = 8.0
+    // How many closed tabs are written out. The cache holds hundreds and the
+    // file is rewritten every ten seconds, so only the newest few go in.
+    let closedTabSaveLimit = 50
+    // The place a window that left its group ALIVE used to hold, as the same
+    // record a closed tab gets: strip, order at that moment, its own index,
+    // and its state. The periodic scan drops a window that it can still see
+    // but can no longer tab - hidden, parked off-screen, its application
+    // switched off - and records nothing, because the window is not closed.
+    // Two things then went wrong. When such a window came back it was grouped
+    // as though it had just opened, anywhere in the strip; and when it was
+    // destroyed instead it was in no group, so nothing was recorded then
+    // either, and the colours and the name in the global maps went with it.
+    // A window found here goes back to its own group at its own place, and a
+    // destroy records from here. Cleared on either.
+    let windowLastGroup = Cell.create(Map2() : Map2<IntPtr, ClosedTabInfo>)
+    // Windows found in the parking spot in no group (ParkedWindow), and when
+    // each was first seen there. One is brought back only after it has stayed
+    // put for the whole grace period. What keeps a drag in progress safe is
+    // not this length: the whole window pass waits while a drag is on
+    // (desktop.isDragging) and while tab monitoring is suspended, which a
+    // detach does for up to tabMonitoringSuspendMaxMs; a window just placed
+    // is excluded by recentlyPlacedHwnds. The grace only lets a park that is
+    // about to be undone by its own code be undone first.
+    let parkedOrphanSince = System.Collections.Generic.Dictionary<IntPtr, int64>()
+    let parkedOrphanGraceMs = 3000L
+    // Windows whose late restore has already had a miss written to the trace:
+    // how many, and the title of the last one. The late pass runs every second
+    // while entries wait, so the same miss would repeat forever; a line is
+    // written only when the title has changed since the last line, and only
+    // the first few per window, because a browser's title changes on every
+    // page.
+    let lateMissLogged = System.Collections.Generic.Dictionary<IntPtr, int * string>()
+    let lateMissLogLimit = 5
+    // One claim per live window, including startup matches. Membership and
+    // title changes do not release it; destruction does. Never persisted.
+    let claimedWindows = Cell.create(Set.empty<IntPtr>)
+    // Live snapshot of (exePath, windowTitle) per grouped hwnd, so the info
+    // is still available when the closed tab is recorded after its window
+    // has already been destroyed
+    let windowInfoCache = Cell.create(Map2() : Map2<IntPtr, string * string>)
+    // Carries a matched ClosedTabInfo from tryClosedTabRestore to the
+    // positioning step at the end of addWindowToGroup
+    let pendingClosedTabRestores = Cell.create(Map2() : Map2<IntPtr, ClosedTabInfo>)
+    // Keep the hidden-target decision across a late claim's queued detachment.
+    let pendingLinkedRestores = Cell.create(Set.empty<IntPtr>)
+    // Seeded closed-tab entries reference their restored group by a sentinel
+    // token (the group's first saved old hwnd), not by the group's strip
+    // hwnd: at restore time the strip window is created asynchronously on
+    // the group thread and reading IGroup.hwnd from the main thread right
+    // after createGroup is unreliable. The token maps to the live group here.
+    let seededGroupMap = Cell.create(Map2() : Map2<IntPtr, IGroup>)
+    // Tab position and snap margin of a saved group, by the same token. A
+    // group whose windows all start late is put together by ordinary
+    // auto-grouping, which knows nothing of what was saved, so without this
+    // the group came back on the default side of its windows and lost the
+    // setting again at the next save.
+    let seededGroupSettings = Cell.create(Map2() : Map2<IntPtr, string option * bool option * bool option>)
+    // The virtual desktop such a group belongs to, as the file names it.
+    let seededGroupDesktops = Cell.create(Map2() : Map2<IntPtr, string>)
+    // Maps a restored window's NEW hwnd to the hwnd it had before closing, so
+    // relative placement can locate already-restored siblings in an order
+    // snapshot taken before they closed
+    // New hwnd -> the old one it was restored from. Not a Cell: a Cell may
+    // only be read from the thread that owns it, so the placement running on a
+    // group thread had to be handed a copy taken when the tab was claimed.
+    // Claiming and placing are seconds apart, and every sibling claimed in
+    // between was missing from that copy - so a tab counted fewer tabs before
+    // it than there were and landed too far left, displacing the one already
+    // in that place. A concurrent dictionary can be read where it is needed,
+    // as it stands at that moment.
+    let restoredFromMap = System.Collections.Concurrent.ConcurrentDictionary<IntPtr, IntPtr>()
+    // Temporary storage for tab group configuration (used during disable/enable)
+    // Keep each group's own tab state as well as its home and settings.
+    let savedTabGroups = Cell.create<List2<SavedTabState.SavedTab list * string * bool * bool * Guid option>>(List2())
+    let windowNameOverride = Cell.create(Map2())
+    let windowNameOverrideSnapshot = windowNameOverride.createSnapshot()
+    // Global per-HWND storage for fill color, underline color and pinned state (persists across group transfers)
+    let windowFillColor = Cell.create(Map2() : Map2<IntPtr, Color>)
+    let windowFillColorSnapshot = windowFillColor.createSnapshot()
+    let windowUnderlineColor = Cell.create(Map2() : Map2<IntPtr, Color>)
+    let windowUnderlineColorSnapshot = windowUnderlineColor.createSnapshot()
+    let windowBorderColor = Cell.create(Map2() : Map2<IntPtr, Color>)
+    let windowBorderColorSnapshot = windowBorderColor.createSnapshot()
+    let windowPinned = Cell.create(Set2<IntPtr>())
+    let windowPinnedSnapshot = windowPinned.createSnapshot()
+    let windowAlignment = Cell.create(Map2() : Map2<IntPtr, TabAlign>)
+    let windowAlignmentSnapshot = windowAlignment.createSnapshot()
+    let windowEdges = Cell.create(Map2() : Map2<IntPtr, TabEdges.Edge>)
+    let windowEdgesSnapshot = windowEdges.createSnapshot()
+    // The source edge of a stored alignment can differ from the current edge
+    // during an arrival, so it is separate from windowEdges.
+    let windowAlignmentEdges = System.Collections.Concurrent.ConcurrentDictionary<IntPtr, TabEdges.Edge>()
+    // Tab groups per virtual desktop (Shared/VirtualDesktopGroups.fs, and the
+    // "Virtual desktops" section below). What the passes have gathered about
+    // which windows are shown on all desktops; a plan for new groups waiting
+    // for a second pass to agree with it; the last desktop that could be
+    // trusted to be the one looked at; and the pass's scheduling.
+    let mutable desktopEvidence : Map<IntPtr, VirtualDesktopGroups.Evidence> = Map.empty
+    let mutable pendingDesktopVisits : VirtualDesktopGroups.Visit list = []
+    let mutable desktopTransferPending = false
+    let mutable previousDesktop : Guid option = None
+    let mutable desktopPassPending = false
+    let mutable lastDesktopTrace = ""
+    let desktopPassTimer = new System.Windows.Forms.Timer(Interval = 1000)
+    let mutable cloakHook : IDisposable option = None
+#if DEBUG
+    let mutable lastStripNoticeTick : uint32 option = None
+#endif
+    let mutable observedStripDesktop : Guid option = None
+    let pendingDesktopWindows = System.Collections.Generic.HashSet<IntPtr>()
+    let waitingDesktopWindows = VirtualDesktopReader.WaitingWindows()
+    let firstTabWaiters = VirtualDesktopReader.FirstTabWaiters()
+    let mutable lastDesktopGeneration = 0L
+    // OS caches and the thread-static COM manager belong to this reader only.
+    let readerOS = lazy(OS())
+    let mutable readerDesktop : Guid option = None
+    let readDesktops (request: VirtualDesktopReader.Request) : VirtualDesktopReader.Reading =
+#if DEBUG
+        // Simulate a reader that never publishes, without blocking the UI thread.
+        if Environment.GetEnvironmentVariable("WINDOWTABS_DEBUG_VD_NO_READING") = "1" then
+            failwith "Injected desktop reading failure"
+#endif
+        let supported = VirtualDesktopHelper.IsSupported
+        let listed =
+            match VirtualDesktopHelper.TryReadDesktopIds() with
+            | null -> None
+            | ids -> Some(List.ofArray ids)
+        let registry () =
+            let mutable id = Guid.Empty
+#if DEBUG
+            if Environment.GetEnvironmentVariable("WINDOWTABS_DEBUG_VD_NO_CURRENT") = "1" then None else
+#endif
+            if VirtualDesktopHelper.TryReadCurrentDesktopId(&id) then Some id else None
+        let before = registry()
+        if readerDesktop.IsSome && before <> readerDesktop then VirtualDesktopGroups.Live.invalidate()
+        readerDesktop <- before
+        let readAt = DateTime.UtcNow
+        let samples = request.windows |> List.map (fun hwnd ->
+            let window = readerOS.Value.windowFromHwnd(hwnd)
+            // Preserve the plain on-current answer for callers that previously
+            // used it, while deriving Presence from the same single COM call.
+            let onCurrent = try window.onCurrentVirtualDesktopOrNone with _ -> None
+            let cloak = try window.cloakedValue with _ -> None
+#if DEBUG
+            let unknown =
+                let exe = Environment.GetEnvironmentVariable("WINDOWTABS_DEBUG_VD_UNKNOWN_EXE")
+                not (String.IsNullOrWhiteSpace exe) &&
+                (try String.Equals(window.pid.exeName, exe, StringComparison.OrdinalIgnoreCase) with _ -> false)
+            let onCurrent = if unknown then None else onCurrent
+            let cloak = if unknown then None else cloak
+#endif
+            let presence = VirtualDesktopGroups.presence onCurrent cloak
+            let hr, id = try window.virtualDesktopIdWithHr with _ -> (-2, Guid.Empty)
+            let reading: VirtualDesktopGroups.WindowRead =
+                { hwnd = hwnd; presence = presence
+                  desktop = if hr = 0 && id <> Guid.Empty then Some id else None }
+            reading, (hr, id), onCurrent, cloak)
+        let after = registry()
+        if before <> after then VirtualDesktopGroups.Live.invalidate()
+        readerDesktop <- after
+        { request = request; readAt = readAt; supported = supported
+          listed = listed; registryBefore = before; registryAfter = after
+          reads = samples |> List.map (fun (r, _, _, _) -> r.hwnd, r) |> Map.ofList
+          desktopResults = samples |> List.map (fun (r, result, _, _) -> r.hwnd, result) |> Map.ofList
+          cloak = samples |> List.map (fun (r, _, _, cloak) -> r.hwnd, cloak) |> Map.ofList
+          onCurrent = samples |> List.map (fun (r, _, onCurrent, _) -> r.hwnd, onCurrent) |> Map.ofList }
+    let desktopReader = new VirtualDesktopReader.Reader<_, _>(readDesktops,
+        (fun () -> invoker.asyncInvoke(fun () -> this.applyDesktopReading())),
+        (fun () ->
+            VirtualDesktopHelper.ReleaseCurrentThread()
+            ShutdownTrace.write "desktop reader cleanup complete"))
+    let desktopReaderOwnerThread = System.Threading.Thread.CurrentThread.ManagedThreadId
+    do Application.ApplicationExit.Add(fun _ ->
+        if System.Threading.Thread.CurrentThread.ManagedThreadId = desktopReaderOwnerThread then
+            desktopReader.Stop())
+
+    let shutdownTimer = new System.Windows.Forms.Timer(Interval = 50)
+    let mutable shutdownCleanupStarted = false
+    let mutable shutdownRequested = false
+    let notifyNewVersionEvt = Event<_>()
+    let launcher = Launcher()
+    // Trailing debounce for updateAppWindows: apps such as LibreOffice fire shell events
+    // (HSHELL_WINDOWACTIVATED / HSHELL_WINDOWCREATED etc.) in rapid bursts and each one would
+    // otherwise trigger a full window-scan. Coalesce the bursts into a single update.
+    let mutable pendingUpdateAppWindowsToken : IDisposable option = None
+    let updateAppWindowsDebounceMs = 50
+
+    // Periodic tab-group state save. Without this, a force-quit (Task Manager kill,
+    // crash, power loss) loses everything since the last clean shutdown. Fires on the
+    // UI thread; the dirty check in Settings.fs skips the ~7 ms disk write when nothing
+    // changed, so the steady-state cost is one JArray build and a string compare.
+    let periodicSaveTimer = new System.Windows.Forms.Timer(Interval = 10000)
+    // Title polling for the closed-tab late restore. A title change alone fires
+    // no shell event, so without this the restore could wait for the next event.
+    // Cheap: GetWindowText on another process's window is a cached read (no
+    // message is sent), and only grouped windows are scanned.
+    let titleSyncTimer = new System.Windows.Forms.Timer(Interval = 1000)
+   
+    let isFirstRun = settingsManager.fileExists.not
+
+    let originalVersion = 
+        let original = settingsManager.settings.version
+        settingsManager.update <| fun s -> { s with version = version }
+        original 
+
+    // A path that carries a version - a Store application's package folder,
+    // or a plain directory named after the version - files the application
+    // under a new name on every update and leaves the old entries behind.
+    // Settings written before AppPath existed can hold a dozen generations of
+    // one application, spread over several categories, and the Programs tab
+    // would show a row for each. Collapse them once, at startup.
+    //
+    // The survivor is the entry still on disk - the version currently
+    // installed - and failing that the last one written, which is the most
+    // recent choice the user made. Lists with nothing to collapse are left
+    // untouched, so this writes nothing on a settings file that is already
+    // clean.
+    // Which executables keep each version in a directory of its own. Read
+    // before anything compares or rewrites a stored path, the collapse below
+    // included.
+    let loadAppPathSettings = AppPathSettings.load()
+
+    let collapseStorePathGenerations =
+        try
+            let settingsJson = settingsManager.settingsJson
+            let categoryKeys = [ for i in 1..10 -> sprintf "Category%dPaths" i ]
+            let keys = [ "IncludedPaths"; "ExcludedPaths"; "AutoGroupingPaths" ] @ categoryKeys
+            let stored = keys |> List.map (fun k -> (settingsJson.getStringArray k).def(List2()).list)
+            let canonical = stored |> List.map AppPath.canonicalise
+
+            // An application belongs to one category. Settings made before
+            // this module existed could put each generation of one
+            // application in a different category, and collapsing the
+            // generations leaves it in several at once. The lowest number
+            // wins, which is the one getCategoryForProcess would have acted
+            // on anyway, so nothing changes behaviour - the file and the
+            // dialog just stop disagreeing with it.
+            // HashSet.Add is false for something already claimed, and the
+            // category lists are walked in order, so the lowest number keeps
+            // the application and the rest let it go.
+            let claimed = Collections.Generic.HashSet<string>()
+            let ownedByLowerCategory =
+                List.zip keys canonical
+                |> List.map (fun (key, paths) ->
+                    if List.contains key categoryKeys
+                    then paths |> List.filter claimed.Add
+                    else paths)
+
+            let mutable changed = false
+            for (key, before, after) in List.zip3 keys stored ownedByLowerCategory do
+                if before <> after then
+                    settingsJson.setStringArray(key, List2(after))
+                    changed <- true
+            if changed then settingsManager.settingsJson <- settingsJson
+        with _ -> ()
+
+    let registerShellHooks =
+        os.registerShellHooks <| fun (hwnd, shellEvent) ->
+            PerfTrace.count (sprintf "shell.%O" shellEvent)
+            match shellEvent with
+            | ShellEvent.HSHELL_WINDOWCREATED ->
+                if shellTraceCount < 60 then
+                    shellTraceCount <- shellTraceCount + 1
+                    DragTrace.log (fun () -> sprintf "shell: WINDOWCREATED hwnd=%X" (hwnd.ToInt64()))
+                this.receive(ShellEvent(hwnd, shellEvent))
+            | ShellEvent.HSHELL_WINDOWDESTROYED -> this.receive(ShellEvent(hwnd, shellEvent))
+            | ShellEvent.HSHELL_WINDOWACTIVATED
+            | ShellEvent.HSHELL_RUDEAPPACTIVATED -> this.receive(ShellEvent(hwnd, shellEvent))
+            | _ -> ()
+
+
+    // What a hot key field falls back to when the settings file has no entry
+    // for it. nextTab / prevTab keep the values they have always shipped with
+    // (Ctrl+Alt+Right / Ctrl+Alt+Left, as packed hot key control codes);
+    // every key the Shortcut Keys tab added starts out as None.
+    let hotKeyDefaults = Map2(List2([
+        (HotKeyPolicy.prevTabKey, 3621)
+        (HotKeyPolicy.nextTabKey, 3623)
+        ]))
+        
+    let hotKeyManager = HotKeyManager()
+    // The bindings RegisterHotKey holds for this process right now: the ones
+    // that were wanted AND accepted. A refused one is not here, so the next
+    // sync asks for it again. Only syncHotKeys writes this.
+    let mutable heldHotKeys : HotKeyPolicy.Binding list = []
+    // Retry of refused registrations while the same window stays in front.
+    // See the hot keys section (scheduleHotKeyRetry).
+    let hotKeyRetryTimer = new System.Windows.Forms.Timer(Interval = 1000)
+    // Once a second: the window pass a move/size loop put off, and the perf
+    // line of a Debug build (see Shared/PerfTrace.fs).
+    let catchUpTimer = new System.Windows.Forms.Timer(Interval = 1000)
+    let hotKeyRetryLimit = 10
+    let mutable hotKeyRetriesLeft = hotKeyRetryLimit
+    let startupExe = System.Reflection.Assembly.GetEntryAssembly().Location
+    let mutable updatingStartup = false
+    // The fields dropped as duplicates at the last sync, so the Debug line
+    // is written once per change rather than once per sync.
+    let mutable reportedDuplicateHotKeys : HotKeyPolicy.Binding list = []
+    // Keeps the foreground hook alive for the life of the program.
+    let mutable foregroundHotKeyHook : IDisposable option = None
+
+    do
+#if DEBUG
+        InputStallTrace.start version
+#endif
+        Desktop(this :> IDesktopNotification).ignore
+        // The hot keys follow the foreground from here on; see the hot keys
+        // section. EVENT_SYSTEM_FOREGROUND is the primary signal - it fires
+        // for the desktop and for tool windows too, which the shell hook's
+        // HSHELL_WINDOWACTIVATED does not - and every window pass resyncs as
+        // well (updateAppWindows). A setting changed in the dialog resyncs at
+        // once; the dialog is in front then, so the effect is that the new
+        // set is held the moment a tabbed window is back in front - the
+        // dialog need not be closed.
+        hotKeyRetryTimer.Tick.Add <| fun _ -> this.retryHotKeys()
+        catchUpTimer.Tick.Add <| fun _ ->
+            // Groups and tabs describe the state a leak would show up in: both
+            // should come back down when windows close.
+            PerfTrace.flush version
+            // A pass put off during a move/size loop is made up for here, as
+            // soon as no group is in one.
+            this.catchUpDeferredWindowPass()
+        catchUpTimer.Start()
+        WinEventHooks.setEnabled (not isDisabledCell.value)
+        foregroundHotKeyHook <- Some(
+            os.setSingleWinEvent WinEvent.EVENT_SYSTEM_FOREGROUND (fun _ -> this.onForegroundChanged()))
+        Services.settings.notifyValue HotKeyPolicy.enableCtrlNumberSetting (fun _ -> this.syncHotKeys())
+        Services.settings.notifyValue HotKeyPolicy.enableAltNumberSetting (fun _ -> this.syncHotKeys())
+        this.syncHotKeys()
+        Services.settings.setValue("runAtStartup", box (StartupRegistration.isEnabled startupExe))
+        Services.settings.notifyValue "runAtStartup" this.updateRunAtStartup
+        Services.desktop.groupExited.Add <| fun _ -> invoker.asyncInvoke(fun() -> this.updateAppWindows())
+        Services.desktop.groupRemoved.Add <| fun _ -> invoker.asyncInvoke(fun() -> this.updateAppWindows())
+        // Start the periodic state-save timer. First tick fires 10s after Start(),
+        // by which time the desktop and groups are fully initialized.
+        periodicSaveTimer.Tick.Add <| fun _ ->
+            try
+                if inShutdown.value.not && inSessionEnd.value.not then
+                    this.saveTabGroupsToSettings()
+            with _ -> ()
+        periodicSaveTimer.Start()
+        // See inSessionEnd. On the shutdown / logoff notification the saved
+        // tab groups are FROZEN, not saved: the periodic snapshot is at most
+        // 10 s old and was taken in normal operation, which makes it safe by
+        // construction - while a save taken here could capture a teardown
+        // already in progress (an application that dismantles itself the
+        // moment it is queried, or a forced shutdown that skips the query
+        // phase). Losing the last few seconds of changes is the accepted
+        // price. WindowTabs' own exit (tray menu) still saves normally.
+        Microsoft.Win32.SystemEvents.SessionEnding.Add <| fun _ ->
+            try
+                if inSessionEnd.value.not then
+                    inSessionEnd.set(true)
+                    desktopReader.Stop()
+                    desktopPassTimer.Stop()
+                    periodicSaveTimer.Stop()
+            with _ -> ()
+        titleSyncTimer.Tick.Add <| fun _ ->
+            try
+                if inShutdown.value.not then
+                    if isDisabledCell.value then
+                        TaskbarAppId.observeDisabled(fun () -> os.windowsInZorder.list |> List.map (fun w -> w.hwnd))
+                    else this.syncWindowTitles()
+            with _ -> ()
+        titleSyncTimer.Start()
+        // Virtual desktops: a look once a second, and one as soon as the shell
+        // starts cloaking and uncloaking windows - which is what a switch of
+        // desktops is, seen from outside.
+        desktopPassTimer.Tick.Add <| fun _ -> this.desktopPass()
+        desktopPassTimer.Start()
+        cloakHook <- Some(
+            os.setWinEventHook(WinEvent.EVENT_OBJECT_CLOAKED, WinEvent.EVENT_OBJECT_UNCLOAKED,
+                               (fun _ evt hwnd _ _ _ eventTick ->
+#if DEBUG
+                                   let grouped = this.desktop.groups.list |> List.exists (fun g -> g.windows.contains((=) hwnd))
+                                   let strip = TopEdgeGuardPlacement.isRegisteredStrip hwnd
+                                   if grouped then VirtualDesktopTrace.noticeSwitch()
+                                   if VirtualDesktopTracePolicy.keepCloak grouped strip (VirtualDesktopTrace.inSwitchWindow()) then
+                                       VirtualDesktopTrace.handover (fun () ->
+                                           let window = os.windowFromHwnd(hwnd)
+                                           sprintf "cloak-event hwnd=%X event=%A eventTick=%u owner=%X cloak=%A visible=%b"
+                                               (hwnd.ToInt64()) evt eventTick (window.parent.hwnd.ToInt64())
+                                               window.cloakedValue window.isVisible)
+#endif
+#if DEBUG
+                                   if TopEdgeGuardPlacement.isRegisteredStrip hwnd then
+                                       VirtualDesktopTrace.handover (fun () ->
+                                           let window = os.windowFromHwnd(hwnd)
+                                           sprintf "strip-native-event strip=%X event=%A eventTick=%u owner=%X cloak=%A noticeTick=%A"
+                                               (hwnd.ToInt64()) evt eventTick (window.parent.hwnd.ToInt64()) window.cloakedValue lastStripNoticeTick)
+#endif
+                                   let invalidate () =
+                                       if this.desktop.groups.list |> List.exists (fun g -> g.windows.contains((=) hwnd)) then
+                                           VirtualDesktopGroups.Live.invalidate()
+                                           pendingDesktopVisits <- []
+                                           // Presentation needs only native visibility and cached desktop
+                                           // identities. Do not wait for the COM reader or pin evidence.
+#if DEBUG
+                                           this.refreshDesktopStrips(Some(uint32 eventTick))
+#else
+                                           this.refreshDesktopStrips(None)
+#endif
+                                           this.scheduleDesktopPass(15)
+#if DEBUG
+                                   // Test hook: act on the shell's cloaking late, so
+                                   // that the last desktop reading is still taken as
+                                   // fresh while the windows of the desktop being left
+                                   // are already cloaked. A desktop switch then meets
+                                   // that state every time instead of once in a while.
+                                   match Int32.TryParse(Environment.GetEnvironmentVariable("WINDOWTABS_DEBUG_CLOAK_INVALIDATE_DELAY_MS")) with
+                                   | true, ms when ms > 0 ->
+                                       System.Threading.Tasks.Task.Delay(ms).ContinueWith(fun (_: System.Threading.Tasks.Task) ->
+                                           invoker.asyncInvoke invalidate) |> ignore
+                                   | _ -> invalidate()
+#else
+                                   invalidate()
+#endif
+                                   ), 0, 0))
+#if DEBUG
+        let traceDisabled = isDisabledCell.value
+        WinEventPump.post(fun () -> PerfTrace.winEventHookInventory "startup" traceDisabled)
+#endif
+
+    member this.desktop : IDesktop = Services.desktop
+    member this.isTabMonitoringSuspended
+        with get() = isTabMonitoringSuspendedCell.value
+        and set(value) =
+            if value then
+                tabMonitoringSuspendGeneration <- tabMonitoringSuspendGeneration + 1
+                tabMonitoringSuspendedMs <- monotonic.ElapsedMilliseconds
+            if value || not workspaceRestorePending then
+                isTabMonitoringSuspendedCell.set(value)
+
+    // Backstop for a suspension whose resume was lost. Run from the main
+    // thread's window pass rather than from the property getter: a read must
+    // not change state, or the moment auto-grouping comes back would depend on
+    // who happened to read the flag.
+    member private this.expireStaleTabMonitoringSuspension() =
+        if not workspaceRestorePending && isTabMonitoringSuspendedCell.value &&
+           monotonic.ElapsedMilliseconds - tabMonitoringSuspendedMs > tabMonitoringSuspendMaxMs then
+            DragTrace.log (fun () -> "tabMonitoring: suspension expired, auto-resuming")
+            isTabMonitoringSuspendedCell.set(false)
+
+    member this.updateRunAtStartup(value)=
+        if not updatingStartup then
+            updatingStartup <- true
+            try
+                let enabled = value.cast<bool>()
+                let actual, failed =
+                    StartupRegistration.changeAndRead enabled
+                        (fun () -> StartupRegistration.change startupExe enabled)
+                        (fun () -> StartupRegistration.isEnabled startupExe)
+                Services.settings.setValue("runAtStartup", box actual)
+                // The synchronous settings caller owns the dialog and reports once.
+                if failed then raise StartupRegistration.ChangeFailed
+            finally updatingStartup <- false
+
+    member this.isAppWindow(window:Window) =
+        Services.filter.isAppWindow(window.hwnd)
+
+    member this.isTabbableWindow(window:Window) = 
+        Services.filter.isTabbableWindow(window.hwnd)
+
+    member this.isAppWindowStyle(window:Window) =
+        Services.filter.isAppWindowStyle(window.hwnd)
+
+    member this.tryDropped(window:Window) =
+        if isDroppedAndAwaitingGrouping.value.contains(window.hwnd) then Some(None) else None
+
+    member private this.suppressExplicitRestore(hwnd: IntPtr, windowTitle: string) =
+        let suppressed, remaining =
+            ExplicitLaunch.suppress DateTime.Now (explicitWindows.value.tryFind(hwnd))
+                (normalizeClosedTabTitle windowTitle)
+                (fun (e: ClosedTabInfo) -> e.exePath, e.windowTitle, e.closedAt)
+                closedTabCache.value
+        if remaining.Length <> closedTabCache.value.Length then
+            RestoreTrace.log (fun () ->
+                sprintf "discard(explicit) hwnd=%X count=%d"
+                    (hwnd.ToInt64()) (closedTabCache.value.Length - remaining.Length))
+        closedTabCache.set(remaining)
+        suppressed
+
+    member this.tryExplicitLaunch(window: Window) =
+        let request, remaining =
+            ExplicitLaunch.take DateTime.Now window.pid.processPath window.hwnd pendingExplicitLaunches.value
+        pendingExplicitLaunches.set(remaining)
+        match request with
+        | None -> None
+        | Some(r) ->
+            explicitWindows.map(fun m -> m.add window.hwnd r)
+            this.suppressExplicitRestore(window.hwnd, window.text) |> ignore
+            match r.destination with
+            | JoinGroup(groupHwnd, invokerHwnd) ->
+                // An explicitly chosen destination may be hidden on another desktop.
+                // Automatic grouping still uses only groups drawn here.
+                let targets = if VirtualDesktopGroups.keepAway then this.desktop.groups.list else this.joinableGroups
+                match targets |> List.tryFind (fun g -> g.hwnd = groupHwnd) with
+                | Some(g) ->
+                    let anchor = if g.windows.contains((=) invokerHwnd) then invokerHwnd else IntPtr.Zero
+                    pendingNewTabInvokers.map(fun m -> m.add window.hwnd anchor)
+                    Some(Some(g))
+                // A vanished destination cannot hand control back to restore.
+                | None -> Some(None)
+            | FreshGroup(postAction) ->
+                pendingStandalonePostActions.map(fun m -> m.add window.hwnd postAction)
+                Some(None)
+
+    member private this.startExplicitWindow(processPath: string, destination: ExplicitDestination) =
+        let request: ExplicitLaunch.Request<ExplicitDestination> = {
+            id = Guid.NewGuid()
+            exePath = processPath
+            startedAt = DateTime.Now
+            existing = os.windowsInZorder.list |> List.map (fun w -> w.hwnd) |> Set.ofList
+            destination = destination
+        }
+        pendingExplicitLaunches.map(fun pending -> pending @ [request])
+        try
+            let psi = ProcessStartInfo()
+            psi.UseShellExecute <- true
+            psi.FileName <- LaunchPath.resolve processPath |> Option.defaultValue processPath
+            Process.Start(psi) |> ignore
+        with _ ->
+            pendingExplicitLaunches.map(List.filter (fun r -> r.id <> request.id))
+            reraise()
+
+    // Get the category number (1-10) for a given process path, or 0 if no category is set
+    member private this.getCategoryForProcess(procPath: string) =
+        (this :> IProgram).getCategoryNumber(procPath)
+
+    // getCategoryEnabled reparses the settings file on every call, and asking
+    // for a category means asking it up to ten times, so a pass that looks at
+    // every window on screen has to ask once per application rather than once
+    // per window. One lookup per pass; nothing is cached across passes, so a
+    // category ticked while the dialog is open is seen immediately.
+    member private this.categoryLookup() =
+        let cache = Dictionary<string, int>()
+        fun (procPath: string) ->
+            if procPath = "" then 0 else
+            match cache.TryGetValue(procPath) with
+            | true, category -> category
+            | _ ->
+                let category = this.getCategoryForProcess(procPath)
+                cache.[procPath] <- category
+                category
+
+    // Every group on screen, described in the plain values Regroup.chooseGroup
+    // reasons about. The group itself is the id, so the answer that comes back
+    // is the group to join. On screen means drawn on the desktop being looked
+    // at (joinableGroups).
+    member private this.groupViews(categoryOf: string -> int) =
+        let hwndZorders = this.hwndZorders()
+        this.joinableGroups |> List.map (fun g ->
+            let procPaths =
+                g.windows.list |> List.map (fun hwnd ->
+                    try os.windowFromHwnd(hwnd).pid.processPath with _ -> "")
+            { Regroup.GroupView.id = g
+              Regroup.GroupView.procPaths = procPaths
+              Regroup.GroupView.categories = procPaths |> List.map categoryOf
+              Regroup.GroupView.count = g.windows.count
+              Regroup.GroupView.rank =
+                g.windows.list
+                |> List.fold (fun best hwnd -> min best (hwndZorders.tryFind(hwnd).def(Int32.MaxValue))) Int32.MaxValue })
+
+    // The rule that greets a newly opened window. Its body now lives in
+    // Regroup.chooseGroup, which the setting-change pass calls as well, so
+    // there is exactly one copy of it: "the same rule as a new window" is held
+    // by the call, not by two pieces of code being kept in step by hand.
+    member this.tryAutoGroup(window:Window) =
+        let procPath = window.pid.processPath
+        if (this :> IProgram).getAutoGroupingEnabled(procPath) then
+            let categoryOf = this.categoryLookup()
+            let views = this.groupViews(categoryOf)
+            Some(Regroup.chooseGroup (this.cast<IProgram>().tabLimit) procPath (categoryOf procPath) views)
+        else None
+
+    // The destination a setting change decided for this window, if it is one
+    // of the windows that change is moving. Answering Some(None) means "make a
+    // group": that window is the first of a set that has nowhere to go, and
+    // completeRegroup below points the rest of the set at what it makes.
+    member this.tryRegroup(window:Window) =
+        match pendingRegroups.value.tryFind(window.hwnd) with
+        | Some(pending) when (DateTime.Now - pending.at).TotalSeconds >= pendingRegroupMaxSeconds ->
+            pendingRegroups.map(fun m -> m.remove window.hwnd)
+            None
+        | Some(pending) ->
+            match pending.group with
+            | Some(group) when this.joinableGroups |> List.exists (fun g -> obj.ReferenceEquals(g, group)) ->
+                Some(Some(group))
+            | Some(_) ->
+                // The destination went away between the decision and the
+                // arrival. Fall through to the ordinary rule rather than
+                // inventing an answer.
+                pendingRegroups.map(fun m -> m.remove window.hwnd)
+                None
+            | None -> Some(None)
+        | None -> None
+
+    // Called from addWindowToGroup once the window is in a group, to retire its
+    // entry and - for a set that had to make a group - to tell the rest of the
+    // set which group that turned out to be.
+    member private this.completeRegroup(hwnd: IntPtr, group: IGroup, isNewGroup: bool) =
+        match pendingRegroups.value.tryFind(hwnd) with
+        | Some(pending) ->
+            pendingRegroups.map(fun m -> m.remove hwnd)
+            // Only a group made for this window speaks for the set. If some
+            // other handler claimed the window first - the user dropped it
+            // somewhere while the removal was still in flight - that is a
+            // decision about that one window, and the rest of the set should
+            // not be dragged along behind it. They are left unbound, so the
+            // next of them to arrive makes their group instead.
+            if pending.group.IsNone && isNewGroup then
+                pendingRegroups.map(fun m ->
+                    Map2(m.items.map(fun (h, p) ->
+                        h, (if p.group.IsNone && p.setId = pending.setId then { p with group = Some(group) } else p))))
+        | None -> ()
+
+    // Record a closed window's tab state + position so the tab can be
+    // restored if the same app window (same exe path + window title)
+    // reappears while WindowTabs is still running. Called just before the
+    // window is removed from its group; the window itself is already
+    // destroyed, so the identity comes from the windowInfoCache snapshot.
+    member this.recordClosedTab(hwnd: IntPtr, group: IGroup) =
+        try
+            let groupHwnd = (try group.hwnd with _ -> IntPtr.Zero)
+            // Use the strip's real on-screen order; the visualOrder mirror
+            // goes stale after pin/unpin normalization.
+            let order = group.visualOrderThreadSafe
+            let ownIndex =
+                order.tryFindIndex((=) hwnd)
+                |> Option.orElseWith (fun() -> group.visualOrder.tryFindIndex((=) hwnd))
+                |> Option.defaultValue -1
+            this.recordClosedTabIn(hwnd, groupHwnd, order.list, ownIndex)
+        with ex ->
+            RestoreTrace.log (fun () -> sprintf "record hwnd=%X FAILED %s" (hwnd.ToInt64()) ex.Message)
+
+    // The same for a window that had already left its group alive (see
+    // windowLastGroup): the place it held is the one remembered then.
+    member private this.recordClosedTabFromLastGroup(hwnd: IntPtr) =
+        match windowLastGroup.value.tryFind(hwnd) with
+        | Some(info) ->
+            let strip = match info.groupRef with LiveStrip(s) -> s | SavedToken(t) -> t
+            try this.recordClosedTabIn(hwnd, strip, info.orderSnapshot, info.tabIndex)
+            with ex -> RestoreTrace.log (fun () -> sprintf "record hwnd=%X FAILED %s" (hwnd.ToInt64()) ex.Message)
+        | None ->
+            match windowInfoCache.value.tryFind(hwnd) with
+            | Some((exePath, windowTitle)) ->
+                RestoreTrace.log (fun () -> sprintf "destroy hwnd=%X NOT RECORDED (in no group, none remembered) underline=%b fill=%b border=%b pin=%b name=%b exe=%s title=%s"
+                                                    (hwnd.ToInt64())
+                                                    (windowUnderlineColor.value.tryFind(hwnd).IsSome)
+                                                    (windowFillColor.value.tryFind(hwnd).IsSome)
+                                                    (windowBorderColor.value.tryFind(hwnd).IsSome)
+                                                    (windowPinned.value.contains(hwnd))
+                                                    (windowNameOverride.value.tryFind(hwnd).IsSome)
+                                                    exePath windowTitle)
+            | None -> ()
+
+    member private this.hasLiveIdentityTwin(hwnd: IntPtr, exePath: string, title: string) =
+        let live =
+            this.desktop.groups.list |> List.collect (fun g -> g.windows.list) |> List.distinct
+            |> List.choose (fun h ->
+                let w = os.windowFromHwnd(h)
+                if h = hwnd || not w.isWindow then None
+                else
+                    try Some(h, (w.pid.processPath, normalizeClosedTabTitle w.text))
+                    with _ -> None)
+        not (ClosedTabClaim.canRecord hwnd (exePath, normalizeClosedTabTitle title) live)
+
+    member private this.recordClosedTabIn(hwnd: IntPtr, groupHwnd: IntPtr, order: IntPtr list, ownIndex: int) =
+            // The two removal paths (HSHELL_WINDOWDESTROYED and the periodic
+            // scan) can both see the window still in its group because removal
+            // is async — record each closed hwnd only once.
+            let twin = closedTabCache.value |> List.tryFind (fun e -> e.closedHwnd = hwnd)
+            if twin.IsSome then
+                // The second of the two paths, moments after the first, is the
+                // normal case and not worth a line. An entry from earlier is:
+                // Windows hands handles out again, and an old entry under this
+                // one would be blocking the record of a different window.
+                let age = DateTime.Now - twin.Value.closedAt
+                if age.TotalSeconds > 5.0 then
+                    RestoreTrace.log (fun () -> sprintf "record hwnd=%X SKIPPED (an entry with this handle from %.0f min ago is already in the cache: %s)"
+                                                        (hwnd.ToInt64()) age.TotalMinutes twin.Value.windowTitle)
+            else
+            match windowInfoCache.value.tryFind(hwnd) with
+            | Some((exePath, windowTitle)) when exePath <> "" && windowTitle <> "" ->
+                if this.hasLiveIdentityTwin(hwnd, exePath, windowTitle) then
+                    RestoreTrace.log (fun () -> "closed claim: skipped-duplicate")
+                else
+                let now = DateTime.Now
+                // When several tabs of one group close in a burst (an app
+                // quitting all its windows), the list shrinks unpredictably
+                // between the closes (removal is async). Anchor every burst
+                // member to the order snapshot taken at the FIRST close of the
+                // burst — the tab's index there is its true pre-close position,
+                // and all burst entries then share one consistent snapshot for
+                // relative placement at restore time.
+                let burstAnchor =
+                    closedTabCache.value
+                    |> List.filter (fun e ->
+                        // A burst is made of tabs closed just now, all of
+                        // them holding their strip's real handle.
+                        (match e.groupRef with
+                         | LiveStrip(h) -> h = groupHwnd
+                         | SavedToken(_) -> false) &&
+                        (now - e.closedAt).TotalSeconds < 5.0 &&
+                        not (List.isEmpty e.orderSnapshot))
+                    |> List.tryLast
+                let orderSnapshot, tabIndex =
+                    let fallback() = order, ownIndex
+                    match burstAnchor with
+                    | Some(anchor) ->
+                        match anchor.orderSnapshot |> List.tryFindIndex ((=) hwnd) with
+                        | Some(i) -> anchor.orderSnapshot, i
+                        | None -> fallback()
+                    | None -> fallback()
+                // The pin of the tab in the group it closed in. A window shown
+                // on all desktops can be pinned in one desktop's group and not
+                // in another's; the global map holds whichever group was last
+                // in front. The side is still taken from the global map: a
+                // strip gives every tab a side, so only the map can tell "this
+                // tab's own side" from "whatever side the group is on".
+                let owningGroup =
+                    this.desktop.groups.tryFind(fun g -> (try g.hwnd = groupHwnd with _ -> false))
+                let info = {
+                    exePath = exePath
+                    windowTitle = normalizeClosedTabTitle windowTitle
+                    renamedTabName = windowNameOverride.value.tryFind(hwnd) |> Option.bind id
+                    isPinned =
+                        match owningGroup with
+                        | Some(g) when g.windows.contains((=) hwnd) -> g.isPinnedThreadSafe(hwnd)
+                        | _ -> windowPinned.value.contains(hwnd)
+                    fillColor = windowFillColor.value.tryFind(hwnd)
+                    underlineColor = windowUnderlineColor.value.tryFind(hwnd)
+                    borderColor = windowBorderColor.value.tryFind(hwnd)
+                    tabAlign = windowAlignment.value.tryFind(hwnd)
+                    // The edge of the tab in its group while it is there;
+                    // one that had already left its group alive (see
+                    // windowLastGroup) keeps the edge remembered then; else
+                    // the edge it left its group from.
+                    tabEdge =
+                        let inGroup (g: IGroup) = this.windowEdgeInGroup(g, hwnd)
+                        match owningGroup with
+                        | Some(g) when g.windows.contains((=) hwnd) -> inGroup g
+                        | owning ->
+                            match windowLastGroup.value.tryFind(hwnd) with
+                            | Some(last) -> last.tabEdge
+                            | None -> owning |> Option.map inGroup |> Option.defaultValue TabEdges.Edge.Top
+                    groupRef = LiveStrip(groupHwnd)
+                    tabIndex = tabIndex
+                    closedHwnd = hwnd
+                    closedAt = now
+                    isRestoreSeed = false
+                    isAmbiguous = false
+                    savedGroupIndex = None
+                    savedDesktop = owningGroup |> Option.bind (fun g -> g.desktopHome)
+                    savedRect = None
+                    seedSince = Some(now)
+                    orderSnapshot = orderSnapshot
+                    // Taken from the window itself as it closed, so it is that
+                    // window's state and nobody else's.
+                    stateIsCertain = true
+                }
+                closedTabCache.map(fun l -> info :: l |> List.truncate closedTabCacheLimit)
+                RestoreTrace.log (fun () -> sprintf "record hwnd=%X group=%X rank=%d underline=%b fill=%b border=%b pin=%b name=%b title=%s"
+                                                    (hwnd.ToInt64()) (groupHwnd.ToInt64()) tabIndex
+                                                    info.underlineColor.IsSome info.fillColor.IsSome info.borderColor.IsSome
+                                                    info.isPinned info.renamedTabName.IsSome info.windowTitle)
+            | snapshot ->
+                RestoreTrace.log (fun () -> sprintf "record hwnd=%X SKIPPED (%s)" (hwnd.ToInt64())
+                                                    (match snapshot with
+                                                     | None -> "no exe/title snapshot"
+                                                     | Some((e, t)) -> sprintf "empty snapshot exe=%s title=%s" e t))
+
+    // Resolve the group a ClosedTabInfo refers to: normally by strip hwnd,
+    // and for seeded entries via the sentinel-token map (see seededGroupMap).
+    // The mapped group is verified still present before it is trusted.
+    member private this.findGroupForClosedInfo (info: ClosedTabInfo) =
+        match info.groupRef with
+        | SavedToken(token) ->
+            seededGroupMap.value.tryFind(token)
+            |> Option.bind (fun g ->
+                if this.desktop.groups.any(fun x -> obj.ReferenceEquals(x, g)) then Some(g) else None)
+        | LiveStrip(strip) ->
+            this.desktop.groups.tryFind(fun g -> (try g.hwnd = strip with _ -> false))
+
+    // Hand a live group the settings of the saved group whose token has just
+    // been bound to it.
+    member private this.applySeededGroupSettings(token: IntPtr, g: IGroup) =
+        match seededGroupSettings.value.tryFind(token) with
+        | Some(pos, margin, locked) ->
+            pos |> Option.iter (fun p -> g.perGroupTabPositionValue <- p)
+            margin |> Option.iter (fun m -> g.snapTabHeightMargin <- m)
+            locked |> Option.iter (fun l -> g.lockWindowPosition <- l)
+        | None -> ()
+
+    member private this.isInfoGroup (g: IGroup) (info: ClosedTabInfo) =
+        match info.groupRef with
+        | SavedToken(token) ->
+            (match seededGroupMap.value.tryFind(token) with
+             | Some(sg) -> obj.ReferenceEquals(sg, g)
+             | None -> false)
+        | LiveStrip(strip) -> (try g.hwnd = strip with _ -> false)
+
+    member private this.claimState(hwnd) =
+        windowPinned.value.contains(hwnd), windowFillColor.value.tryFind(hwnd),
+        windowUnderlineColor.value.tryFind(hwnd), windowBorderColor.value.tryFind(hwnd)
+
+    member private this.isPristineForClaim(hwnd) =
+        // Suppression checks the protection period before this eligibility check.
+        ExplicitLaunch.canClaimState (explicitWindows.value.tryFind(hwnd))
+            (windowNameOverride.value.tryFind(hwnd).IsNone &&
+             this.claimState(hwnd) = (false, None, None, None))
+
+    member private this.refreshAmbiguousEntries() =
+        let now = DateTime.Now
+        let current =
+            closedTabCache.value |> List.filter (fun e ->
+                let limit = if e.isRestoreSeed then seedMaxAgeDays else closedTabMaxAgeDays
+                (now - (e.seedSince |> Option.defaultValue e.closedAt)).TotalDays <= limit)
+        let held =
+            current |> List.map (fun e -> (e.exePath, e.windowTitle), e.groupRef, e.isAmbiguous)
+            |> ClosedTabClaim.heldIndices
+        let refreshed =
+            current |> List.mapi (fun i e ->
+                if e.isAmbiguous && not (held.Contains i) then
+                    this.traceRestoreRetention(e.closedHwnd, groupRefHandle e.groupRef, e.tabIndex, "ambiguity-released")
+                    { e with isAmbiguous = false }
+                else e)
+        if refreshed <> closedTabCache.value then closedTabCache.set(refreshed)
+
+    member private this.restoreRectangle(hwnd: IntPtr) =
+        try
+            let window = os.windowFromHwnd(hwnd)
+            if not window.isWindow then None else
+            let bounds =
+                if not window.isMinimized then window.bounds else
+                let normal = window.placement.rcNormalPosition
+                // Placement is in workspace coordinates except for tool windows.
+                if int(window.styleEx) &&& WindowsExtendedStyles.WS_EX_TOOLWINDOW <> 0 then normal
+                else
+                    match Mon.fromHwnd(hwnd) with
+                    | Some mon -> normal.move(mon.workRect.x - mon.displayRect.x,
+                                              mon.workRect.y - mon.displayRect.y)
+                    | None -> normal
+            Some(bounds.x,bounds.y,bounds.width,bounds.height)
+        with _ -> None
+
+    member private this.traceRestorePair(saved: IntPtr, hwnd: IntPtr, rank, distance, candidates) =
+#if DEBUG
+        RestoreTrace.retention hwnd saved rank "position-pair" (fun () ->
+            sprintf " record=%X window=%X distance=%A candidates=%d" (saved.ToInt64()) (hwnd.ToInt64()) distance candidates)
+#endif
+        ()
+
+    member private this.restorePosition(hwnd: IntPtr) : RestorePosition.Observation =
+        // Physical distances do not depend on monitor scale or desktop identity.
+        // A failed desktop read must not discard a valid rectangle.
+        { center=RestorePosition.center (this.restoreRectangle hwnd)
+          scale=1.0; desktop=None }
+
+    member private this.traceRestorePosition(hwnd, token, rank, decision) =
+        let reason, distance, gap =
+            match decision with
+            | RestorePosition.Selected(_,d,g,_) ->
+                "ambiguity-resolved-by-position", Some d, g
+            | RestorePosition.Ordered(_,d,g) -> "ambiguity-resolved-by-order", d, g
+            | RestorePosition.Held why -> "ambiguity-held-" + why, None, None
+        RestoreTrace.retention hwnd token rank reason (fun () ->
+            sprintf " distance=%A gap=%A" distance gap)
+
+    member private this.closedClaimDecision(hwnd, exePath, windowTitle) =
+        this.refreshAmbiguousEntries()
+        if claimedWindows.value.Contains hwnd then ClosedTabClaim.AlreadyClaimed else
+        let identity = exePath, normalizeClosedTabTitle windowTitle
+        let matches =
+            if exePath = "" || windowTitle = "" then [] else
+            let entries = closedTabCache.value |> List.mapi (fun index e ->
+                (e.exePath,e.windowTitle), e.isAmbiguous,
+                ({ index=index; center=RestorePosition.center e.savedRect; desktop=e.savedDesktop } : RestorePosition.Candidate))
+            let matching = entries |> List.filter (fun (other,_,_) -> ClosedTabClaim.sameIdentity identity other)
+            if not matching.IsEmpty then
+                let matching = matching |> List.sortBy (fun (_,_,c) ->
+                    let e = closedTabCache.value.[c.index]
+                    Option.defaultValue Int32.MaxValue e.savedGroupIndex, e.tabIndex, c.index)
+                let arrivals =
+                    hwnd :: (os.windowsInZorder.list |> List.choose (fun w ->
+                        try
+                            if w.isWindow && not (claimedWindows.value.Contains w.hwnd) &&
+                               this.isAppWindowStyle(w) &&
+                               Services.filter.getIsTabbingEnabledForWindow(w.hwnd) &&
+                               ClosedTabClaim.sameIdentity identity (w.pid.processPath, normalizeClosedTabTitle w.text) then Some w.hwnd
+                            else None
+                        with _ -> None))
+                    |> List.distinct |> List.sortBy (fun h -> h.ToInt64())
+                let pairs = ClosedTabClaim.resolveMany (arrivals |> List.map this.restorePosition)
+                                                       (matching |> List.map (fun (_,_,c) -> c))
+                match pairs |> List.tryFind (fun (_,pair) -> arrivals.[pair.liveIndex] = hwnd) with
+                | Some(index,pair) ->
+                    let e = closedTabCache.value.[index]
+                    if matching.Length > 1 || arrivals.Length > 1 then
+                        this.traceRestorePair(e.closedHwnd, hwnd, e.tabIndex, pair.distance, pair.candidates)
+                    [index]
+                | None -> []
+            else matching |> List.map (fun (_,_,c) -> c.index)
+        ClosedTabClaim.decide hwnd claimedWindows.value matches
+
+    member private this.peekClosedTabMatch(hwnd, exePath, windowTitle) =
+        match this.closedClaimDecision(hwnd, exePath, windowTitle) with
+        | ClosedTabClaim.Claim index -> Some closedTabCache.value.[index]
+        | ClosedTabClaim.AlreadyClaimed -> None
+        | ClosedTabClaim.NoMatch -> None
+
+    // Fallback for a window whose title does not survive a restart. A
+    // browser's title is its active tab's, so Edge or Chrome comes back
+    // showing a different page and the exact match above finds nothing -
+    // which is how one window of a mixed group (Edge + LINE + Chrome) was
+    // left behind while the others reassembled. Only restore SEEDS are
+    // eligible, never a tab the user closed by hand, and only when the window
+    // reopened where it was: applications restore their own geometry, so a
+    // rectangle that no longer overlaps means this is a different window.
+    // With several candidates the nearest saved rectangle wins.
+    member private this.findSeedByExe(exePath: string, bounds: (int * int * int * int) option) =
+        if exePath = "" then None else
+        let centerOf (x, y, w, h) = (float x + float w / 2.0, float y + float h / 2.0)
+        let contains (x, y, w, h) (px, py) =
+            px >= float x && px <= float (x + w) && py >= float y && py <= float (y + h)
+        let overlaps (saved: int * int * int * int) =
+            match bounds with
+            | None -> true
+            | Some(live) -> contains saved (centerOf live) || contains live (centerOf saved)
+        // A window minimized when the state was saved was recorded at the
+        // off-screen position Windows parks minimized windows at (-32000).
+        // That is not where the window lives, so it says nothing about which
+        // live window this is: treat it as no position at all rather than let
+        // it rule every candidate out.
+        let usableRect (r: int * int * int * int) =
+            let (x, y, _, _) = r
+            x > -30000 && y > -30000
+        let candidates =
+            closedTabCache.value
+            |> List.mapi (fun i e -> (i, e))
+            |> List.filter (fun (_, e) ->
+                e.isRestoreSeed && not e.isAmbiguous &&
+                sameExePath e.exePath exePath &&
+                (match e.savedRect with
+                 | Some(r) when usableRect r -> overlaps r
+                 | _ -> true))
+        match candidates with
+        | [] -> None
+        | _ ->
+            let idx =
+                match bounds with
+                | Some(live) ->
+                    let (lx, ly) = centerOf live
+                    candidates
+                    |> List.minBy (fun (_, e) ->
+                        match e.savedRect with
+                        | Some(r) when usableRect r ->
+                            let (sx, sy) = centerOf r
+                            (sx - lx) * (sx - lx) + (sy - ly) * (sy - ly)
+                        | _ -> infinity)
+                    |> fst
+                | None -> candidates |> List.head |> fst
+            Some(idx, List.length candidates)
+
+    // Whether this window may claim a saved entry by exe path alone yet. One
+    // candidate is the only one it could be. Where several entries share the
+    // application there is nothing to choose between them, and waiting for the
+    // title to settle is not a way of choosing: an application that starts on
+    // a name of its own - Excel before a workbook is loaded, VSCode showing
+    // the container rather than the folder - still has that name when the wait
+    // is over. Claiming then took an entry at random, put the window in its
+    // place, and consumed the record, so the window that really belonged there
+    // had nothing left to come back to. Two VSCode windows lost their
+    // underline that way, and an Excel window took the other workbook's slot.
+    //
+    // So an entry is claimed by application alone only when it cannot be
+    // mistaken, and the window waits until then. Nothing is lost by waiting:
+    // the entry stays, the late pass runs while entries remain, and the moment
+    // the real title appears the exact match restores the place, the colours
+    // and the name together.
+    member private this.seedFallbackAllowed(hwnd: IntPtr, candidateCount: int) =
+        candidateCount <= 1 &&
+        (match windowFirstSeen.value.tryFind(hwnd) with
+         | Some(seenAt) -> monotonic.ElapsedMilliseconds - seenAt >= seedFallbackGraceMs
+         | None -> false)
+
+    // Consume one specific cache entry (the one a peek settled on).
+    member private this.takeClosedTabEntry(hwnd, info: ClosedTabInfo) =
+        let eligible =
+            if not info.isAmbiguous then true else
+            let window = os.windowFromHwnd(hwnd)
+            let decision = this.closedClaimDecision(hwnd, (try window.pid.processPath with _ -> ""), (try window.text with _ -> ""))
+            match decision with
+            | ClosedTabClaim.Claim index -> obj.ReferenceEquals(closedTabCache.value.[index], info)
+            | _ -> false
+        match ClosedTabClaim.take hwnd (fun e -> eligible && obj.ReferenceEquals(e, info))
+                                  claimedWindows.value closedTabCache.value with
+        | Some(entry, claimed, remaining) ->
+            // Replace all current state, whether inherited or changed by the user.
+            if explicitWindows.value.tryFind(hwnd).IsSome then
+                windowNameOverride.map(fun m -> m.remove hwnd)
+                windowPinned.map(fun s -> s.remove hwnd)
+                windowFillColor.map(fun m -> m.remove hwnd)
+                windowUnderlineColor.map(fun m -> m.remove hwnd)
+                windowBorderColor.map(fun m -> m.remove hwnd)
+                windowAlignment.map(fun m -> m.remove hwnd)
+                windowEdges.map(fun m -> m.remove hwnd)
+            claimedWindows.set(claimed)
+            closedTabCache.set(remaining)
+            this.refreshAmbiguousEntries()
+            Some (if entry.isAmbiguous then {entry with isAmbiguous=false;stateIsCertain=true} else entry)
+        | None -> None
+
+    // Put the saved pin state back on a restored tab. Runs on the group thread.
+    //
+    // Pin is half of the tab's band on the strip and the ordering below sorts
+    // within bands, so this has to have happened before any order is worked
+    // out - a tab still carrying the pin state that auto-grouping happened to
+    // give it would be sorted into the wrong half of the strip and the saved
+    // order would come out wrong for every tab in that band, not just this one.
+    // It has to happen again after anything that runs the strip's smart-pin
+    // rule, which is moveTab and nothing else; setVisualOrder deliberately
+    // leaves pin alone.
+    member private this.enforcePin(wg: WindowGroup, hwnd: IntPtr, info: ClosedTabInfo) =
+        let tab = Tab(hwnd)
+        if info.isPinned && not (wg.ts.isPinned(tab)) then wg.pinTab(hwnd)
+        elif not info.isPinned && wg.ts.isPinned(tab) then wg.unpinTab(hwnd)
+
+    // Shared by early and late claims, after alignment and pin are applied.
+    // A saved snapshot may disagree with today's order. Move only the claimed
+    // tab so reopening a window cannot rearrange its existing peers.
+    member private this.restorePlacement(wg: WindowGroup, hwnd: IntPtr, info: ClosedTabInfo) =
+        let current = wg.ts.visualOrder.list
+        let placed =
+            current |> List.map (fun (Tab(h) as t) -> TabOrder.placed h (wg.ts.visualZoneOf(t)))
+        let oldHandleOf (h: IntPtr) =
+            match restoredFromMap.TryGetValue(h) with
+            | true, oldHwnd -> Some(oldHwnd)
+            | _ -> None
+        let desired =
+            TabOrder.placeRestoredTab info.orderSnapshot oldHandleOf hwnd info.closedHwnd info.tabIndex placed
+        if desired <> (current |> List.map (fun (Tab(h)) -> h)) then
+            // Unlike moveTab, this does not apply smart-pin to the arrival.
+            wg.ts.setVisualOrder(desired |> List.map Tab)
+
+    // Closed-tab restore: when a window matching a recorded closed tab
+    // appears, restore its tab state and put it back into its former group.
+    // Runs before category/exe auto-grouping in findGroupForWindow.
+    member this.tryClosedTabRestore(window:Window) =
+        if this.suppressExplicitRestore(window.hwnd, window.text) then None else
+        let exePath = try window.pid.processPath with _ -> ""
+        let windowTitle = try window.text with _ -> ""
+        let bounds =
+            try
+                let b = window.bounds
+                Some(b.x, b.y, b.width, b.height)
+            with _ -> None
+        // An entry is claimed on an exact application and title, and on
+        // nothing else. Claiming by application alone was meant for a window
+        // whose title does not survive a restart - a browser reopening on
+        // another page - but there is no way to tell that window from any
+        // other of the same application, and being the last candidate left is
+        // not the same as being the right one. A second terminal called
+        // "PowerShell ver 7 pwsh.exe" took the last free entry in its group,
+        // which belonged to a window called "WindowTabs1"; the entry was
+        // consumed, and when that window did appear there was nothing left for
+        // it. Restoring nothing is better: entries are kept for thirty days,
+        // so a window whose title comes back gets its place back with it.
+        let matched =
+            // A late claim moving between groups already reserved this entry.
+            let reserved = pendingClosedTabRestores.value.tryFind(window.hwnd)
+            let entry =
+                match reserved with
+                | Some info -> Some info
+                | None ->
+                    this.peekClosedTabMatch(window.hwnd, exePath, windowTitle)
+                    |> Option.bind (fun info -> this.takeClosedTabEntry(window.hwnd, info))
+            entry |> Option.map (applicableState true)
+        (match matched with
+         | Some(i) -> RestoreTrace.log (fun () -> sprintf "claim(early) hwnd=%X token=%X rank=%d align=%A pin=%b title=%s"
+                                                      (window.hwnd.ToInt64()) ((groupRefHandle i.groupRef).ToInt64()) i.tabIndex i.tabAlign i.isPinned windowTitle)
+         | None ->
+            if closedTabCache.value |> List.exists (fun e -> e.isRestoreSeed && sameExePath e.exePath exePath) then
+                RestoreTrace.log (fun () -> sprintf "claim(early) hwnd=%X NONE title=%s" (window.hwnd.ToInt64()) windowTitle))
+        match matched with
+        | Some(info) ->
+            let hwnd = window.hwnd
+#if DEBUG
+            // Claim runs on the main thread. Sample native geometry without
+            // reading or waiting for the destination group's cells.
+            let probe = WindowFrameMargin.Cache()
+            try
+                probe.Refresh(hwnd, TopEdgeGuardPlacement.isGuard) |> ignore
+                let target = this.findGroupForClosedInfo info |> Option.map (fun group -> group.hwnd)
+                let published = target |> Option.bind WindowFrameMargin.readBase
+#if DEBUG
+                WindowFrameMargin.trace (
+                    sprintf "claim hwnd=%X margin=%A group=%A publishedBase=%A"
+                        (int64 hwnd) (probe.Get(hwnd, 96)) target published)
+#endif
+            finally probe.Clear()
+#endif
+            // Restore state to the global maps before addWindow so the tab is
+            // created with the saved name/colors/pin/alignment (same pattern
+            // as restoreTabGroupsFromSettings)
+            match info.renamedTabName with
+            | Some(name) -> windowNameOverride.set(windowNameOverride.value.add hwnd (Some(name)))
+            | None -> ()
+            info.fillColor |> Option.iter (fun c -> windowFillColor.set(windowFillColor.value.add hwnd c))
+            info.underlineColor |> Option.iter (fun c -> windowUnderlineColor.set(windowUnderlineColor.value.add hwnd c))
+            info.borderColor |> Option.iter (fun c -> windowBorderColor.set(windowBorderColor.value.add hwnd c))
+            if info.isPinned then windowPinned.set(windowPinned.value.add hwnd)
+            windowEdges.map(fun m -> m.add hwnd (this.allowedWindowEdge (info.tabEdge)))
+            info.tabAlign |> Option.iter (fun a ->
+                windowAlignmentEdges.[hwnd] <- info.tabEdge
+                windowAlignment.set(windowAlignment.value.add hwnd a))
+            // Remember old->new hwnd so siblings restored later can locate this
+            // tab in their close-time order snapshot
+            restoredFromMap.[hwnd] <- info.closedHwnd
+            // Remember the entry so addWindowToGroup can restore the position
+            pendingClosedTabRestores.map(fun m -> m.add hwnd info)
+            match this.closedInfoGroupForRestore(hwnd, info) with
+            | Some(g) ->
+                if not g.isDesktopShown then pendingLinkedRestores.map(Set.add hwnd)
+                Some(Some(g))
+            | None -> None  // No eligible live group: state is restored, grouping falls through.
+        | None -> None
+
+    // Main-thread title sync (no cross-thread notification): compares each
+    // grouped window's current title with the windowInfoCache snapshot.
+    // On a change it refreshes the snapshot and runs the closed-tab late
+    // restore for apps whose title settles only after grouping (e.g. VSCode
+    // starting on "Welcome" before showing the workspace name). Only
+    // pristine tabs (no custom state yet) are touched. Grouped windows
+    // without a snapshot yet (e.g. restored at startup, which bypasses
+    // addWindowToGroup) get one here, so closing them can be recorded.
+    // Called from updateAppWindows and the 1s titleSyncTimer.
+    member this.syncWindowTitles() =
+        try
+            // A destroy event may be missed after a window leaves its group.
+            // Clear only dead windows, never merely detached or renamed ones.
+            let dead = claimedWindows.value |> Set.filter (fun h -> not (os.windowFromHwnd(h).isWindow))
+            if not dead.IsEmpty then
+                claimedWindows.map(fun claimed -> Set.difference claimed dead)
+                pendingLinkedRestores.map(fun pending -> Set.difference pending dead)
+                pendingClosedTabRestores.map(fun pending ->
+                    dead |> Set.fold (fun (m: Map2<IntPtr, ClosedTabInfo>) h -> m.remove h) pending)
+            // While saved windows are still waiting to open, every grouped
+            // window is offered to the late restore on each pass, not only
+            // when its title changes: a window whose title never becomes the
+            // saved one has no other moment at which it could rejoin its
+            // group once the grace period is over.
+            let hasSeeds = closedTabCache.value |> List.exists (fun e -> e.isRestoreSeed)
+            this.desktop.groups.iter <| fun gi ->
+                gi.windows.iter <| fun hwnd ->
+                    match windowInfoCache.value.tryFind(hwnd) with
+                    | Some((exePath, oldTitle)) ->
+                        let window = os.windowFromHwnd(hwnd)
+                        if window.isWindow then
+                            let newTitle = try window.text with _ -> oldTitle
+                            if newTitle <> oldTitle then
+                                windowInfoCache.map(fun m -> m.add hwnd (exePath, newTitle))
+                                if newTitle <> "" then
+                                    this.tryLateClosedTabRestore(hwnd, exePath, newTitle)
+                            elif hasSeeds && exePath <> "" then
+                                this.tryLateClosedTabRestore(hwnd, exePath, newTitle)
+                    | None ->
+                        let window = os.windowFromHwnd(hwnd)
+                        if window.isWindow then
+                            let exePath = try window.pid.processPath with _ -> ""
+                            let title = try window.text with _ -> ""
+                            if exePath <> "" then
+                                windowInfoCache.map(fun m -> m.add hwnd (exePath, title))
+        with _ -> ()
+
+    member private this.tryLateClosedTabRestore(hwnd: IntPtr, exePath: string, windowTitle: string) =
+        try
+                if not (this.suppressExplicitRestore(hwnd, windowTitle)) && closedTabCache.value.IsEmpty.not && this.isPristineForClaim(hwnd) && (this.isOnDesktopFromReader(hwnd) || this.isInGroup(hwnd)) then
+                    // Peek first: the entry is only consumed when applied in place
+                    let normTitle = normalizeClosedTabTitle windowTitle
+                    let bounds =
+                        try
+                            let b = os.windowFromHwnd(hwnd).bounds
+                            Some(b.x, b.y, b.width, b.height)
+                        with _ -> None
+                    let peeked =
+                        this.peekClosedTabMatch(hwnd, exePath, windowTitle)
+                        |> Option.map (fun info -> info, false)
+                    (match peeked with
+                     | Some(i, amb) -> RestoreTrace.log (fun () -> sprintf "claim(late) hwnd=%X token=%X rank=%d amb=%b title=%s"
+                                                                      (hwnd.ToInt64()) ((groupRefHandle i.groupRef).ToInt64()) i.tabIndex amb windowTitle)
+                     | None ->
+                        // A miss is only interesting while entries for this
+                        // application wait: then the titles on both sides say
+                        // why nothing matched.
+                        let waiting = closedTabCache.value |> List.filter (fun i -> sameExePath i.exePath exePath)
+                        if not waiting.IsEmpty then
+                            let n, last = match lateMissLogged.TryGetValue(hwnd) with | true, v -> v | _ -> (0, "")
+                            if n < lateMissLogLimit && normTitle <> last then
+                                lateMissLogged.[hwnd] <- (n + 1, normTitle)
+                                RestoreTrace.log (fun () -> sprintf "late hwnd=%X NO MATCH title=%s; %d waiting for this exe: %s"
+                                                                    (hwnd.ToInt64()) windowTitle waiting.Length
+                                                                    (waiting |> List.map (fun i -> i.windowTitle) |> String.concat " | ")))
+                    match peeked with
+                    | Some(info, ambiguous) ->
+                        let currentGroup = this.groupOfWindow hwnd
+                        // A claim may rejoin a hidden group through the same safe
+                        // link insertion as an early claim, without moving its peers.
+                        let savedGroup = this.closedInfoGroupForRestore(hwnd, info)
+                        match currentGroup, savedGroup with
+                        | Some(cur), Some(saved) when not (obj.ReferenceEquals(cur, saved)) ->
+                            // The tab sits in the wrong group (e.g. VSCode's "Welcome"
+                            // window was auto-grouped before the workspace title
+                            // appeared). Detach it and let the normal grouping
+                            // pipeline re-add it: with the title now matching,
+                            // tryClosedTabRestore performs the full group +
+                            // position + state restore using this reservation.
+                            RestoreTrace.log (fun () -> sprintf "  late hwnd=%X DETACH (wrong group)" (hwnd.ToInt64()))
+                            match this.takeClosedTabEntry(hwnd, info) with
+                            | Some entry ->
+                                pendingClosedTabRestores.map(fun m -> m.add hwnd entry)
+                                if not saved.isDesktopShown then pendingLinkedRestores.map(Set.add hwnd)
+                                match cur :> obj with
+                                | :? GroupInfo as gi when not saved.isDesktopShown ->
+                                    gi.invokeGroup(fun () -> gi.group.removeWindow(hwnd, activate=false))
+                                | _ -> cur.removeWindow(hwnd)
+                                this.scheduleUpdateAppWindows()
+                            | None -> ()
+                        | _ ->
+                        match this.takeClosedTabEntry(hwnd, info) with
+                        | Some(entry) ->
+                            let info = applicableState (not ambiguous) entry
+                            info.fillColor |> Option.iter (fun c -> windowFillColor.set(windowFillColor.value.add hwnd c))
+                            info.underlineColor |> Option.iter (fun c -> windowUnderlineColor.set(windowUnderlineColor.value.add hwnd c))
+                            info.borderColor |> Option.iter (fun c -> windowBorderColor.set(windowBorderColor.value.add hwnd c))
+                            if info.isPinned then windowPinned.set(windowPinned.value.add hwnd)
+                            windowEdges.map(fun m -> m.add hwnd (this.allowedWindowEdge (info.tabEdge)))
+                            info.tabAlign |> Option.iter (fun a ->
+                                windowAlignmentEdges.[hwnd] <- info.tabEdge
+                                windowAlignment.set(windowAlignment.value.add hwnd a))
+                            restoredFromMap.[hwnd] <- info.closedHwnd
+                            match this.groupOfWindow hwnd with
+                            | Some(g) ->
+                                // A window whose title had not settled when it
+                                // appeared was auto-grouped before its saved
+                                // entry could be claimed, so the entry's group
+                                // token was never bound to a live group. Bind
+                                // it now, to the group this window landed in:
+                                // without it neither this tab nor any sibling
+                                // that follows is ever put back in its saved
+                                // place, and a group whose windows all start
+                                // late comes back in the order they happened to
+                                // open in.
+                                let mutable isSavedGroup = this.isInfoGroup g info
+                                match info.groupRef with
+                                | SavedToken(token) when
+                                        not isSavedGroup && info.isRestoreSeed &&
+                                        token <> IntPtr.Zero &&
+                                        (this.findGroupForClosedInfo info).IsNone ->
+                                    seededGroupMap.map(fun m -> m.add token g)
+                                    // As in the early pass, only onto a group
+                                    // that is this window's alone. A window
+                                    // auto-grouped on its own before its title
+                                    // settled reaches its saved group only
+                                    // here, and refusing every group outright
+                                    // left it on the default side for good -
+                                    // siblings arriving later find the group
+                                    // no longer new and cannot mend it either.
+                                    if g.windows.count = 1 then
+                                        this.applySeededGroupSettings(token, g)
+                                    isSavedGroup <- true
+                                | _ -> ()
+                                match g :> obj with
+                                | :? GroupInfo as gi ->
+                                    let replaceCurrentState = explicitWindows.value.tryFind(hwnd).IsSome
+                                    gi.invokeGroup <| fun() ->
+                                        try
+                                            let wg = gi.group
+                                            let tab = Tab(hwnd)
+                                            wg.setTabName(hwnd, info.renamedTabName)
+                                            wg.ts.setTabFillColor(tab, info.fillColor)
+                                            wg.ts.setTabUnderlineColor(tab, info.underlineColor)
+                                            wg.ts.setTabBorderColor(tab, info.borderColor)
+                                            // Through the group, not the strip: wg.setTabAlign
+                                            // also writes the global map the settings file is
+                                            // saved from. The strip-only call left that map
+                                            // holding the alignment this window had inherited
+                                            // when it was auto-grouped, so the tab looked right
+                                            // but came back right-aligned after the NEXT restart.
+                                            // The saved edge - used here, by the
+                                            // restore, and nowhere else (1-4-1);
+                                            // an edge no longer allowed gives way
+                                            // to the first allowed one (1-5).
+                                            let restoredEdge = TabEdges.fallback wg.ts.allowedEdges info.tabEdge
+                                            if restoredEdge <> wg.tabEdge(hwnd) then wg.setTabEdge(hwnd, restoredEdge)
+                                            match TabEdges.alignmentOnArrival (Some info.tabEdge) restoredEdge info.tabAlign with
+                                            | Some a -> wg.setTabAlign(hwnd, a)
+                                            | None when info.tabEdge <> restoredEdge ->
+                                                wg.ts.clearTabAlign(tab)
+                                                Services.program.setWindowAlignment(hwnd, None)
+                                            | None when replaceCurrentState -> wg.ts.clearTabAlign(tab)
+                                            | None -> ()
+                                            // Alignment and pin first, always,
+                                            // whether or not this is the saved
+                                            // group: together they are the
+                                            // tab's band, the ordering below
+                                            // sorts within bands, and a tab
+                                            // that landed outside its saved
+                                            // group is not ordered at all but
+                                            // still keeps what it was saved
+                                            // with.
+                                            this.enforcePin(wg, hwnd, info)
+                                            if ClosedTabClaim.mayPlace info.isRestoreSeed isSavedGroup false then
+                                                this.restorePlacement(wg, hwnd, info)
+                                                RestoreTrace.log (fun () -> sprintf "  place(late) hwnd=%X rank=%d order=%s"
+                                                                                  (hwnd.ToInt64()) info.tabIndex
+                                                                                  (wg.ts.visualOrder.list |> List.map (fun (Tab h) -> sprintf "%X" (h.ToInt64())) |> String.concat ","))
+                                            else
+                                                RestoreTrace.log (fun () -> sprintf "  place(late) hwnd=%X SKIPPED (not saved group)" (hwnd.ToInt64()))
+                                        with _ -> ()
+                                | _ -> ()
+                            | None -> ()
+                        | None -> ()
+                    | None -> ()
+        with _ -> ()
+
+    /// Runs a window pass that a move/size loop had put off, once no group is
+    /// in one any more. Called once a second.
+    member this.catchUpDeferredWindowPass() =
+        if deferredWindowPass then
+            try
+                if not (this.desktop.groups.any(fun g -> g.isInMoveSizeThreadSafe)) then
+                    this.updateAppWindows()
+            with _ -> ()
+
+    member this.updateAppWindows() = PerfTrace.time "updateAppWindows" <| fun () ->
+        // A pass over every window on the desktop takes a few hundred
+        // milliseconds when several hundred are open, and Office creates and
+        // destroys windows of its own throughout a resize - each one asking
+        // for another pass, which is what made dragging a group's top edge
+        // crawl. While a window of a group is in its move/size loop the pass
+        // is put off; the loop's end asks for it again (WindowGroup's
+        // onExitMoveSize reaches here through the placement update), and the
+        // ten-second timer is the backstop.
+        let inMoveSize =
+            try this.desktop.groups.any(fun g -> g.isInMoveSizeThreadSafe) with _ -> false
+        if inMoveSize then
+            PerfTrace.count "updateAppWindows.deferred"
+            deferredWindowPass <- true
+        else
+        deferredWindowPass <- false
+        this.expireStaleTabMonitoringSuspension()
+        if updateTraceCount < 60 || this.desktop.isDragging || this.isTabMonitoringSuspended then
+            updateTraceCount <- updateTraceCount + 1
+            if updateTraceCount <= 200 then
+                DragTrace.log (fun () -> sprintf "updateAppWindows #%d: isDragging=%b suspended=%b disabled=%b shutdown=%b restorePending=%b"
+                                              updateTraceCount this.desktop.isDragging this.isTabMonitoringSuspended isDisabledCell.value inShutdown.value needsRestoreOnStartup.value)
+        if this.desktop.isDragging.not then
+            // If restoration is needed on startup, do it first before auto-grouping.
+            // Not while disabled: the snapshot is kept for the moment the user
+            // switches WindowTabs back on, and rebuilding the groups behind a
+            // ticked "disable" box is exactly what the switch is there to prevent.
+            if needsRestoreOnStartup.value && isDisabledCell.value.not then
+                this.restoreTabGroupsFromSettings()
+                needsRestoreOnStartup.set(false)
+
+            if inShutdown.value.not && isDisabledCell.value.not then
+                let windows = PerfTrace.time "windowsInZorder" (fun () -> os.windowsInZorder)
+                PerfTrace.count (sprintf "windowsScanned.%d" (windows.count / 50 * 50))
+                this.forgetDeadParkedOrphans()
+                windows.iter <| fun window ->
+                    PerfTrace.time "pass.subscribe" (fun () -> this.ensureWindowIsSubscribed(window))
+                    if this.isTabMonitoringSuspended.not then
+                        // Before grouping: a window brought back on screen is
+                        // tabbable again, and is grouped in this same pass -
+                        // back into its own group when windowLastGroup still
+                        // remembers it.
+                        PerfTrace.time "pass.rescue" (fun () -> this.rescueParkedOrphan(window))
+                        PerfTrace.time "pass.group" (fun () -> this.ensureWindowIsGrouped(window))
+                PerfTrace.time "syncWindowTitles" (fun () -> this.syncWindowTitles())
+            PerfTrace.time "pass.destroyEmpty" (fun () -> this.destroyEmptyGroups())
+            PerfTrace.time "pass.removeUntabable" (fun () -> this.removeUntabableWindows())
+            // Groups and tabs describe the state a leak would show up in: both
+            // should come back down when windows close.
+            PerfTrace.gauge "groups" this.desktop.groups.length
+            PerfTrace.gauge "tabs" (this.desktop.groups.fold 0 (fun n g -> n + g.windows.count))
+
+        // Group membership may have changed above - a window grouped after
+        // it came to the front, a group destroyed under the foreground
+        // window - and the hot keys follow membership.
+        this.syncHotKeys()
+        this.exitIfNeeded()
+
+    member this.ensureWindowIsSubscribed(window:Window) =
+        let hwnd = window.hwnd
+        if  isSubscribed.value.contains(hwnd).not &&
+            window.pid.isCurrentProcess.not &&
+            this.isAppWindowStyle(window)
+            then
+            if windowFirstSeen.value.tryFind(hwnd).IsNone then
+                windowFirstSeen.map(fun m -> m.add hwnd monotonic.ElapsedMilliseconds)
+            let registerEvent evt =
+                window.setWinEventHook evt (fun() -> this.receive(WinEvent(hwnd, evt)))
+            let hooks = List2([WinEvent.EVENT_OBJECT_SHOW;WinEvent.EVENT_OBJECT_HIDE]).map(registerEvent)
+            let dispose = {
+                new IDisposable with
+                    member this.Dispose() =
+                        hooks.iter(fun h -> h.Dispose())
+                }
+            isSubscribed.map(fun s -> s.add hwnd dispose)
+
+    member this.ensureWindowIsGrouped(window:Window) =
+        // A tab the user has just dropped outside every strip wants a group of
+        // its own here, even if the window is still a tab of a group of
+        // another virtual desktop (it is shown on all of them). Any other
+        // window in a group anywhere is left to the desktop pass, which gives
+        // a window shown on all desktops its group on each desktop.
+        let wantsGroup =
+            let dropped = isDroppedAndAwaitingGrouping.value.contains(window.hwnd)
+            VirtualDesktopGroups.wantsGroup dropped
+                (dropped && this.isInShownGroup(window.hwnd)) (this.isInGroup(window.hwnd))
+        // Skip windows not on the current virtual desktop to prevent regrouping
+        // during desktop switch. That question is asked last: it is a call into
+        // the shell, this runs for every top-level window on every pass (eight
+        // hundred and more), and while the shell is busy each call can take a
+        // millisecond or more - asked first, it was most of a pass and held the
+        // main thread for seconds.
+        let mayJoin =
+            not (this.isInGroup(window.hwnd)) ||
+            VirtualDesktopGroups.Live.mayDuplicate (VirtualDesktopGroups.Live.snapshot()) window.hwnd
+        if wantsGroup && mayJoin && this.isTabbableWindow(window) && this.canAddFirstTab(window.hwnd) then
+            if groupTraceCount < 60 then
+                groupTraceCount <- groupTraceCount + 1
+                DragTrace.log (fun () -> sprintf "ensureWindowIsGrouped: hwnd=%X exe=%s" (window.hwnd.ToInt64()) (try window.pid.exeName with _ -> "?"))
+            this.addWindowToGroup(window)
+
+    // A window in no group that remains in the geometric parking region is
+    // put back on the primary monitor. ParkedWindow requires it to be outside
+    // every display and beyond one work area's bottom-right corner. This is
+    // not proof that WindowTabs, rather than another application, parked it.
+    // Group members are not touched: the stranded pass in
+    // removeUntabableWindows already reseats those inside their own group.
+    member this.rescueParkedOrphan(window:Window) =
+        let hwnd = window.hwnd
+        let isOrphanInParkingSpot () =
+            window.pid.isCurrentProcess.not &&
+            window.isWindow && window.isVisible &&
+            not window.isMinimized && not window.isCloaked &&
+            this.isInGroup(hwnd).not &&
+            recentlyPlacedHwnds.value.tryFind(hwnd).IsNone &&
+            pendingRegroups.value.tryFind(hwnd).IsNone &&
+            this.isAppWindowStyle(window) &&
+            (let monitors = Mon.all.list
+             let toBox (r: Rect) = ParkedWindow.ofXYWH r.x r.y r.width r.height
+             ParkedWindow.isParked
+                (monitors |> List.map (fun m -> toBox m.displayRect))
+                (monitors |> List.map (fun m -> toBox m.workRect))
+                (toBox window.bounds)) &&
+            Services.filter.getIsTabbingEnabledForWindow(hwnd) &&
+            // Last: a call into the shell (see ensureWindowIsGrouped).
+            this.isOnDesktopFromReader(hwnd)
+        let parked =
+            this.desktop.isDragging.not &&
+            isRestoringTabGroups.value.not && needsRestoreOnStartup.value.not &&
+            (try isOrphanInParkingSpot () with _ -> false)
+        if parked.not then
+            parkedOrphanSince.Remove(hwnd) |> ignore
+        else
+            let now = monotonic.ElapsedMilliseconds
+            match parkedOrphanSince.TryGetValue(hwnd) with
+            | false, _ ->
+                parkedOrphanSince.[hwnd] <- now
+                // Nothing else may ask for a pass while it waits; the
+                // ten-second timer would, but later than it has to be.
+                ThreadHelper.cancelablePostBack (int parkedOrphanGraceMs + 250) (fun () ->
+                    this.scheduleUpdateAppWindows()) |> ignore
+            | true, since when now - since >= parkedOrphanGraceMs ->
+                parkedOrphanSince.Remove(hwnd) |> ignore
+                let monitors = Mon.all.list
+                let primary =
+                    monitors
+                    |> List.tryFind (fun m -> let r = m.displayRect in r.left <= 0 && r.top <= 0 && r.right > 0 && r.bottom > 0)
+                    |> Option.orElse (List.tryHead monitors)
+                match primary with
+                | Some(monitor) ->
+                    let area = monitor.workRect
+                    let b = window.bounds
+                    let (x, y, w, h) =
+                        ParkedWindow.homeFor
+                            (ParkedWindow.ofXYWH area.x area.y area.width area.height) b.width b.height
+                    RestoreTrace.log (fun () -> sprintf "rescue hwnd=%X (in no group, parked at %d,%d for %dms) -> %d,%d"
+                                                        (hwnd.ToInt64()) b.x b.y (now - since) x y)
+                    if w = b.width && h = b.height then window.setPositionOnly x y
+                    else window.move(Rect(Pt(x, y), Sz(w, h)))
+                | None -> ()
+            | true, _ -> ()
+
+    member private this.forgetDeadParkedOrphans() =
+        if parkedOrphanSince.Count > 0 then
+            let dead =
+                parkedOrphanSince.Keys
+                |> Seq.filter (fun hwnd -> (try os.windowFromHwnd(hwnd).isWindow with _ -> false) |> not)
+                |> List.ofSeq
+            dead |> List.iter (fun hwnd -> parkedOrphanSince.Remove(hwnd) |> ignore)
+
+    // Group one application's windows again as though each of them had just
+    // opened. Reached ONLY from a grouping setting going off to on - never
+    // from the periodic pass, because a tab the user dragged out by hand would
+    // then be dragged back in at the next tick, and keeping it out is the one
+    // existing behaviour this feature must not cost.
+    //
+    // stillWanted is the setting that asked for this, read again at the moment
+    // the pass actually runs: the request may wait a moment (below), and a box
+    // that has been unticked in the meantime is not asking for anything.
+    member this.regroupProcessWindows(procPath: string, stillWanted: unit -> bool) =
+        // An empty path names no application, and would match every window
+        // whose own path could not be read.
+        //
+        // Nothing here is allowed to reach the settings dialog as an
+        // exception: the box has already been ticked and the setting already
+        // saved, so a failure to rearrange what is on screen must not look to
+        // the user like the setting itself failing.
+        try
+            if procPath <> "" then
+                this.regroupWhenIdle(procPath, stillWanted, regroupRetries)
+        with ex ->
+            DragTrace.log (fun () -> sprintf "regroup: %s failed - %s" procPath (ex.Message))
+
+    // Wait rather than discard. isTabMonitoringSuspended is routinely still
+    // set for a few hundred milliseconds after a drag - resumeTabMonitoringAfter
+    // uses 200-300ms - so a tick made just after detaching a tab by hand would
+    // otherwise do nothing at all, silently. Held for at most four half-second
+    // attempts; past that the click and the movement would no longer look to
+    // the user like one thing, and the setting is saved either way, so every
+    // window opened from now on is grouped as asked.
+    member private this.regroupWhenIdle(procPath: string, stillWanted: unit -> bool, attemptsLeft: int) =
+        if inShutdown.value || inSessionEnd.value || isDisabledCell.value then
+            DragTrace.log (fun () -> sprintf "regroup: abandoned for %s (shutdown=%b sessionEnd=%b disabled=%b)"
+                                             procPath inShutdown.value inSessionEnd.value isDisabledCell.value)
+        elif this.desktop.isDragging || this.isTabMonitoringSuspended ||
+             needsRestoreOnStartup.value || isRestoringTabGroups.value then
+            if attemptsLeft > 0 then
+                DragTrace.log (fun () -> sprintf "regroup: %s waiting (dragging=%b suspended=%b restoring=%b) attemptsLeft=%d"
+                                                 procPath this.desktop.isDragging this.isTabMonitoringSuspended
+                                                 (isRestoringTabGroups.value || needsRestoreOnStartup.value) attemptsLeft)
+                ThreadHelper.cancelablePostBack regroupRetryMs (fun() ->
+                    this.regroupWhenIdle(procPath, stillWanted, attemptsLeft - 1)) |> ignore
+            else
+                DragTrace.log (fun () -> sprintf "regroup: %s gave up waiting" procPath)
+        elif (try stillWanted() with _ -> false) then
+            this.regroupNow(procPath)
+
+    // What has to change is worked out first, as arithmetic over plain values
+    // (Regroup.plan), and only then applied. Deciding and acting window by
+    // window cannot work here: every removal is a post to a group's own thread,
+    // so a window taken out of its group is still listed in it for a while, and
+    // a decision taken against that stale picture would put the second window
+    // into the first one's old group and the third into the second's.
+    //
+    // Applying is only ever "leave your group, and here is where you are
+    // going". The joining itself is left to the ordinary pass, which is both
+    // simpler and the point: addWindowToGroup is where a tab inherits its new
+    // group's alignment, lands beside its own application's tabs and gets a
+    // closed tab's saved state back, and a regrouped window has as much right
+    // to all of that as a window that has just opened.
+    member private this.regroupNow(procPath: string) =
+        let categoryOf = this.categoryLookup()
+        let hwndZorders = this.hwndZorders()
+        // The groups drawn on the desktop being looked at, and no others: they
+        // are the only ones a window here can be sent to (joinableGroups), and a
+        // window shown on all desktops is a tab of the group the person can see.
+        // A window here that only another desktop's group holds is listed below
+        // as in no group, and the ordinary pass leaves it to the desktop pass.
+        let groups = this.joinableGroups |> Array.ofList
+        // A window belongs to this pass when it is the changed application's
+        // AND the ordinary pass would be willing to group it. Same predicate as
+        // ensureWindowIsGrouped, deliberately: "treated as if it had just
+        // opened" is worth nothing if the two disagree about which windows can
+        // be grouped at all. Windows on another virtual desktop are therefore
+        // left alone here exactly as they are left alone there.
+        let isTarget (hwnd: IntPtr) (windowProcPath: string) =
+            windowProcPath = procPath &&
+            (try
+                let window = os.windowFromHwnd(hwnd)
+                this.isTabbableWindow(window) && this.isOnDesktopFromReader(hwnd)
+             with _ -> false)
+        let seen = HashSet<IntPtr>()
+        let views = ResizeArray<Regroup.WindowView>()
+        let addView (hwnd: IntPtr) (group: int option) =
+            if seen.Add(hwnd) then
+                let windowProcPath = try os.windowFromHwnd(hwnd).pid.processPath with _ -> ""
+                views.Add
+                    { Regroup.WindowView.hwnd = hwnd
+                      Regroup.WindowView.procPath = windowProcPath
+                      Regroup.WindowView.category = categoryOf windowProcPath
+                      Regroup.WindowView.zorder = hwndZorders.tryFind(hwnd).def(Int32.MaxValue)
+                      Regroup.WindowView.group = group
+                      Regroup.WindowView.isTarget = isTarget hwnd windowProcPath }
+        groups |> Array.iteri (fun i g -> g.windows.iter (fun hwnd -> addView hwnd (Some i)))
+        // Windows of this application that are in no group yet. The ordinary
+        // pass would pick them up a moment later anyway, but including them
+        // here is what lets them share the one group the rest are gathering in
+        // instead of arriving after it has been settled.
+        os.windowsInZorder.iter <| fun window ->
+            if seen.Contains(window.hwnd).not &&
+               (try window.pid.processPath = procPath with _ -> false) then
+                addView window.hwnd None
+
+        let moves = Regroup.plan (this.cast<IProgram>().tabLimit) (List.ofSeq views)
+        DragTrace.log (fun () -> sprintf "regroup: %s windows=%d moves=%d" procPath views.Count (List.length moves))
+        if moves.IsEmpty.not then
+            // A window being fitted into a strip is briefly off-screen, and
+            // off-screen fails isTabbableWindow - the same reason the
+            // multi-select drag-detach path needs this.
+            this.cast<IProgram>().markRecentlyPlaced(moves |> List.map (fun m -> m.hwnd))
+            let now = DateTime.Now
+            moves |> List.iter (fun move ->
+                let pending =
+                    match move.destination with
+                    | Regroup.Existing(index) -> { group = Some(groups.[index]); setId = -1; at = now }
+                    | Regroup.Fresh(n) -> { group = None; setId = n; at = now }
+                pendingRegroups.map(fun m -> m.add move.hwnd pending)
+                move.source |> Option.iter (fun index -> groups.[index].removeWindow(move.hwnd)))
+            // A window that was in no group has no removal to wait for, so
+            // nothing else would wake the pass up for it. (Where there IS a
+            // removal, the group's own removed event schedules a pass with the
+            // window already gone from the group - see the groupRemoved
+            // subscription - which is what makes the ordinary path pick these
+            // up in the first place.)
+            this.scheduleUpdateAppWindows()
+
+    member this.destroyEmptyGroups() =
+        this.desktop.groups.iter <| fun gi ->
+        if gi.windows.isEmpty && launcher.isLaunching(gi).not then
+            gi.destroy()
+
+    member this.removeUntabableWindows() =
+        // Case C: prune expired entries from the recently-placed grace map
+        // first so it doesn't grow unboundedly.
+        let now = DateTime.Now
+        let expired =
+            recentlyPlacedHwnds.value.items.list
+            |> List.filter (fun (_, ts) -> (now - ts).TotalMilliseconds > recentlyPlacedGraceMs)
+            |> List.map fst
+        if not (List.isEmpty expired) then
+            recentlyPlacedHwnds.map(fun m ->
+                expired |> List.fold (fun acc h -> acc.remove h) m)
+        let isRecentlyPlaced(hwnd) =
+            match recentlyPlacedHwnds.value.tryFind(hwnd) with
+            | Some _ -> true
+            | None -> false
+        // A window shown on all virtual desktops is in several groups; it is
+        // recorded once, from the group of the desktop being looked at - so
+        // those groups go first - and taken out of all of them.
+        let closedRecorded = HashSet<IntPtr>()
+        let groupsShownFirst =
+            this.desktop.groups.where(fun g -> g.isDesktopShown)
+                .appendList(this.desktop.groups.where(fun g -> g.isDesktopShown.not))
+        groupsShownFirst.iter <| fun gi ->
+            // Skip groups whose top window is in a native move/size loop: the
+            // other windows are parked off-screen for the duration
+            // (hideChildWindows) and would wrongly fail the tabbable check,
+            // getting kicked out of the group (issue #12 — a click on the
+            // window edge could dissolve the group under high load).
+            if (try gi.isInMoveSizeThreadSafe with _ -> false) then () else
+            gi.windows.iter <| fun hwnd ->
+                let window = os.windowFromHwnd(hwnd)
+                // Only remove windows that are on the current virtual desktop and not tabbable
+                // Don't remove windows on other virtual desktops to preserve tab groups during desktop switch
+                // Case C: also skip windows that were just placed into a
+                // group via the multi-select drag-detach path — they may
+                // still be at the dragExit off-screen parking location
+                // while their adjustChildWindows hasn't run yet.
+                // The reading that says a window is here can be a moment old:
+                // in the middle of a desktop switch the shell has already
+                // cloaked the windows of the desktop being left while the
+                // last reading still calls them here. Taken at its word, it
+                // threw every window of that desktop out of its group. The
+                // shell's own cloak, read now, says the window is on another
+                // desktop, and is believed over the reading.
+                let cloakedByShell =
+#if DEBUG
+                    // Test hook: decide as before this check existed, to show
+                    // what it prevents (with the cloak delay above).
+                    Environment.GetEnvironmentVariable("WINDOWTABS_DEBUG_PRUNE_TRUST_READING") <> "1" &&
+#endif
+                    (match window.cloakedValue with
+                     | Some c -> c &&& 2 <> 0
+                     | None -> false)
+                let excluded = Services.filter.isTabbingExcludedForWindow(hwnd)
+                let untabbable =
+                    excluded ||
+                    VirtualDesktopGroups.pruneMember window.isWindow (fun () ->
+                        this.isTabbableWindow(window).not &&
+                        not (isRecentlyPlaced(hwnd)) &&
+                        not cloakedByShell &&
+                        this.isOnDesktopFromReader(hwnd))
+                // A live, visible, un-minimized window of a tabbed application
+                // sitting at the iconic position (-32000,-32000) has not left:
+                // a restore left it there (see the second pass of
+                // adjustChildWindows). Put it back rather than throw it out,
+                // which is how a tab and its window used to vanish together.
+                // Sitting outside every monitor is the other way a window is
+                // left behind. A group parks the windows it is not dragging
+                // just past the bottom right corner of the desktop, and so
+                // does a tab drag; a park that is never undone - the process
+                // was restarted or the group went away in between - leaves one
+                // out there for good, where the user cannot reach it. The same
+                // reseat brings it home.
+                let offEveryMonitor (b: Rect) =
+                    b.width > 0 && b.height > 0 &&
+                    not (Mon.all.any(fun mon ->
+                        let s = mon.displayRect
+                        min s.right b.right > max s.left b.left &&
+                        min s.bottom b.bottom > max s.top b.top))
+                let stranded =
+                    not excluded && untabbable &&
+                    window.isWindow && window.isVisible && not window.isMinimized && not window.isCloaked &&
+                    (let b = window.bounds in b.x <= -30000 || b.y <= -30000 || offEveryMonitor b) &&
+                    (try Services.filter.getIsTabbingEnabledForProcess window.pid.processPath with _ -> false)
+                if stranded then
+                    RestoreTrace.log (fun () -> sprintf "reseat hwnd=%X group=%X (live window left off screen at %A) title=%s"
+                                                        (hwnd.ToInt64()) (try gi.hwnd.ToInt64() with _ -> 0L)
+                                                        (let b = window.bounds in (b.x, b.y))
+                                                        (match windowInfoCache.value.tryFind(hwnd) with
+                                                         | Some((_, t)) -> t
+                                                         | None -> ""))
+                    gi.reseatWindow hwnd
+                elif untabbable then
+                    // Record only genuinely destroyed windows; a window that is
+                    // merely hidden (e.g. minimized to tray) keeps its hwnd and
+                    // its state in the global maps. Its place is remembered
+                    // instead, for the destroy that may follow.
+                    if window.isWindow.not then
+                        if closedRecorded.Add(hwnd) then this.recordClosedTab(hwnd, gi)
+                        windowFillColor.map(fun m -> m.remove hwnd)
+                        windowUnderlineColor.map(fun m -> m.remove hwnd)
+                        windowBorderColor.map(fun m -> m.remove hwnd)
+                        windowPinned.map(fun s -> s.remove hwnd)
+                        windowNameOverride.map(fun m -> m.remove hwnd)
+                        windowAlignmentEdges.TryRemove(hwnd) |> ignore
+                        windowEdges.map(fun m -> m.remove hwnd)
+                        claimedWindows.map(ClosedTabClaim.forget hwnd)
+                        pendingLinkedRestores.map(Set.remove hwnd)
+                        pendingClosedTabRestores.map(fun m -> m.remove hwnd)
+                        explicitWindows.map(fun m -> m.remove hwnd)
+                    // Removal is asynchronous, so the next pass sees the window
+                    // still here and would remember it again, one place further
+                    // left each time as the others go: only the first pass
+                    // counts.
+                    elif excluded then
+                        windowLastGroup.map(fun m -> m.remove hwnd)
+                    elif windowLastGroup.value.tryFind(hwnd).IsNone then
+                        let now = DateTime.Now
+                        let groupHwnd = (try gi.hwnd with _ -> IntPtr.Zero)
+                        // Several tabs of one group dropped in a burst (the
+                        // application switched off) share the order taken at
+                        // the first of them, as closed tabs do: each later
+                        // one's own view of the strip already lacks the ones
+                        // before it.
+                        let anchor =
+                            windowLastGroup.value.items.list
+                            |> List.tryPick (fun (_, e) ->
+                                match e.groupRef with
+                                | LiveStrip(s) when s = groupHwnd &&
+                                                    (now - e.closedAt).TotalSeconds < 5.0 &&
+                                                    List.contains hwnd e.orderSnapshot -> Some(e.orderSnapshot)
+                                | _ -> None)
+                        let order =
+                            match anchor with
+                            | Some(o) -> o
+                            | None -> (try gi.visualOrderThreadSafe.list with _ -> [])
+                        let ownIndex = order |> List.tryFindIndex ((=) hwnd) |> Option.defaultValue -1
+                        let exePath, title =
+                            match windowInfoCache.value.tryFind(hwnd) with
+                            | Some(snapshot) -> snapshot
+                            | None -> ("", "")
+                        let info = {
+                            exePath = exePath
+                            windowTitle = normalizeClosedTabTitle title
+                            renamedTabName = windowNameOverride.value.tryFind(hwnd) |> Option.bind id
+                            isPinned = windowPinned.value.contains(hwnd)
+                            fillColor = windowFillColor.value.tryFind(hwnd)
+                            underlineColor = windowUnderlineColor.value.tryFind(hwnd)
+                            borderColor = windowBorderColor.value.tryFind(hwnd)
+                            tabAlign = windowAlignment.value.tryFind(hwnd)
+                            tabEdge = this.windowEdgeInGroup(gi, hwnd)
+                            groupRef = LiveStrip(groupHwnd)
+                            tabIndex = ownIndex
+                            closedHwnd = hwnd
+                            closedAt = now
+                            isRestoreSeed = false
+                            isAmbiguous = false
+                            savedGroupIndex = None
+                            savedDesktop = gi.desktopHome
+                            savedRect = None
+                            seedSince = Some(now)
+                            orderSnapshot = order
+                            stateIsCertain = true
+                        }
+                        windowLastGroup.map(fun m -> m.add hwnd info)
+                        RestoreTrace.log (fun () ->
+                            let reason =
+                                if not (Services.filter.getIsTabbingEnabledForProcess exePath) then "tabbing off"
+                                elif not window.isVisible then "hidden"
+                                elif window.isCloaked then "cloaked"
+                                elif window.isMinimized then "minimized, not an app window"
+                                else
+                                    let b = window.bounds
+                                    sprintf "off-screen or not an app window bounds=%d,%d,%d,%d" b.x b.y b.width b.height
+                            sprintf "prune hwnd=%X group=%X rank=%d %s title=%s"
+                                    (hwnd.ToInt64()) (groupHwnd.ToInt64()) ownIndex reason title)
+                    gi.removeWindow hwnd
+
+    member this.findGroupForWindow(window:Window) =
+        let handlers = List2([
+            this.tryExplicitLaunch
+            this.tryDropped
+            this.tryRegroup
+            launcher.findGroup
+            this.tryClosedTabRestore
+            this.tryReturnToLastGroup
+            this.tryAutoGroup
+            ])
+        handlers.tryPick(fun f -> f(window)).def(None)
+
+    // A window the scan dropped alive (see windowLastGroup) that can be
+    // tabbed again goes back to its own group while that group exists, not
+    // to whichever group auto-grouping would pick for a newcomer.
+    member this.tryReturnToLastGroup(window:Window) =
+        match windowLastGroup.value.tryFind(window.hwnd) with
+        | Some(info) ->
+            match this.closedInfoGroupForReturn(window.hwnd, info) with
+            | Some(g) ->
+                if not g.isDesktopShown then pendingLinkedRestores.map(Set.add window.hwnd)
+                Some(Some(g))
+            | None -> None
+        | None -> None
+
+    // The alignment the saved entries still waiting for this application all
+    // agree on. At startup a group is put together by ordinary grouping
+    // seconds before the restore reaches it: the first window in takes the
+    // global default, every joiner copies the tab before it, and the restore
+    // then corrects only the tabs it can identify by title - leaving any
+    // window still showing a generic name (Excel before a workbook loads,
+    // VSCode showing the container rather than the folder) on the wrong side
+    // of the strip, where it is conspicuous. The entries know which side the
+    // group was on before anything opened, so a window that cannot be
+    // identified yet starts there instead of on the default side.
+    member private this.savedAlignFor(exePath: string) =
+        if exePath = "" then None else
+        match closedTabCache.value
+              |> List.filter (fun e -> e.isRestoreSeed && not e.isAmbiguous && sameExePath e.exePath exePath)
+              |> List.map (fun e -> e.tabAlign) with
+        | [] -> None
+        | first :: rest when rest |> List.forall ((=) first) -> first
+        | _ -> None
+
+    member this.addWindowToGroup(window:Window) =
+        let hwnd = window.hwnd
+        // Snapshot exe path + title now; recordClosedTab needs them after the
+        // window has been destroyed and can no longer be queried
+        windowInfoCache.map(fun m ->
+            m.add hwnd ((try window.pid.processPath with _ -> ""), (try window.text with _ -> "")))
+        // Read before the group is chosen: tryReturnToLastGroup wants it.
+        let returning = windowLastGroup.value.tryFind(hwnd)
+        let group,isNewGroup =
+            match this.findGroupForWindow(window) with
+            | Some(group) -> (group, false)
+            | None -> (Services.desktop.createGroup(), true)
+        // Back in a group, so the remembered place is used up either way. Where
+        // that group is the one it left, the place is put back through the
+        // same step a closed tab's is (at the end of this method); anywhere
+        // else the place means nothing.
+        (match returning with
+         | Some(info) ->
+            windowLastGroup.map(fun m -> m.remove hwnd)
+            if not isNewGroup && this.isInfoGroup group info then
+                pendingClosedTabRestores.map(fun m -> m.add hwnd info)
+                RestoreTrace.log (fun () -> sprintf "return hwnd=%X to group=%X rank=%d" (hwnd.ToInt64()) ((groupRefHandle info.groupRef).ToInt64()) info.tabIndex)
+            else
+                RestoreTrace.log (fun () -> sprintf "return hwnd=%X SKIPPED (landed in another group) rank=%d" (hwnd.ToInt64()) info.tabIndex)
+         | None -> ())
+        // Retire this window's setting-change entry, and where the group was
+        // just made for it, hand the group to the rest of the set so they join
+        // it instead of each making one of their own.
+        this.completeRegroup(hwnd, group, isNewGroup)
+        let isDropped = isDroppedAndAwaitingGrouping.value.contains(hwnd)
+        DragTrace.log (fun () -> sprintf "addWindowToGroup: hwnd=%X dropped=%b newGroup=%b" (hwnd.ToInt64()) isDropped isNewGroup)
+        //need to add this now so we don't end up creating another group for it while waiting for the WgnWindowAdded notification
+        isDroppedAndAwaitingGrouping.map(fun s -> s.remove hwnd)
+        if this.isInGroup(hwnd) then
+            VirtualDesktopTrace.log (fun () -> sprintf "second group: hwnd=%X reason=fresh-shared-drop" (hwnd.ToInt64()))
+        let withDelay = not isDropped && isNewGroup && delayTabExeNames.contains(window.pid.exeName)
+        // Consume only the snap-drag metadata; keep the normal drop/regroup,
+        // closed-tab and saved-alignment path for single-tab detach.
+        let detachedEdge = pendingDragEdges.value.tryFind(hwnd)
+        pendingDragEdges.map(fun m -> m.remove hwnd)
+        let snapMargin = pendingDragSnapMargins.value.tryFind(hwnd)
+        pendingDragSnapMargins.map(fun m -> m.remove hwnd)
+        if isNewGroup then snapMargin |> Option.iter (fun margin -> group.snapTabHeightMargin <- margin)
+        let detachedLock = pendingDetachedLocks.value.tryFind(hwnd)
+        pendingDetachedLocks.map(fun m -> m.remove hwnd)
+        if isNewGroup then detachedLock |> Option.iter (fun locked -> group.lockWindowPosition <- locked)
+        let invokerHwnd = pendingNewTabInvokers.value.tryFind(hwnd).def(IntPtr.Zero)
+        pendingNewTabInvokers.map(fun m -> m.remove hwnd)
+        // A tab opened beside another takes its colours along with its side
+        // and pin. They are copied before the tab is added, so it is drawn in
+        // them from the start.
+        if invokerHwnd <> IntPtr.Zero then
+            let copyFrom (colors: Cell<Map2<IntPtr, Color>>) =
+                match colors.value.tryFind(invokerHwnd) with
+                | Some(c) -> colors.set(colors.value.add hwnd c)
+                | None -> ()
+            copyFrom windowFillColor
+            copyFrom windowUnderlineColor
+            copyFrom windowBorderColor
+        let returningState = pendingClosedTabRestores.value.tryFind(hwnd)
+        // Capture restore correspondence on the main thread; the insertion
+        // callback must not read the mutable dictionary from the group thread.
+        let restoreOrder =
+            returningState |> Option.bind (fun info ->
+                let oldHandles = restoredFromMap |> Seq.map (fun kv -> kv.Key, kv.Value) |> Map.ofSeq
+                let willBind =
+                    match info.groupRef with
+                    | SavedToken token -> info.isRestoreSeed && token <> IntPtr.Zero &&
+                                          (this.findGroupForClosedInfo info).IsNone
+                    | _ -> false
+                if ClosedTabClaim.mayPlace info.isRestoreSeed (this.isInfoGroup group info) willBind then
+                    Some(TabOrder.placeRestoredTab info.orderSnapshot (fun h -> Map.tryFind h oldHandles)
+                             hwnd info.closedHwnd info.tabIndex)
+                else None)
+        let savedAlign =
+            if (ExplicitLaunch.active DateTime.Now (explicitWindows.value.tryFind(hwnd))).IsSome then None
+            else this.savedAlignFor(try window.pid.processPath with _ -> "")
+        let explicitLink =
+            ExplicitLaunch.active DateTime.Now (explicitWindows.value.tryFind(hwnd))
+            |> Option.exists (fun request ->
+                match request.destination with JoinGroup _ -> true | _ -> false)
+        let restoreTargetHidden = not group.isDesktopShown || pendingLinkedRestores.value.Contains hwnd
+        pendingLinkedRestores.map(Set.remove hwnd)
+        let restoreInFormerGroup = returningState |> Option.exists (this.isInfoGroup group)
+        match group :> obj with
+        | :? GroupInfo as gi ->
+            gi.addWindowWith(hwnd, fun wg ->
+                let state = VirtualDesktopGroups.Live.snapshot()
+                let away = VirtualDesktopGroups.keepAway && VirtualDesktopGroups.Live.isFresh state &&
+                           (VirtualDesktopGroups.Live.read state hwnd).presence = VirtualDesktopGroups.Away
+                let restoredLink =
+                    VirtualDesktopGroups.restoreLinked (state.shared.Contains hwnd) restoreInFormerGroup
+                        (restoreTargetHidden || not wg.isDesktopShownThreadSafe) away
+                let linked = restoredLink || (explicitLink && (away || not wg.isDesktopShownThreadSafe))
+                let addLinked add =
+                    let trace reason =
+                        if restoredLink then
+                            returningState |> Option.iter (fun info ->
+                                this.traceRestoreTarget(hwnd, info, true, reason))
+                    try
+                        add()
+                        trace (if wg.windows.contains(hwnd) then "joined-linked" else "join-not-applied")
+                    with _ ->
+                        trace "join-failed"
+                        reraise()
+                let invoker = Tab(invokerHwnd)
+                if invokerHwnd <> IntPtr.Zero && wg.ts.tabs.contains(invoker) then
+                    if linked then
+                        addLinked(fun () ->
+                            wg.addWindowLinked(hwnd, withDelay, alignment=wg.ts.getTabAlign(invoker),
+                                               pinned=wg.ts.isPinned(invoker), after=invokerHwnd, edge=wg.ts.edgeOf invoker))
+                    else
+                        wg.addWindow(hwnd, withDelay, alignment=wg.ts.getTabAlign(invoker),
+                                     pinned=wg.ts.isPinned(invoker), after=invokerHwnd, edge=wg.ts.edgeOf invoker)
+                else
+                    let edge =
+                        (if isDropped then detachedEdge else None)
+                        |> Option.orElseWith (fun () -> returningState |> Option.map (fun info -> info.tabEdge))
+                        |> Option.map (TabEdges.fallback wg.ts.allowedEdges)
+                        |> Option.defaultValue wg.joinEdge
+                    let alignment =
+                        match returningState with
+                        | Some info -> info.tabAlign
+                        | None when isDropped -> Services.program.getWindowAlignment(hwnd)
+                        | None ->
+                            savedAlign |> Option.orElseWith (fun () ->
+                                if isNewGroup then None
+                                else wg.ts.visualOrder.list |> List.filter (fun t -> wg.ts.edgeOf t = edge) |> List.tryLast |> Option.map wg.ts.getTabAlign)
+                    let pinned = returningState |> Option.map (fun info -> info.isPinned)
+                    if linked then
+                        addLinked(fun () ->
+                            wg.addWindowLinked(hwnd, withDelay, ?alignment=alignment, ?pinned=pinned, ?restoreOrder=restoreOrder, edge=edge))
+                    else
+                        wg.addWindow(hwnd, withDelay, ?alignment=alignment, ?pinned=pinned, ?restoreOrder=restoreOrder, edge=edge))
+        | _ -> group.addWindow(hwnd, withDelay)
+        // For auto-grouping, position new tab next to same-exe tabs
+        if invokerHwnd = IntPtr.Zero && returningState.IsNone && not isNewGroup && not isDropped && (ExplicitLaunch.active DateTime.Now (explicitWindows.value.tryFind(hwnd))).IsNone then
+            let procPath = window.pid.processPath
+            match group :> obj with
+            | :? GroupInfo as gi ->
+                gi.invokeGroup <| fun() ->
+                    let wg = gi.group
+                    let tabs = wg.ts.visualOrder
+                    let newTab = Tab(hwnd)
+                    // Find the rightmost tab of the same exe (excluding the new tab)
+                    // - on the new tab's own edge: a tab of another strip is
+                    // not beside it.
+                    let newEdge = wg.ts.edgeOf newTab
+                    let mutable lastSameExeIdx = -1
+                    tabs.iteri(fun i t ->
+                        if t <> newTab && wg.ts.edgeOf t = newEdge then
+                            try
+                                let (Tab thwnd) = t
+                                let otherProcPath = os.windowFromHwnd(thwnd).pid.processPath
+                                if otherProcPath = procPath then
+                                    lastSameExeIdx <- i
+                            with _ -> ()
+                    )
+                    if lastSameExeIdx >= 0 then
+                        match tabs.tryFindIndex((=) newTab) with
+                        | Some(curIdx) when curIdx <> lastSameExeIdx + 1 ->
+                            wg.ts.moveTab(newTab, lastSameExeIdx + 1)
+                        | _ -> ()
+            | _ -> ()
+
+        // Bind the saved group token after reserving this arrival. Its saved
+        // tab state and position were already supplied to the insertion above.
+        match pendingClosedTabRestores.value.tryFind(hwnd) with
+        | Some(info) ->
+            pendingClosedTabRestores.map(fun m -> m.remove hwnd)
+            let mutable isSavedGroup = this.isInfoGroup group info
+            // The former group no longer exists (e.g. the whole group was
+            // absent at startup and its members are reopening one by one, so
+            // the cache entries still carry the dead sentinel). Bind the
+            // sentinel to the group this window actually landed in, so the
+            // siblings reassemble there instead of each spawning a group of
+            // its own.
+            //
+            // What is registered is the group OBJECT, not its strip hwnd:
+            // TabStripDecorator is constructed asynchronously on the group
+            // thread, so a group created moments ago has no strip hwnd yet
+            // and reading it here throws. Keying on the hwnd therefore did
+            // nothing in exactly the case this exists for - a whole saved
+            // group absent at boot - and Edge, LINE and Chrome each ended up
+            // in a group of their own.
+            // Only when the token has no LIVE group, as in the late pass. A
+            // token pointing at a group that still exists means this window
+            // landed somewhere else, and repointing it would send every
+            // sibling still to come after it. A token pointing at a group that
+            // has since been destroyed - the first window of a saved group
+            // opened and was closed again before its siblings started - has to
+            // be repointed, or the rest of the group would never reassemble:
+            // findGroupForClosedInfo refuses the dead group, and a bare lookup
+            // would still find the key and refuse to bind a live one.
+            (match info.groupRef with
+             | SavedToken(token) when
+                    not isSavedGroup && info.isRestoreSeed &&
+                    token <> IntPtr.Zero &&
+                    (this.findGroupForClosedInfo info).IsNone ->
+                seededGroupMap.map(fun m -> m.add token group)
+                // Only onto a group made for this window. Where the window
+                // joined a group that was already there, that group is some
+                // other windows' and its tab position is theirs to keep.
+                if isNewGroup then
+                    this.applySeededGroupSettings(token, group)
+                // This IS now the saved group, as it is on the late path. It
+                // was read before the binding above, so it said false, and the
+                // window that created its group was left unplaced for ever
+                // after - the reported fault. Ordering it is safe even when it
+                // has joined some other windows' group: TabOrder moves nothing
+                // it does not recognise from the saved order, so tabs that were
+                // already there keep the neighbours they have.
+                isSavedGroup <- true
+             | _ -> ())
+#if DEBUG
+            match group :> obj with
+            | :? GroupInfo as gi ->
+                gi.invokeGroup <| fun() ->
+                    try
+                        let wg = gi.group
+                        // The add used the final edge, alignment, pin and saved slot.
+                        if isSavedGroup then
+                            RestoreTrace.log (fun () -> sprintf "  place(early) hwnd=%X rank=%d order=%s"
+                                                              (hwnd.ToInt64()) info.tabIndex
+                                                              (wg.ts.visualOrder.list |> List.map (fun (Tab h) -> sprintf "%X" (h.ToInt64())) |> String.concat ","))
+                        else
+                            RestoreTrace.log (fun () -> sprintf "  place(early) hwnd=%X SKIPPED (not saved group)" (hwnd.ToInt64()))
+                    with _ -> ()
+            | _ -> ()
+#endif
+        | None -> ()
+
+        // Run any post-action registered for a standalone launch (position, etc.)
+        match pendingStandalonePostActions.value.tryFind(hwnd) with
+        | Some(action) ->
+            pendingStandalonePostActions.map(fun m -> m.remove hwnd)
+            invoker.asyncInvoke(fun () -> action hwnd)
+        | None -> ()
+
+    member this.scheduleUpdateAppWindows() =
+        pendingUpdateAppWindowsToken |> Option.iter (fun t -> t.Dispose())
+        pendingUpdateAppWindowsToken <-
+            Some(ThreadHelper.cancelablePostBack updateAppWindowsDebounceMs (fun () ->
+                pendingUpdateAppWindowsToken <- None
+                this.updateAppWindows()))
+
+    member this.receive message =
+        let mutable skipFullUpdate = false
+        match message with
+        | WinEvent(hwnd, evt) -> ()
+        | ShellEvent(hwnd, evt) ->
+            match evt with
+            | ShellEvent.HSHELL_WINDOWDESTROYED ->
+                // Shell removal can also mean a live window was hidden to tray.
+                if not (os.windowFromHwnd(hwnd).isWindow) then
+                    Services.filter.forgetWindowTabbing(hwnd)
+                isSubscribed.value.tryFind(hwnd).iter <| fun dispose -> dispose.Dispose()
+                // Direct removal + lightweight cleanup instead of expensive full window scan.
+                // EVENT_OBJECT_HIDE already handles tab removal via updateAppWindows(),
+                // so HSHELL_WINDOWDESTROYED only needs cleanup for any remaining cases.
+                // A window shown on all virtual desktops is in one group per
+                // desktop: it is recorded once, as a tab of the group of the
+                // desktop being looked at, and leaves every one of them.
+                (match this.groupOfWindow hwnd with
+                 | Some(g) ->
+                    this.recordClosedTab(hwnd, g)
+                    this.desktop.groups.iter (fun other ->
+                        if other.windows.contains((=)hwnd) then other.removeWindow(hwnd))
+                 | None ->
+                    // Left its group alive earlier, or was never a tab. The
+                    // first has a place remembered for it; the second has no
+                    // snapshot and is not worth a line.
+                    this.recordClosedTabFromLastGroup(hwnd))
+                windowAlignmentEdges.TryRemove(hwnd) |> ignore
+                windowEdges.map(fun m -> m.remove hwnd)
+                windowLastGroup.map(fun m -> m.remove hwnd)
+                lateMissLogged.Remove(hwnd) |> ignore
+                windowInfoCache.map(fun m -> m.remove hwnd)
+                windowFirstSeen.map(fun m -> m.remove hwnd)
+                claimedWindows.map(ClosedTabClaim.forget hwnd)
+                pendingLinkedRestores.map(Set.remove hwnd)
+                pendingClosedTabRestores.map(fun m -> m.remove hwnd)
+                explicitWindows.map(fun m -> m.remove hwnd)
+                pendingNewTabInvokers.map(fun m -> m.remove hwnd)
+                pendingStandalonePostActions.map(fun m -> m.remove hwnd)
+                // A window closed between leaving its group and rejoining one
+                // never arrives to retire its own entry.
+                pendingRegroups.map(fun m -> m.remove hwnd)
+                this.destroyEmptyGroups()
+                this.exitIfNeeded()
+                skipFullUpdate <- true
+            | _ ->()
+        | Timer -> ()
+
+        if not skipFullUpdate then
+            this.scheduleUpdateAppWindows()
+
+    member this.exitIfNeeded() =
+        if inShutdown.value && this.desktop.isEmpty then
+            if not shutdownCleanupStarted then
+                shutdownCleanupStarted <- true
+                // Drain native registrations on their owning apartment, after
+                // every group has queued its subscription removals.
+                ShutdownDeadline.setStage "WinEvent stop request"
+                WinEventHooks.stop()
+                shutdownTimer.Tick.Add(fun _ -> this.exitIfNeeded())
+                shutdownTimer.Start()
+            // Keep pumping the UI while the other apartments finish. An exited
+            // group notification precedes its actual ExitThread completion.
+            ShutdownDeadline.setStage "group, WinEvent and desktop reader threads wait"
+            if ThreadHelper.groupsStopped() && WinEventPump.isStopped() && not desktopReader.IsAlive then
+                shutdownTimer.Stop()
+                ShutdownTrace.write "group, WinEvent and desktop reader threads stopped"
+                ShutdownDeadline.setStage "main ExitThread"
+                ShutdownTrace.write "main ExitThread"
+                Application.ExitThread()
+
+    member this.saveSettingsAndUpdateAppWindows(f) =
+        settingsManager.update f
+        this.updateAppWindows()
+
+
+    //needed to keep hook alive
+    member this.keepAliveReference = keepAliveCell.value
+
+    // ------------------------------------------------------------- hot keys --
+    //
+    // The keys of the Shortcut Keys tab - numbers 1-9, Next / Previous Tab,
+    // add a tab to the right - are RegisterHotKey hot keys, and a key that
+    // RegisterHotKey holds is taken from EVERY program. So they are held only
+    // while a tabbed window is in front and released the moment anything
+    // else is, which is what leaves Ctrl+1 to Notepad. HotKeyPolicy decides;
+    // this section applies, and syncHotKeys is the only place that does.
+    //
+    // A key that is wanted but refused - another program holds it - does not
+    // count as held, so every later sync asks for it again. And since a
+    // tabbed window can stay in front for hours without a foreground event,
+    // a refusal also starts a timer that asks again once a second, a bounded
+    // number of times; the next foreground change renews the allowance.
+
+    // Where the window in front stands, in HotKeyPolicy's terms.
+    member private this.classifyForeground() =
+        let hwnd = WinUserApi.GetForegroundWindow()
+        if hwnd = IntPtr.Zero then HotKeyPolicy.Other
+        elif this.isInGroup hwnd then HotKeyPolicy.TabbedWindow
+        else
+            // A dialog a tabbed window put up - Save As, Options, a message
+            // box - is owned by it; GA_ROOTOWNER walks the owner chain up.
+            // HotKeyPolicy.wantsHotKeys says why such a dialog releases the
+            // keys rather than keeping them.
+            let owner = WinUserApi.GetAncestor(hwnd, GetAncestorConstants.GA_ROOTOWNER)
+            if owner <> IntPtr.Zero && owner <> hwnd && this.isInGroup owner then HotKeyPolicy.DialogOfTabbedWindow
+            elif os.windowFromHwnd(hwnd).pid.isCurrentProcess then HotKeyPolicy.OwnWindow
+            else HotKeyPolicy.Other
+
+    // What the settings ask to be held while a tabbed window is in front.
+    member private this.wantedHotKeys() =
+        let settings = settingsManager.settings
+        let mode = HotKeyPolicy.numberKeyMode settings.enableCtrlNumberHotKey settings.enableAltNumberHotKey
+        // Read HotKeys once per synchronization. Calling IProgram.getHotKey
+        // for every binding would clone the entire settings JSON each time.
+        let hotKeys = settingsManager.settingsJsonReadOnly.getObject("HotKeys").def(JObject())
+        let getHotKey key = hotKeys.getInt32(key).def(hotKeyDefaults.tryFind(key).def(HotKeyPolicy.noKey))
+        let kept, dropped = HotKeyPolicy.dedupe (HotKeyPolicy.bindings mode getHotKey)
+        // Two fields with one key: the first keeps it and the other is
+        // inert. The dialog does not warn; this line is the one place it
+        // shows.
+        if dropped <> reportedDuplicateHotKeys then
+            reportedDuplicateHotKeys <- dropped
+            for b in dropped do
+                Debug.WriteLine(sprintf "hotkey: %s repeats another field's key and is not registered" (HotKeyPolicy.describe b))
+        kept
+
+    // The one place hot keys are registered or released. Idempotent: it
+    // compares what is held with what the foreground and the settings want
+    // and touches the difference only (HotKeyPolicy.plan), so it is cheap
+    // and safe to call from every signal that might have changed the answer
+    // - the foreground WinEvent, the end of every window pass, a setting
+    // changed in the dialog, the retry timer. Nothing is swallowed: a
+    // release that failed would leave a key taken from other programs, and
+    // that has to show up somewhere.
+    member private this.syncHotKeys() =
+        try
+            let foreground = this.classifyForeground()
+            let wanted = if not inShutdown.value && HotKeyPolicy.wantsHotKeys foreground then this.wantedHotKeys() else []
+            let plan = HotKeyPolicy.plan heldHotKeys wanted
+            for b in plan.release do
+                if not (hotKeyManager.unregister b.name) then
+                    Debug.WriteLine(sprintf "hotkey: UnregisterHotKey refused %s" (HotKeyPolicy.describe b))
+                heldHotKeys <- heldHotKeys |> List.filter (fun h -> h.name <> b.name)
+            let mutable refused = false
+            for b in plan.acquire do
+                let modifiers, vk = HotKeyPolicy.toRegisterHotKey b.code
+                if hotKeyManager.register b.name (modifiers, vk) (fun () -> this.runHotKey b.action) then
+                    heldHotKeys <- heldHotKeys @ [ b ]
+                else
+                    // Another program holds the key - or, if the settings
+                    // file was edited by hand, another of these bindings.
+                    refused <- true
+                    Debug.WriteLine(sprintf "hotkey: RegisterHotKey refused %s (mod=%d vk=0x%02X)" (HotKeyPolicy.describe b) modifiers vk)
+            this.scheduleHotKeyRetry(refused)
+        with ex ->
+            Debug.WriteLine(sprintf "hotkey: sync failed: %s" (ex.ToString()))
+
+    member private this.scheduleHotKeyRetry(refused: bool) =
+        if refused && hotKeyRetriesLeft > 0 then
+            hotKeyRetryTimer.Start()
+        else
+            hotKeyRetryTimer.Stop()
+            if refused then
+                Debug.WriteLine "hotkey: retries exhausted; asking again at the next foreground change"
+
+    member private this.retryHotKeys() =
+        hotKeyRetriesLeft <- hotKeyRetriesLeft - 1
+        this.syncHotKeys()
+
+    member private this.onForegroundChanged() = PerfTrace.time "onForegroundChanged" <| fun () ->
+        hotKeyRetriesLeft <- hotKeyRetryLimit
+        this.syncHotKeys()
+
+    // A held key fired. The group is the one of the window in front NOW, not
+    // the one that was in front when the key was registered: the keys stay
+    // held across a switch from one tabbed window to another, and a stale
+    // group would act on the wrong strip.
+    member private this.runHotKey (action: HotKeyPolicy.HotKeyAction) =
+        let hwnd = WinUserApi.GetForegroundWindow()
+        match this.groupOfWindow hwnd with
+        | None ->
+            // Fired in the moment between a foreground change and the
+            // release it causes. Nothing to act on.
+            ()
+        | Some(group) ->
+            match action with
+            | HotKeyPolicy.ActivateTab n -> group.activateIndex(n - 1)
+            | HotKeyPolicy.NextTab -> group.switchWindow(true, false)
+            | HotKeyPolicy.PrevTab -> group.switchWindow(false, false)
+            | HotKeyPolicy.NewTabRight ->
+                // The tab menu's "New tab : right of this tab", from the
+                // keyboard. The same NewWindowLaunch.start the menu item
+                // calls, so a Store application, Windows Terminal and a
+                // failed start are handled alike; tryNewWindowLaunch then
+                // docks the new window right of the invoking tab.
+                let processPath = os.windowFromHwnd(hwnd).pid.processPath
+                NewWindowLaunch.start hwnd processPath (fun path ->
+                    this.cast<IProgram>().launchNewWindow group.hwnd hwnd processPath)
+
+   
+    member this.hwndZorders() : Map2<IntPtr, int>= Map2(os.windowsInZorder.enumerate.map(fun(i,w) -> w.hwnd,i))
+    
+    member this.isInGroup hwnd : bool =
+        this.desktop.groups.any(fun group -> group.windows.contains((=)hwnd))
+
+    // ------------------------------------------------------ virtual desktops --
+    //
+    // A window shown on all virtual desktops ("Show this window / windows from
+    // this app on all desktops" in task view) is really there on every
+    // desktop, so it is a tab in a group of each desktop it has been seen on,
+    // and those groups are separate groups. A group belongs to a desktop
+    // (IGroup.desktopHome); only the groups of the desktop being looked at are
+    // "shown" (IGroup.isDesktopShown). Everything is decided in
+    // Shared/VirtualDesktopGroups.fs; this reads Windows, hands it over, and
+    // carries out the answer.
+    //
+    // Someone who never uses the setting sees no difference: every window is
+    // in one group, every group's strip is owned by its front window, and the
+    // shell shows and hides the strips with their windows exactly as before.
+    // WindowTabs hides a strip itself only where the shell cannot - a group of
+    // another desktop whose owner is here - and that takes a window shown on
+    // all desktops.
+
+    /// Whether the group a window is in on the desktop being looked at exists.
+    member this.isInShownGroup hwnd : bool =
+        this.desktop.groups.any(fun group -> group.isDesktopShown && group.windows.contains((=)hwnd))
+
+    /// The group an action on a window is about: the one of the desktop being
+    /// looked at, failing that the first that holds it.
+    member this.groupOfWindow hwnd : IGroup option =
+        let groups = this.desktop.groups
+        match groups.tryFind(fun g -> g.isDesktopShown && g.windows.contains((=)hwnd)) with
+        | Some(g) -> Some(g)
+        | None -> groups.tryFind(fun g -> g.windows.contains((=)hwnd))
+
+    /// The groups WindowTabs may put a window into by itself - auto-grouping,
+    /// a "new window" launch, a setting-change regroup, a returning window:
+    /// the ones drawn on the desktop being looked at
+    /// (VirtualDesktopGroups.joinable). Without pins that is every group of
+    /// this desktop, and a group of another desktop never had a window of
+    /// this one to offer anyway.
+    member this.joinableGroups : IGroup list =
+        VirtualDesktopGroups.joinable
+            (this.desktop.groups.list |> List.map (fun g ->
+                g, (if g.isDesktopShown then VirtualDesktopGroups.Shown else VirtualDesktopGroups.Hidden)))
+
+    /// A live window keeps the exact reference to its former group.
+    member private this.closedInfoGroupForReturn(hwnd: IntPtr, info: ClosedTabInfo) : IGroup option =
+        let shared = (VirtualDesktopGroups.Live.snapshot()).shared.Contains hwnd
+        VirtualDesktopGroups.returnInto shared (this.findGroupForClosedInfo info) (fun g -> g.isDesktopShown)
+
+    member private this.traceRestoreRetention(hwnd: IntPtr, token: IntPtr, rank: int, reason: string) =
+        RestoreTrace.retention hwnd token rank reason (fun () -> "")
+
+    member private this.traceRestoreTarget(hwnd: IntPtr, info: ClosedTabInfo, across: bool, reason: string) =
+        RestoreTrace.log (fun () ->
+            sprintf "restore-target hwnd=%X token=%X rank=%d across=%b result=%s"
+                (hwnd.ToInt64()) ((groupRefHandle info.groupRef).ToInt64()) info.tabIndex across reason)
+
+    /// Claimed seeds and closed tabs share the exact-group return policy.
+    /// Keep shared-window evidence even during a temporarily stale reading.
+    member private this.closedInfoGroupForRestore(hwnd: IntPtr, info: ClosedTabInfo) : IGroup option =
+        let found = this.findGroupForClosedInfo info
+        let shared = (VirtualDesktopGroups.Live.snapshot()).shared.Contains hwnd
+        let target = VirtualDesktopGroups.restoreInto shared found (fun (g: IGroup) -> g.isDesktopShown)
+        match found, target with
+        | None, _ -> this.traceRestoreTarget(hwnd, info, false, "group-missing")
+        | Some g, None when not g.isDesktopShown ->
+            this.traceRestoreTarget(hwnd, info, true,
+                if shared then "shared-hidden" else "cross-desktop-disabled")
+        | _ -> ()
+        target
+
+    /// Which windows of which group are written to the settings file or set
+    /// aside while WindowTabs is off - `keeps groupIndex hwnd` - and which of
+    /// them are marked as on all desktops (VirtualDesktopGroups.savedMembership).
+    /// A window moved to another desktop and followed is in two groups for a
+    /// moment; it is written once, into the group of the desktop it went to.
+    member private this.savedMembers (groups: (IGroup * IntPtr list) list) =
+        let shared = VirtualDesktopGroups.Live.shared()
+        let holders =
+            groups
+            |> List.mapi (fun i (g, members) -> members |> List.distinct |> List.map (fun h -> h, (i, g.desktopHome)))
+            |> List.concat
+            |> List.groupBy fst
+            |> List.map (fun (h, xs) -> h, List.map snd xs)
+            |> Map.ofList
+        let verdicts =
+            holders |> Map.map (fun h places ->
+                match places with
+                | [ _ ] -> VirtualDesktopGroups.savedMembership false None places
+                | _ ->
+                    let desktop = (VirtualDesktopGroups.Live.read (VirtualDesktopGroups.Live.snapshot()) h).desktop
+                    VirtualDesktopGroups.savedMembership (shared.Contains h) desktop places)
+        let keeps (i: int) (h: IntPtr) =
+            match verdicts.TryFind h with
+            | Some(into, _) -> List.contains i into
+            | None -> true
+        let marked = verdicts |> Map.filter (fun _ (_, onAll) -> onAll) |> Map.toList |> List.map fst |> Set.ofList
+        keeps, marked
+
+    member private this.refreshDesktopStrips(noticeTick: uint32 option) =
+        if this.canReadDesktops then
+#if DEBUG
+            noticeTick |> Option.iter (fun tick -> lastStripNoticeTick <- Some tick)
+#endif
+            let groups = this.desktop.groups.list
+            let state = VirtualDesktopGroups.Live.snapshot()
+            let mutable desktopId = Guid.Empty
+            let registryRead = VirtualDesktopHelper.TryReadCurrentDesktopId(&desktopId)
+            let current = if registryRead then Some desktopId else state.current
+            if registryRead && current <> observedStripDesktop then
+                let previous = observedStripDesktop |> Option.orElse state.current
+                VirtualDesktopTrace.handover (fun () ->
+                    sprintf "prediction-registry current=%A previous=%A observedTick=%d cloakTick=%A"
+                        current previous Environment.TickCount noticeTick)
+                observedStripDesktop <- current
+                match previous, current with
+                | Some old, Some destination when old <> destination ->
+                    VirtualDesktopGroups.Live.requestPrediction destination "registry" IntPtr.Zero |> ignore
+                | _ -> ()
+            let members = groups |> List.collect (fun g -> g.windows.list) |> List.distinct
+            let unsupported = desktopReader.Latest |> Option.exists (fun p -> not p.value.supported)
+            let reads = members |> List.map (fun hwnd ->
+                let old = VirtualDesktopGroups.Live.read state hwnd
+                let window = os.windowFromHwnd(hwnd)
+                let presence =
+                    if not window.isWindow then VirtualDesktopGroups.Away
+                    elif unsupported then VirtualDesktopGroups.Here
+                    else VirtualDesktopGroups.stripPresence current (state.stripShared.Contains hwnd) old window.cloakedValue
+                hwnd, { old with presence=presence }) |> Map.ofList
+            let states = groups |> List.mapi (fun i g ->
+                let groupState : VirtualDesktopGroups.GroupState = {
+                    key=i; members=g.windows.list; home=g.desktopHome
+                    display=if g.isDesktopShown then VirtualDesktopGroups.Shown else VirtualDesktopGroups.Hidden }
+                groupState)
+            let decisions = VirtualDesktopGroups.decide { current=current; listed=state.listed } reads state.shared states
+            let view : VirtualDesktopGroups.StripView =
+                { current=current; presence=reads |> Map.map (fun _ r -> r.presence)
+#if DEBUG
+                  noticeTick=lastStripNoticeTick
+#else
+                  noticeTick=None
+#endif
+                }
+            // One snapshot and one sweep for both directions. The group queues
+            // are independent: the main thread never waits for their repaint.
+            for decision in decisions do
+                let shown = decision.display = VirtualDesktopGroups.Shown
+                let target = groups.[decision.key]
+                if shown && not target.isDesktopShown then
+                    target.windows.iter (fun h ->
+                        if groups |> List.filter (fun g -> g.windows.contains((=) h)) |> List.length > 1 then
+                            this.publishTabState(target, h))
+                match target with
+                | :? GroupInfo as group -> group.applyStripDesktop(shown, view)
+                | _ -> ()
+
+    member private this.scheduleDesktopPass(delayMs: int) =
+        if not desktopPassPending then
+            desktopPassPending <- true
+            ThreadHelper.cancelablePostBack delayMs (fun () ->
+                desktopPassPending <- false
+                this.desktopPass()) |> ignore
+
+    /// The per-window maps (pin, side, colours) hold the state of the tab in
+    /// the group it is being handled in. A window in several groups can be
+    /// pinned in one and not in another, so when a group comes to the front
+    /// its own state of such a window is put back in the maps - anything that
+    /// copies a tab from the maps (a drag into another group, a closed tab's
+    /// record, the save) then copies this desktop's.
+    member private this.publishTabState(g: IGroup, hwnd: IntPtr) =
+        if os.windowFromHwnd(hwnd).isWindow && g.visualOrderThreadSafe.contains((=) hwnd) then
+            windowEdges.map(fun m -> m.add hwnd (this.allowedWindowEdge (g.tabEdgeThreadSafe(hwnd))))
+        if g.isPinnedThreadSafe(hwnd) then windowPinned.set(windowPinned.value.add hwnd)
+        else windowPinned.set(windowPinned.value.remove hwnd)
+        match g.explicitTabAlign(hwnd) with
+        | Some(a) -> windowAlignment.set(windowAlignment.value.add hwnd a)
+        | None -> windowAlignment.set(windowAlignment.value.remove hwnd)
+        let colour (read: IntPtr -> Color option) (map: Cell<Map2<IntPtr, Color>>) =
+            match read hwnd with
+            | Some(c) -> map.set(map.value.add hwnd c)
+            | None -> map.set(map.value.remove hwnd)
+        colour g.getTabFillColorThreadSafe windowFillColor
+        colour g.getTabUnderlineColorThreadSafe windowUnderlineColor
+        colour g.getTabBorderColorThreadSafe windowBorderColor
+
+    /// A group for this desktop, made of the windows of another desktop's
+    /// group that are here and have no group here: its windows shown on all
+    /// desktops, confirmed by a fresh reading. It starts as a copy - the
+    /// order, each tab's state, the group's settings - and is its own group
+    /// from then on. Its windows are not moved: they are where they are.
+    member private this.makeDesktopGroup(source: IGroup, members: IntPtr list, desktop: Guid) =
+        let state = VirtualDesktopGroups.Live.snapshot()
+        let members = members |> List.filter (VirtualDesktopGroups.Live.mayDuplicate state)
+        if not members.IsEmpty then
+            let g = Services.desktop.createGroup()
+            g.desktopHome <- Some(desktop)
+            g.perGroupTabPositionValue <- source.perGroupTabPositionValue
+            g.snapTabHeightMargin <- source.snapTabHeightMargin
+            g.lockWindowPosition <- source.lockWindowPosition
+            for hwnd in members do
+                // The global maps are what a joining tab takes its state from.
+                this.publishTabState(source, hwnd)
+                let state = VirtualDesktopGroups.Live.snapshot()
+                if VirtualDesktopGroups.Live.mayDuplicate state hwnd then
+                    VirtualDesktopTrace.log (fun () -> sprintf "second group: hwnd=%X reason=fresh-shared-visit" (hwnd.ToInt64()))
+                    g.addWindowUnplaced(hwnd)
+            VirtualDesktopTrace.log (fun () ->
+                sprintf "desktop %s: group made for %s (from group %X)"
+                    ((string desktop).Substring(0, 8))
+                    (members |> List.map (fun h -> sprintf "%X" (h.ToInt64())) |> String.concat ",")
+                    (try source.hwnd.ToInt64() with _ -> 0L))
+
+    /// Complete the removal on the source thread before reserving the new
+    /// membership. Its removed notifications precede the completion callback
+    /// on the main queue, so no pass can observe two owning groups.
+    member private this.moveDesktopGroup(source: IGroup, members: IntPtr list, desktop: Guid) =
+        let state = VirtualDesktopGroups.Live.snapshot()
+        let home = source.desktopHome
+        let members = members |> List.filter (VirtualDesktopGroups.Live.mayMove state home)
+        match source with
+        | :? GroupInfo as info when not members.IsEmpty && not info.isExited && not desktopTransferPending ->
+            let position = source.perGroupTabPositionValue
+            let margin = source.snapTabHeightMargin
+            let locked = source.lockWindowPosition
+            members |> List.iter (fun h -> this.publishTabState(source, h))
+            let program = this :> IProgram
+            program.suspendTabMonitoring()
+            let suspension = tabMonitoringSuspendGeneration
+            desktopTransferPending <- true
+            info.invokeGroup <| fun () ->
+                let moved = ResizeArray<IntPtr>()
+                try
+                    let fresh = VirtualDesktopGroups.Live.snapshot()
+                    for h in members do
+                        if fresh.current = Some desktop &&
+                           VirtualDesktopGroups.Live.mayMove fresh home h && info.group.windows.contains(h) then
+                            info.group.removeWindow(h)
+                            moved.Add(h)
+                finally
+                    invoker.asyncInvoke <| fun () ->
+                        try
+                            // Finish this committed transfer, even if a later
+                            // switch occurs while the notifications are queued.
+                            if moved.Count > 0 then
+                                let target = Services.desktop.createGroup()
+                                target.desktopHome <- Some desktop
+                                target.perGroupTabPositionValue <- position
+                                target.snapTabHeightMargin <- margin
+                                target.lockWindowPosition <- locked
+                                for h in moved do
+                                    target.addWindowUnplaced(h)
+                                    VirtualDesktopTrace.log (fun () ->
+                                        sprintf "desktop transfer: hwnd=%X reason=fresh-bound-arrival" (h.ToInt64()))
+                        finally
+                            desktopTransferPending <- false
+                            if suspension = tabMonitoringSuspendGeneration then program.resumeTabMonitoring()
+        | _ -> ()
+
+    /// Ungrouped candidates wait briefly for the same background reader.
+    /// Relax uncertainty only at the new-tab entrance; existing members keep
+    /// the strict policy, including dropped tabs that might create a copy.
+    member private this.canAddFirstTab(hwnd: IntPtr) =
+        if this.isInGroup(hwnd) then this.isOnDesktopFromReader(hwnd) else
+        let elapsed = firstTabWaiters.Elapsed(hwnd, monotonic.ElapsedMilliseconds)
+        pendingDesktopWindows.Add(hwnd) |> ignore
+        let sample =
+            desktopReader.Latest |> Option.map (fun p -> p.value)
+            |> Option.filter (fun r ->
+                not r.supported ||
+                (VirtualDesktopGroups.Live.accepts r.readAt && r.registryBefore = r.registryAfter))
+        let supported = sample |> Option.map (fun r -> r.supported) |> Option.defaultValue true
+        let reading = sample |> Option.bind (fun r -> r.reads.TryFind hwnd)
+        let onCurrent = sample |> Option.bind (fun r -> r.onCurrent.TryFind hwnd) |> Option.flatten
+        let cloak = sample |> Option.bind (fun r -> r.cloak.TryFind hwnd) |> Option.flatten
+        let state = VirtualDesktopGroups.Live.snapshot()
+        let current =
+            match sample with
+            | Some r when r.readAt = state.readAt -> state.current
+            | _ -> None
+        let desktop = reading |> Option.bind (fun r -> r.desktop)
+        match VirtualDesktopReader.firstTabDecision elapsed supported current desktop onCurrent cloak reading.IsSome with
+        | Some allowed -> firstTabWaiters.Remove(hwnd); allowed
+        | None -> this.scheduleDesktopPass(15); false
+
+    member private this.isOnDesktopFromReader(hwnd: IntPtr) =
+        pendingDesktopWindows.Add(hwnd) |> ignore
+        let waitForReading () =
+            waitingDesktopWindows.Add(hwnd)
+            this.scheduleDesktopPass(15)
+            false
+        match desktopReader.Latest with
+        | Some p when not p.value.supported -> true
+        | _ ->
+            let state = VirtualDesktopGroups.Live.snapshot()
+            if VirtualDesktopGroups.Live.isHere state hwnd then true
+            elif VirtualDesktopGroups.Live.isFresh state &&
+                 (VirtualDesktopGroups.Live.read state hwnd).presence = VirtualDesktopGroups.Away then false
+            else waitForReading ()
+
+    member private this.canReadDesktops =
+        not (isDisabledCell.value || inShutdown.value || inSessionEnd.value ||
+             isRestoringTabGroups.value || needsRestoreOnStartup.value || desktopReader.IsStopped)
+
+    /// Refresh native strip visibility, then submit handles for background COM reads.
+    member this.desktopPass() =
+        if this.canReadDesktops then
+            // Retry even when the reader is hung or every publication is rejected.
+            // Keep deadlines through the scan, then discard ineligible/dead waiters.
+            let expired = firstTabWaiters.Expired(monotonic.ElapsedMilliseconds)
+            if not expired.IsEmpty then
+                this.updateAppWindows()
+                expired |> List.iter firstTabWaiters.Remove
+            this.refreshDesktopStrips(None)
+            let grouped = this.desktop.groups.list |> List.collect (fun g -> g.windows.list) |> Set.ofList
+            let windows = Set.unionMany [grouped; Set.ofSeq pendingDesktopWindows; waitingDesktopWindows.Windows; firstTabWaiters.Windows] |> Set.toList
+            if desktopReader.Request({ grouped = grouped; windows = windows }) then
+                pendingDesktopWindows.Clear()
+
+    /// Taskbar buttons per group and desktop, from the reading just accepted.
+    /// Off and with nothing written, this is one settings read. Nothing is
+    /// handed over while tab monitoring is suspended (startup restore, desktop
+    /// transfers), so the settled groups are handled together afterwards.
+    member private this.publishTaskbar(reading: (Guid option * Map<IntPtr, VirtualDesktopGroups.WindowRead> * Set<IntPtr> * Set<IntPtr>) option) =
+        try
+            let enabled = unbox<bool>(Services.settings.getValue "groupTaskbarButtons")
+            if TaskbarAppIdPolicy.shouldPass enabled (TaskbarAppId.isHolding()) this.isTabMonitoringSuspended then
+                // On-screen order: the mirror misses reorders by pin/unpin/align.
+                let groups =
+                    this.desktop.groups.list |> List.map (fun g ->
+                        g.hwnd,
+                        SavedSession.mergedOrder g.visualOrderThreadSafe.list g.visualOrder.list
+                        |> List.filter (fun h -> g.windows.contains((=) h)))
+                let current, placeOf, excluded, shared =
+                    match reading with
+                    | None -> Some Guid.Empty, (fun _ -> TaskbarAppIdPolicy.OnDesktop Guid.Empty), Set.empty, Set.empty
+                    | Some(current, reads, excluded, shared) ->
+                        let here (r: VirtualDesktopGroups.WindowRead) =
+                            match r.presence with
+                            | VirtualDesktopGroups.Here -> Some true
+                            | VirtualDesktopGroups.Away -> Some false
+                            | VirtualDesktopGroups.Unsure -> None
+                        current,
+                        (fun h ->
+                            reads |> Map.tryFind h
+                            |> Option.map (fun r -> here r, r.desktop)
+                            |> TaskbarAppIdPolicy.placeOf current),
+                        excluded, shared
+                TaskbarAppId.publish
+                    { enabled = enabled
+                      groups = groups
+                      excluded = excluded
+                      shared = shared
+                      shown = this.desktop.groups.list |> List.filter (fun g -> g.isDesktopShown) |> List.map (fun g -> g.hwnd) |> Set.ofList
+                      places = os.windowsInZorder.list |> List.map (fun w -> w.hwnd, placeOf w.hwnd) |> Map.ofList
+                      current = current }
+        with _ -> ()
+
+    /// A completed publication is consumed once, on the main thread. Keep
+    /// derived evidence and group changes here; group threads see Live only
+    /// after the registry checks and trust rules have accepted the raw read.
+    member private this.applyDesktopReading() = PerfTrace.time "applyDesktopReading" <| fun () ->
+        let mutable completedReading: VirtualDesktopReader.Reading option = None
+        let mutable firstTabsReady = false
+        try
+            match desktopReader.Latest with
+            | Some publication when publication.generation > lastDesktopGeneration ->
+                lastDesktopGeneration <- publication.generation
+                if not this.canReadDesktops then () else
+                let sample = publication.value
+                if not sample.supported then
+                    completedReading <- Some sample
+                    firstTabsReady <- firstTabWaiters.HasReading(sample)
+                    this.publishTaskbar(None)
+                else
+                let groups = this.desktop.groups.list
+                let members = groups |> List.collect (fun g -> g.windows.list) |> List.distinct
+                if Set.ofList members <> sample.request.grouped ||
+                   not (VirtualDesktopGroups.Live.accepts sample.readAt) ||
+                   sample.registryBefore <> sample.registryAfter then
+                    pendingDesktopVisits <- []
+                    this.scheduleDesktopPass(50)
+                else
+                let listed = sample.listed
+                let registryAfter = sample.registryAfter
+                let readAt = sample.readAt
+                let readMap = sample.reads
+                let desktopResults = sample.desktopResults
+                let reads = members |> List.choose (fun h -> readMap |> Map.tryFind h)
+                let wasShared = VirtualDesktopGroups.sharedOf desktopEvidence
+                let current =
+                    match VirtualDesktopGroups.trustCurrent registryAfter previousDesktop listed wasShared reads with
+                    | Some c when VirtualDesktopGroups.contradicted c readMap wasShared
+                                      (groups |> List.map (fun g -> g.desktopHome, g.windows.list)) -> None
+                    | c -> c
+                if current.IsSome then
+                    if previousDesktop <> current then pendingDesktopVisits <- []
+                    previousDesktop <- current
+                    completedReading <- Some sample
+                let d = { VirtualDesktopGroups.current = current; VirtualDesktopGroups.listed = listed }
+                if current.IsSome then
+                    desktopEvidence <- VirtualDesktopGroups.updateEvidence d desktopEvidence reads
+                let shared = VirtualDesktopGroups.positiveShared d desktopEvidence readMap
+                let several =
+                    members
+                    |> List.filter (fun h -> (groups |> List.filter (fun g -> g.windows.contains((=) h))).Length > 1)
+                    |> Set.ofList
+                VirtualDesktopGroups.Live.publish shared several current listed readAt readMap desktopResults
+                firstTabsReady <- firstTabWaiters.HasReading(sample)
+                let keyed = groups |> List.mapi (fun i g -> i, g) |> Map.ofList
+                let stateOf (i: int) (g: IGroup) : VirtualDesktopGroups.GroupState =
+                    { key = i
+                      members = g.windows.list
+                      home = g.desktopHome
+                      display = if g.isDesktopShown then VirtualDesktopGroups.Shown else VirtualDesktopGroups.Hidden }
+                let states = keyed |> Map.toList |> List.map (fun (i, g) -> stateOf i g)
+                // Repair all bound duplicates, including those never classified
+                // as shared and those restored from an older saved session.
+                let leaving = VirtualDesktopGroups.duplicateRemovals d readMap shared states
+                for (i, h) in leaving do
+                    VirtualDesktopTrace.log (fun () ->
+                        sprintf "duplicate removed: hwnd=%X group=%X reason=fresh-bound-reading" (h.ToInt64()) (try keyed.[i].hwnd.ToInt64() with _ -> 0L))
+                    keyed.[i].removeWindow(h)
+                let states =
+                    states |> List.map (fun s ->
+                        { s with members = s.members |> List.filter (fun h -> not (List.contains (s.key, h) leaving)) })
+                // A window shown on all desktops is left in one group.
+                let surplus = VirtualDesktopGroups.surplusCopies d readMap states
+                for (i, h) in surplus do
+                    VirtualDesktopTrace.log (fun () ->
+                        sprintf "surplus copy removed: hwnd=%X group=%X" (h.ToInt64()) (try keyed.[i].hwnd.ToInt64() with _ -> 0L))
+                    keyed.[i].removeWindow(h)
+                let states =
+                    states |> List.map (fun s ->
+                        { s with members = s.members |> List.filter (fun h -> not (List.contains (s.key, h) surplus)) })
+                let decisions = VirtualDesktopGroups.decide d readMap shared states
+                for dec in decisions do
+                    let g = keyed.[dec.key]
+                    if g.desktopHome <> dec.home then g.desktopHome <- dec.home
+                    let shown = (dec.display = VirtualDesktopGroups.Shown)
+                    if shown && not g.isDesktopShown then
+                        g.windows.iter (fun h -> if several.Contains h then this.publishTabState(g, h))
+                this.refreshDesktopStrips(None)
+                this.publishTaskbar(Some(current, readMap, Set.difference several shared, shared))
+                // Groups for the windows that are here and have none here.
+                match current with
+                | Some c when not this.isTabMonitoringSuspended && not this.desktop.isDragging &&
+                              not (TabStripDecorator.isShellSwitcherOpen(os)) ->
+                    let displayOf i =
+                        match decisions |> List.tryFind (fun dec -> dec.key = i) with
+                        | Some(dec) -> dec.display
+                        | None -> VirtualDesktopGroups.Shown
+                    let withDisplay = states |> List.map (fun s -> s, displayOf s.key)
+                    let eligible h =
+                        not (isDroppedAndAwaitingGrouping.value.contains h) &&
+                        (try this.isTabbableWindow(os.windowFromHwnd(h)) with _ -> false)
+                    let state = VirtualDesktopGroups.Live.snapshot()
+                    let moves =
+                        if VirtualDesktopGroups.keepAway then []
+                        else VirtualDesktopGroups.Live.movesNow state withDisplay eligible
+                    moves |> List.tryHead |> Option.iter (fun move ->
+                        this.moveDesktopGroup(keyed.[move.source], move.members, c))
+                    let visits =
+                        if VirtualDesktopGroups.keepAway then []
+                        else VirtualDesktopGroups.Live.visitsNow state withDisplay eligible
+                    if VirtualDesktopGroups.sameVisits pendingDesktopVisits visits then
+                        pendingDesktopVisits <- []
+                        for v in visits do
+                            this.makeDesktopGroup(keyed.[v.source], v.members, c)
+                    else
+                        pendingDesktopVisits <- visits
+                        // The second pass a visit waits for.
+                        if not visits.IsEmpty then this.scheduleDesktopPass(150)
+                | _ -> pendingDesktopVisits <- []
+                let trace =
+                    sprintf "current=%s shared=%s groups=%s"
+                        (match current with Some c -> (string c).Substring(0, 8) | None -> "?")
+                        (shared |> Seq.map (fun h -> sprintf "%X" (h.ToInt64())) |> String.concat ",")
+                        (decisions
+                         |> List.map (fun dec ->
+                            sprintf "%X:%s@%s" (try keyed.[dec.key].hwnd.ToInt64() with _ -> 0L)
+                                (if dec.display = VirtualDesktopGroups.Shown then "shown" else "hidden")
+                                (match dec.home with Some h -> (string h).Substring(0, 8) | None -> "?"))
+                         |> String.concat " ")
+                if trace <> lastDesktopTrace then
+                    lastDesktopTrace <- trace
+                    VirtualDesktopTrace.log (fun () -> trace)
+            | _ -> ()
+        with ex ->
+            VirtualDesktopTrace.log (fun () -> sprintf "desktop pass failed: %s" ex.Message)
+        // Reading completion, rather than another shell event or the window
+        // scan timer, resumes candidates that were waiting for their first read.
+        let strictWaitersReady =
+            match completedReading with
+            | Some sample when this.canReadDesktops ->
+                waitingDesktopWindows.TakeReady(sample, fun hwnd -> this.isInGroup(hwnd))
+            | _ -> false
+        // First-tab completion does not require a known current desktop and
+        // does not join the strict waiters' immediate re-request loop below.
+        if this.canReadDesktops && (strictWaitersReady || firstTabsReady) then
+            this.updateAppWindows()
+        // A waiter may have arrived after the in-flight request was captured.
+        // Submit the remaining waiters now instead of waiting for the timer.
+        if this.canReadDesktops && not waitingDesktopWindows.Windows.IsEmpty then
+            this.scheduleDesktopPass(15)
+
+    member this.notifyNewVersion = notifyNewVersionEvt.Publish
+
+    member this.refresh() = this.receive(Timer)
+
+    /// Drops the closed-tab records of applications that tabbing is now off
+    /// for. Switching an application off is not the same as closing its tabs:
+    /// it is no longer an application with tabs at all, and a record left
+    /// behind would hand the old tab name, colours, pin and position back the
+    /// day the user switches it on again. Every record is looked at rather
+    /// than only the application just switched, so anything left by an earlier
+    /// change goes too.
+    member this.forgetClosedTabsOfUntabbedApps() =
+        let stillTabbed (info: ClosedTabInfo) =
+            // A path that cannot be judged is kept: losing a record is worse
+            // than keeping one a moment too long.
+            try Services.filter.getIsTabbingEnabledForProcess info.exePath with _ -> true
+        if closedTabCache.value |> List.exists (stillTabbed >> not) then
+            let dropped = closedTabCache.value |> List.filter (stillTabbed >> not)
+            RestoreTrace.log (fun () ->
+                sprintf "forget %d closed tab(s) of applications tabbing is off for: %s"
+                        dropped.Length
+                        (dropped |> List.map (fun e -> e.exePath) |> List.distinct |> String.concat ", "))
+            closedTabCache.map(List.filter stillTabbed)
+            // The file is written from this cache, so the records only leave
+            // it for good once it is saved.
+            this.saveTabGroupsToSettings()
+
+    // Save tab group configuration to settings file for restoration on next
+    // startup.
+    //
+    // WHAT goes into the file - which groups, in which order, with the windows
+    // that have not opened yet spliced back in at the index they held - is
+    // decided in SavedSession, and this reads the values out of the desktop
+    // and the global per-window maps to hand over. The split is not tidiness.
+    // That composition is where a saved order can be taken from the wrong list
+    // or an entry aged out by the wrong rule, and while it stood in the middle
+    // of this method it could not be run at all without a screen full of
+    // windows; over there a script drives it and reads back what was written.
+
+    // One saved window that has not opened yet, as it goes back into the
+    // settings file.
+    member private this.savedTabOfSeed(e: ClosedTabInfo) =
+        { SavedTabState.ofHwnd e.closedHwnd with
+            exePath = Some(e.exePath)
+            windowTitle = Some(e.windowTitle)
+            rect = e.savedRect
+            renamedTabName = e.renamedTabName
+            isPinned = e.isPinned
+            fillColor = e.fillColor |> Option.map colorToRRGGBBAA
+            underlineColor = e.underlineColor |> Option.map colorToRRGGBBAA
+            borderColor = e.borderColor |> Option.map colorToRRGGBBAA
+            align = e.tabAlign |> Option.map savedAlignOfTabAlign
+            edge = TabEdges.savedOfEdge e.tabEdge
+            seedSince = Some(e.seedSince |> Option.defaultValue DateTime.Now)
+            // Read back as a tab the user closed, not as a window still
+            // waiting to start: only an exact title match may claim one of
+            // these. Without the mark they would return as seeds and become
+            // eligible for the match by application alone, and a newly
+            // opened browser window could be pulled into a group the user
+            // had closed a week earlier.
+            closedByUser = e.isRestoreSeed.not }
+
+    member private this.allowedWindowEdge(edge) =
+        let allowed = try TabEdgeSettings.allowedOf settingsManager.settingsJsonReadOnly with _ -> TabEdges.topOnly
+        TabEdges.fallback allowed edge
+
+    member private this.windowEdgeInGroup(g: IGroup, hwnd: IntPtr) =
+        let edge =
+            if (VirtualDesktopGroups.Live.shared()).Contains hwnd &&
+               (this.desktop.groups.list |> List.filter (fun group -> group.windows.contains((=) hwnd)) |> List.length) > 1 then
+                try g.tabEdgeThreadSafe(hwnd) with _ -> TabEdges.Edge.Top
+            else windowEdges.value.tryFind(hwnd) |> Option.defaultValue TabEdges.Edge.Top
+        this.allowedWindowEdge edge
+
+    // One live window as the file records it, and None for a handle that is no
+    // longer a window - the one thing here that cannot be decided without
+    // asking Windows, which is why the save takes this as a function.
+    member private this.savedTabOfWindow allowed (hwnd: IntPtr) =
+        let window = os.windowFromHwnd(hwnd)
+        if window.isWindow.not then None else
+        // The window's identity goes in as well as its handle. A handle is
+        // only valid within one OS session, so after a Windows restart it
+        // matches nothing (and can even collide with an unrelated new window
+        // that reuses the value) - the exe path + normalized title are what
+        // the restore falls back to, and what it uses to distrust a reused
+        // handle.
+        let exePath = (try window.pid.processPath with _ -> "")
+        let title = (try window.text with _ -> "")
+        // The rectangle tells apart two windows of the same application with
+        // the same title (two terminals both called "Claude1"): exe + title
+        // alone assigned their per-window state first-come-first-served, which
+        // put one window's rename onto the other. Most windows reopen where
+        // they were, so at restore the saved rectangles pick the right twins.
+        let rect = this.restoreRectangle hwnd
+        // Written through the same record a not-yet-started window is written
+        // through (savedTabOfSeed), so the two cannot disagree about a key or
+        // a format.
+        Some { SavedTabState.ofHwnd hwnd with
+                 exePath = (if exePath <> "" then Some(exePath) else None)
+                 windowTitle = (if title <> "" then Some(normalizeClosedTabTitle title) else None)
+                 rect = rect
+                 renamedTabName = windowNameOverride.value.tryFind(hwnd) |> Option.bind id
+                 edge = TabEdges.savedOfEdge (TabEdges.fallback allowed (windowEdges.value.tryFind(hwnd) |> Option.defaultValue TabEdges.Edge.Top))
+                 isPinned = windowPinned.value.contains(hwnd)
+                 fillColor = windowFillColor.value.tryFind(hwnd) |> Option.map colorToRRGGBBAA
+                 underlineColor = windowUnderlineColor.value.tryFind(hwnd) |> Option.map colorToRRGGBBAA
+                 borderColor = windowBorderColor.value.tryFind(hwnd) |> Option.map colorToRRGGBBAA
+                 // From the global map, not from the strip. The absence of a
+                 // value is meaningful: it says "whichever side this group is
+                 // set to", so writing the strip's effective alignment instead
+                 // would nail every tab to a side and the group's own
+                 // tabPosition setting would stop moving them. What must not
+                 // happen is a value going missing from the map, and that is
+                 // dealt with where it was lost - at the restore
+                 // (SavedSession.plan) - not by papering over it here.
+                 align = windowAlignment.value.tryFind(hwnd) |> Option.map savedAlignOfTabAlign }
+
+    member this.saveTabGroupsToSettings() =
+        // Nothing is grouped while WindowTabs is disabled, so a save here would
+        // replace the record of the user's groups with an empty desktop - and
+        // that record is all that is left to rebuild them from after a restart.
+        // The last snapshot from before the switch stays frozen instead.
+        if isDisabledCell.value then () else
+        // Likewise until the startup restore has read the saved groups. The
+        // periodic timer was trusted to fire after it, 10 s from start; on a
+        // loaded machine the hidden settings preload held the message loop
+        // longer than that, the first tick ran before the restore, and saved
+        // the still-empty desktop over the record it was about to read.
+        if needsRestoreOnStartup.value then () else
+        try
+            let json = settingsManager.settingsJson
+            let allowed = try TabEdgeSettings.allowedOf json with _ -> TabEdges.topOnly
+            let saveNow = DateTime.Now
+            this.refreshAmbiguousEntries()
+            // Saved windows whose application has not started yet are held in
+            // memory as restore seeds, and nothing else remembers them. The
+            // periodic save fires 10 s after boot - long before applications
+            // that are not in Startup come up - so without writing the seeds
+            // back it would replace the file's record of those groups with
+            // whatever happens to be running, which right after a restart is
+            // nothing. A WindowTabs restart, or a second reboot, would then
+            // have lost the groups for good.
+            let pending =
+                closedTabCache.value
+                |> List.map (fun e ->
+                    e, { SavedSession.tab = this.savedTabOfSeed e
+                         SavedSession.rank = e.tabIndex
+                         SavedSession.isRestoreSeed = e.isRestoreSeed })
+            let infoOf = System.Collections.Generic.Dictionary<IntPtr, ClosedTabInfo>()
+            pending |> List.iter (fun (info, p) -> infoOf.[p.tab.hwnd] <- info)
+            let pendingSeeds =
+                SavedSession.seedsToSave saveNow seedMaxAgeDays closedTabMaxAgeDays
+                                         closedTabSaveLimit (pending |> List.map snd)
+            let claimedSeeds = System.Collections.Generic.HashSet<IntPtr>()
+            // A window in the groups of several virtual desktops because it is
+            // shown on all of them is written into each, marked, with that
+            // group's pin, so that the restore puts it back into each rather
+            // than refusing it as an identity claimed by two groups. One that
+            // is in two groups only because it was moved and followed is
+            // written once (savedMembers).
+            let groupsNow = this.desktop.groups.list
+            let keeps, marked =
+                this.savedMembers (groupsNow |> List.map (fun gi -> gi, gi.visualOrderThreadSafe.list @ gi.visualOrder.list))
+            let stateIn (gi: IGroup) hwnd =
+                this.savedTabOfWindow allowed hwnd
+                |> Option.map (fun t ->
+                    if marked.Contains hwnd then
+                        { t with onAllDesktops = true; isPinned = gi.isPinnedThreadSafe(hwnd)
+                                 edge = TabEdges.savedOfEdge (TabEdges.fallback allowed (try gi.tabEdgeThreadSafe(hwnd) with _ -> TabEdges.Edge.Top)) }
+                    else t)
+            let liveGroups =
+                groupsNow
+                |> List.mapi (fun i gi ->
+                    // Seeds of a group that has partly reassembled here are
+                    // saved with it. Which group an entry belongs to is a
+                    // question about the live desktop, so it is answered here
+                    // and the answer handed over.
+                    let seeds =
+                        pendingSeeds
+                        |> List.filter (fun p ->
+                            claimedSeeds.Contains(p.tab.hwnd).not &&
+                            (match this.findGroupForClosedInfo infoOf.[p.tab.hwnd] with
+                             | Some(g) when obj.ReferenceEquals(g, gi) ->
+                                claimedSeeds.Add(p.tab.hwnd) |> ignore
+                                true
+                             | _ -> false))
+                    // Both orders, because neither is complete on its own: the
+                    // strip snapshot is the real on-screen order but does not
+                    // yet hold a window added moments ago, and the mirror goes
+                    // stale after a pin/unpin normalization.
+                    let group : SavedSession.GroupToSave =
+                        { stripOrder = gi.visualOrderThreadSafe.list |> List.filter (keeps i)
+                          mirrorOrder = gi.visualOrder.list |> List.filter (keeps i)
+                          seeds = seeds
+                          tabPosition = Some(gi.perGroupTabPositionValue)
+                          snapMargin = Some(gi.snapTabHeightMargin)
+                          lockPosition = Some(gi.lockWindowPosition)
+                          desktop = gi.desktopHome |> Option.map VirtualDesktopGroups.formatDesktop }
+                    group, stateIn gi)
+            // A group where nothing has opened yet keeps a group of its own,
+            // held together by the sentinel token it was seeded under. Tabs
+            // the user closed are not kept this way: emptying a group is the
+            // plainest way of saying it is finished with, so once its last tab
+            // is closed the group goes rather than waiting to be resurrected
+            // by whichever of its windows is opened next.
+            pendingSeeds |> List.iter (fun p ->
+                if not p.isRestoreSeed && not (claimedSeeds.Contains p.tab.hwnd) then
+                    let info = infoOf.[p.tab.hwnd]
+                    this.traceRestoreRetention(p.tab.hwnd, groupRefHandle info.groupRef, p.rank, "closed-without-live-group"))
+            let waitingGroups =
+                pendingSeeds
+                |> List.filter (fun p -> claimedSeeds.Contains(p.tab.hwnd).not && p.isRestoreSeed)
+                // By the reference itself, not the handle inside it: grouping
+                // on the bare number would put a token and a strip handle that
+                // happened to share it into one group. The filter above admits
+                // only saved entries today, so this changes nothing - it keeps
+                // the guarantee in the type rather than in the filter above it.
+                |> List.groupBy (fun p -> infoOf.[p.tab.hwnd].groupRef)
+                |> List.choose (fun (gref, entries) ->
+                    // Only a saved group is written this way, and only a saved
+                    // group has settings held against its token.
+                    match gref with
+                    | LiveStrip(_) -> None
+                    | SavedToken(token) ->
+                        // The group's own settings go with it. Read from the
+                        // live group above, they have no live group to be read
+                        // from here, and a second restart would have lost them.
+                        let pos, margin, locked =
+                            match seededGroupSettings.value.tryFind(token) with
+                            | Some(p, m, l) -> p, m, l
+                            | None -> None, None, None
+                        let group : SavedSession.GroupToSave =
+                            { stripOrder = []
+                              mirrorOrder = []
+                              seeds = entries
+                              tabPosition = pos
+                              snapMargin = margin
+                              lockPosition = locked
+                              desktop = seededGroupDesktops.value.tryFind(token) }
+                        Some(group))
+            json.addOrUpdate("SavedTabGroupsForRestart",
+                             SavedSession.writeEach
+                                 (liveGroups @ (waitingGroups |> List.map (fun g -> g, this.savedTabOfWindow allowed))))
+            settingsManager.settingsJson <- json
+        with
+        | _ -> ()
+
+    // Restore tab groups from settings file on startup.
+    //
+    // WHICH saved tab comes back as which live window, and what may be put on
+    // it once it is there, is decided in SavedSession.plan. This gathers the
+    // windows that are on screen and then carries the plan out. Same reason as
+    // the save: the matching is the part that goes wrong invisibly - a window
+    // takes its twin's name, or comes back without the alignment it was saved
+    // with and is drawn at the wrong end of the strip - and while it was
+    // written in the middle of this method there was no way to run it at all
+    // without a desktop full of windows.
+    //
+    // Includes windows on other virtual desktops (cloaked windows) for full
+    // restoration.
+    member this.restoreTabGroupsFromSettings() =
+#if DEBUG
+        let mutable reportRestore = fun () ->
+            RestoreTrace.log (fun () -> "restore-summary groups=0 handle=0 title=0 held=0 dropped=0 stage=completed")
+        let completionGate = obj()
+        // The main pass owns one completion; each queued insertion owns another.
+        let mutable pendingCompletions = 1
+        let beginPlacement () = lock completionGate (fun () -> pendingCompletions <- pendingCompletions + 1)
+        let completePlacement update =
+            let finished = lock completionGate (fun () ->
+                update()
+                pendingCompletions <- pendingCompletions - 1
+                pendingCompletions = 0)
+            // No logger thunk takes the completion gate or reads mutable groups.
+            if finished then reportRestore()
+#endif
+        try
+            let json = settingsManager.settingsJsonReadOnly
+            match json.getValueCI("SavedTabGroupsForRestart") with
+            | Some(:? JArray as groupsArray) when groupsArray.Count > 0 ->
+                isRestoringTabGroups.set(true)
+
+                // Get all current windows including those on other virtual desktops (cloaked)
+                // We use isAppWindowStyle instead of isTabbableWindow to include cloaked windows
+                let currentWindows = os.windowsInZorder.where(fun w ->
+                    w.pid.isCurrentProcess.not &&
+                    w.isWindow &&
+                    this.isAppWindowStyle(w) &&
+                    Services.filter.getIsTabbingEnabledForWindow(w.hwnd))
+
+                // The identity of every live window, for the two things a
+                // handle alone cannot do: reject a REUSED handle (after a
+                // reboot the OS hands the same values to unrelated windows)
+                // and find a window again when every handle has changed (the
+                // reboot case). The centre of the rectangle is what tells two
+                // windows apart when even the identity cannot.
+                let live =
+                    currentWindows.list
+                    |> List.map (fun w ->
+                        let position = this.restorePosition w.hwnd
+                        let result : SavedSession.LiveWindow = {
+                            handle = w.hwnd
+                            exePath = (try w.pid.processPath with _ -> "")
+                            title = (try normalizeClosedTabTitle w.text with _ -> "")
+                            center = position.center
+                            positionTrusted = position.center.IsSome
+                            scale = position.scale
+                            desktop = position.desktop }
+                        result)
+
+                let savedGroups = SavedSession.read groupsArray
+                let tracePosition hwnd gi rank decision =
+                    let token = savedGroups.[gi].windows |> List.tryHead |> Option.map (fun t -> t.hwnd) |> Option.defaultValue IntPtr.Zero
+                    this.traceRestorePosition(hwnd, token, rank, decision)
+                let planned =
+                    SavedSession.planWithPairTrace
+                        (fun hwnd gi rank distance count ->
+                            this.traceRestorePair(savedGroups.[gi].windows.[rank].hwnd, hwnd, rank, distance, count))
+                        tracePosition DateTime.Now seedMaxAgeDays closedTabMaxAgeDays savedGroups live
+
+#if DEBUG
+                let dispatched = Collections.Generic.HashSet<int * int>()
+                let rejected = Collections.Generic.Dictionary<int * int, string>()
+                reportRestore <- fun () ->
+                    let mutable byHandle, byTitle, held, dropped = 0, 0, 0, 0
+                    let handles xs = xs |> List.map (fun (h: IntPtr) -> sprintf "%X" (h.ToInt64())) |> String.concat ","
+                    for gi,g in List.indexed planned do
+                        for ti,t in List.indexed g.tabs do
+                            if dispatched.Contains((gi,ti)) then
+                                if t.live = Some t.saved.hwnd && not t.saved.closedByUser then byHandle <- byHandle + 1
+                                else byTitle <- byTitle + 1
+                            else
+                                let reason =
+                                    match rejected.TryGetValue((gi,ti)) with
+                                    | true, why -> why
+                                    | _ ->
+                                        match t.outcome with
+                                        | SavedSession.Ambiguous -> "ambiguity-held"
+                                        | SavedSession.Waiting -> "waiting-no-unclaimed-candidate"
+                                        | SavedSession.Expired -> "expired"
+                                        | SavedSession.Unusable -> "unusable-identity"
+                                        | SavedSession.Matched -> "dispatch-interrupted"
+                                if not (rejected.ContainsKey((gi,ti))) &&
+                                   (t.outcome = SavedSession.Waiting || t.outcome = SavedSession.Ambiguous) then held <- held + 1
+                                else dropped <- dropped + 1
+                                let key = SavedSession.identityOf t.saved
+                                let competitors =
+                                    planned |> List.mapi (fun gj other ->
+                                        other.tabs |> List.choose (fun x ->
+                                            if key.IsSome && SavedSession.identityOf x.saved = key &&
+                                               (gj <> gi || x.rank <> t.rank) &&
+                                               x.outcome <> SavedSession.Expired then
+                                                Some(sprintf "%d:%d:%X:%A" gj x.rank (x.saved.hwnd.ToInt64()) x.outcome)
+                                            else None)) |> List.concat |> String.concat ","
+                                let candidates =
+                                    live |> List.filter (fun w -> key = Some(SavedSession.identityKey w.exePath w.title))
+                                         |> List.map (fun w -> w.handle) |> handles
+                                let handleLive, sameExe =
+                                    try
+                                        let w = os.windowFromHwnd(t.saved.hwnd)
+                                        let exists = w.isWindow
+                                        exists, (exists && (t.saved.exePath |> Option.exists (fun exe -> exe <> "" && AppPath.sameApp exe w.pid.processPath)))
+                                    with _ -> false, false
+                                let eligible = live |> List.exists (fun w -> w.handle = t.saved.hwnd)
+                                let exe = t.saved.exePath |> Option.map IO.Path.GetFileName |> Option.defaultValue ""
+                                let title = RestoreTrace.titleIdentity (t.saved.windowTitle |> Option.defaultValue "")
+                                let peers = g.tabs |> List.filter (fun x -> x.rank <> t.rank) |> List.map (fun x -> x.saved.hwnd) |> handles
+                                RestoreTrace.log (fun () ->
+                                    sprintf "restore-miss group=%d rank=%d hwnd=%X exe=%s %s peers=%s reason=%s records=%s candidates=%s handleLive=%b sameExe=%b eligible=%b"
+                                        gi t.rank (t.saved.hwnd.ToInt64()) exe title peers reason competitors candidates handleLive sameExe eligible)
+                    RestoreTrace.log (fun () ->
+                        sprintf "restore-summary groups=%d handle=%d title=%d held=%d dropped=%d stage=completed"
+                            planned.Length byHandle byTitle held dropped)
+#endif
+
+                // Tab groups per virtual desktop. Each group goes back to its
+                // desktop (a desktop Explorer no longer lists belongs to
+                // nothing, and the group is filed again where its windows
+                // are). A window saved in several groups - it was shown on all
+                // desktops - goes back into each only if it still is; one that
+                // now lives on one desktop goes into that desktop's group
+                // (VirtualDesktopGroups.restoreTargets).
+                let listed =
+                    match VirtualDesktopHelper.TryReadDesktopIds() with
+                    | null -> None
+                    | ids -> Some(List.ofArray ids)
+                let homes =
+                    planned |> List.map (fun g -> VirtualDesktopGroups.savedHome listed g.desktop)
+                let registryCurrent =
+                    let mutable id = Guid.Empty
+                    if VirtualDesktopHelper.TryReadCurrentDesktopId(&id) then Some(id) else None
+                let desktops = { VirtualDesktopGroups.current = registryCurrent; VirtualDesktopGroups.listed = listed }
+                let savedIn =
+                    planned
+                    |> List.mapi (fun gi g -> g.tabs |> List.choose (fun t -> t.live |> Option.map (fun h -> h, (gi, homes.[gi]))))
+                    |> List.concat
+                    |> List.groupBy fst
+                    |> List.map (fun (h, xs) -> h, List.map snd xs)
+                    |> Map.ofList
+                let restoreTargets =
+                    savedIn |> Map.map (fun hwnd places ->
+                        let readAt = DateTime.UtcNow
+                        let w = os.windowFromHwnd(hwnd)
+                        let read =
+                            { VirtualDesktopGroups.hwnd = hwnd
+                              VirtualDesktopGroups.presence = (try w.desktopPresence with _ -> VirtualDesktopGroups.Unsure)
+                              VirtualDesktopGroups.desktop = (try w.desktopIdOrNone with _ -> None) }
+                        let mutable after = Guid.Empty
+                        let stable =
+                            VirtualDesktopHelper.TryReadCurrentDesktopId(&after) &&
+                            Some after = registryCurrent && VirtualDesktopGroups.Live.accepts readAt
+                        let d = if stable then desktops else { desktops with current = None; listed = None }
+                        VirtualDesktopGroups.restoreTargets d (Some read) places, readAt)
+                let goesInto gi hwnd =
+                    match restoreTargets.TryFind hwnd with
+                    | Some(targets, readAt) ->
+                        List.contains gi targets &&
+                        (not (this.isInGroup(hwnd)) || VirtualDesktopGroups.Live.accepts readAt)
+                    | None -> false
+
+                // The edges tabs may use now. A tab saved on an edge that is
+                // no longer allowed comes back after the tabs already on the
+                // edge it moves to (1-5, TabEdges.residentsFirst): the matched
+                // windows join in that order, and the windows still to come
+                // are placed against an order that says so.
+                let restoreAllowed = try TabEdgeSettings.allowedOf Services.settings.root with _ -> TabEdges.topOnly
+
+                for (gi, g) in List.indexed planned do
+                    let matched =
+                        g.tabs
+                        |> List.filter (fun t -> t.live.IsSome && goesInto gi t.live.Value)
+                        |> TabEdges.residentsFirst restoreAllowed (fun t -> TabEdges.edgeOfSaved t.applied.edge)
+#if DEBUG
+                    for ti,t in List.indexed g.tabs do
+                        if t.live.IsSome && not (matched |> List.exists (fun x -> x.rank = t.rank)) then
+                            lock completionGate (fun () -> rejected.[(gi,ti)] <- "desktop-target-or-stale-read")
+#endif
+                    matched |> List.iteri (fun i t ->
+                        RestoreTrace.log (fun () -> sprintf "  matched[%d] hwnd=%X saved=%X"
+                                                            i (t.live.Value.ToInt64()) (t.saved.hwnd.ToInt64())))
+                    // Create the group with the matched windows, in saved order.
+                    let createdGroup =
+                        if matched.IsEmpty then None else
+                        let group = Services.desktop.createGroup()
+                        // A saved group default is also known before any tab joins.
+                        g.tabPosition |> Option.iter (fun pos -> group.perGroupTabPositionValue <- pos)
+                        matched |> List.iter (fun t ->
+                            let hwnd = t.live.Value
+                            if this.isInGroup(hwnd) then
+                                VirtualDesktopTrace.log (fun () -> sprintf "second group: hwnd=%X reason=stable-shared-restore" (hwnd.ToInt64()))
+                            claimedWindows.map(Set.add hwnd)
+                            // What the plan allows onto this window: always
+                            // the alignment and the pin, the name and the
+                            // colours only when they cannot have belonged to
+                            // another window.
+                            let e = t.applied
+                            // Restore to global maps BEFORE addWindow to avoid race condition
+                            // (addWindow is async on group thread, which reads from globals)
+                            e.renamedTabName |> Option.iter (fun name ->
+                                windowNameOverride.set(windowNameOverride.value.add hwnd (Some(name))))
+                            e.fillColor |> Option.bind parseColorRRGGBBAA
+                            |> Option.iter (fun c -> windowFillColor.set(windowFillColor.value.add hwnd c))
+                            e.underlineColor |> Option.bind parseColorRRGGBBAA
+                            |> Option.iter (fun c -> windowUnderlineColor.set(windowUnderlineColor.value.add hwnd c))
+                            e.borderColor |> Option.bind parseColorRRGGBBAA
+                            |> Option.iter (fun c -> windowBorderColor.set(windowBorderColor.value.add hwnd c))
+                            if e.isPinned then
+                                windowPinned.set(windowPinned.value.add hwnd)
+                            windowEdges.map(fun m -> m.add hwnd (this.allowedWindowEdge (TabEdges.edgeOfSaved e.edge)))
+                            e.align |> Option.iter (fun a ->
+                                windowAlignmentEdges.[hwnd] <- TabEdges.edgeOfSaved e.edge
+                                windowAlignment.set(windowAlignment.value.add hwnd (tabAlignOfSavedAlign a)))
+                            // Identity-matched window: remember new -> old
+                            // handle, so a sibling restored later can find
+                            // this tab in its close-time order snapshot
+                            // (the order arithmetic resolves through this map).
+                            if hwnd <> t.saved.hwnd then
+                                restoredFromMap.[hwnd] <- t.saved.hwnd
+#if DEBUG
+                            beginPlacement()
+                            let mutable completed = 0
+                            let finish placed reason =
+                                if Threading.Interlocked.Exchange(&completed, 1) = 0 then
+                                    completePlacement (fun () ->
+                                        if placed then dispatched.Add((gi,t.rank)) |> ignore
+                                        else rejected.[(gi,t.rank)] <- reason)
+#endif
+                            try
+                                match group :> obj with
+                                | :? GroupInfo as groupInfo ->
+                                    groupInfo.addWindowWith(hwnd, fun wg ->
+                                        try
+                                            wg.addWindow(hwnd, false, ?alignment=(e.align |> Option.map tabAlignOfSavedAlign),
+                                                         pinned=e.isPinned, edge=TabEdges.edgeOfSaved e.edge)
+#if DEBUG
+                                            let placed = wg.windows.contains(hwnd)
+                                            RestoreTrace.log (fun () -> sprintf "restore-placement group=%d rank=%d hwnd=%X placed=%b" gi t.rank (hwnd.ToInt64()) placed)
+                                            finish placed "group-add-rejected"
+#endif
+                                        with ex ->
+#if DEBUG
+                                            finish false ("group-add-error-" + ex.GetType().Name)
+#endif
+                                            reraise())
+                                | _ ->
+                                    group.addWindow(hwnd, false)
+#if DEBUG
+                                    finish false "group-add-unverified"
+#endif
+                            with ex ->
+#if DEBUG
+                                finish false ("group-dispatch-error-" + ex.GetType().Name)
+#endif
+                                reraise())
+                        g.snapMargin |> Option.iter (fun v -> group.snapTabHeightMargin <- v)
+                        g.lockPosition |> Option.iter (fun v -> group.lockWindowPosition <- v)
+                        group.desktopHome <- homes.[gi]
+                        Some(group)
+
+                    RestoreTrace.log (fun () -> sprintf "group token=%X created=%b order=%s"
+                                                        (g.token.ToInt64())
+                                                        (createdGroup.IsSome)
+                                                        (g.savedOrder |> List.map (fun h -> sprintf "%X" (h.ToInt64())) |> String.concat ","))
+                    if g.token <> IntPtr.Zero then
+                        seededGroupSettings.map(fun m -> m.add g.token (g.tabPosition, g.snapMargin, g.lockPosition))
+                        homes.[gi] |> Option.iter (fun h ->
+                            seededGroupDesktops.map(fun m -> m.add g.token (VirtualDesktopGroups.formatDesktop h)))
+                        (match createdGroup with
+                         | Some(grp) -> seededGroupMap.map(fun m -> m.add g.token grp)
+                         | None -> ())
+                        // Boot-order independence: windows of this group that
+                        // are not open yet (their application starts after
+                        // WindowTabs) are seeded into the closed-tab cache, so
+                        // the moment such a window appears the closed-tab
+                        // restore machinery puts it into its group - whichever
+                        // of WindowTabs and the application won the boot race.
+                        // closedHwnd carries the old (dead) handle purely as a
+                        // unique token; the order snapshot is the saved order
+                        // in old handles, which the arrival resolves through
+                        // restoredFromMap.
+                        let savedEdges = g.tabs |> List.map (fun t -> t.saved.hwnd, TabEdges.edgeOfSaved t.saved.edge) |> Map.ofList
+                        let restoreOrder =
+                            g.savedOrder
+                            |> TabEdges.residentsFirst restoreAllowed (fun h ->
+                                Map.tryFind h savedEdges |> Option.defaultValue TabEdges.Edge.Top)
+                        g.tabs |> List.iter (fun t ->
+                            let e = t.saved
+                            let byUser = e.closedByUser
+                            let title = e.windowTitle |> Option.defaultValue ""
+                            match t.outcome with
+                            | SavedSession.Expired ->
+                                // Not seeded and so not written back either:
+                                // the entry leaves the settings file on the
+                                // next save.
+                                RestoreTrace.log (fun () -> sprintf "  %s rank=%d token=%X DROPPED expired"
+                                                                    (if byUser then "closed" else "seed") t.rank (e.hwnd.ToInt64()))
+                            | SavedSession.Unusable ->
+                                this.traceRestoreRetention(e.hwnd, g.token, t.rank, "unusable-identity")
+                            | SavedSession.Ambiguous
+                            | SavedSession.Waiting ->
+                                if t.outcome = SavedSession.Ambiguous then
+                                    this.traceRestoreRetention(e.hwnd, g.token, t.rank, "ambiguity-held")
+                                if closedTabCache.value |> List.exists (fun c -> c.closedHwnd = e.hwnd) |> not then
+                                    // Through the same record the save writes
+                                    // the entry back from, so that what is put
+                                    // into the cache here and what leaves it at
+                                    // the next save are one description and not
+                                    // two that have to be kept in step by hand.
+                                    let p = SavedSession.pendingOfPlanned t
+                                    let info = {
+                                        exePath = p.tab.exePath |> Option.defaultValue ""
+                                        windowTitle = title
+                                        // Everything the file held, whether or
+                                        // not it may be applied. What is
+                                        // dropped here is dropped for good: the
+                                        // entry is written back from these
+                                        // fields at the next save, so an entry
+                                        // created without its alignment takes
+                                        // the alignment out of the settings
+                                        // file even if its window never opens
+                                        // at all. Whether the name and the
+                                        // colours may be put on the window that
+                                        // claims it is carried separately, in
+                                        // stateIsCertain.
+                                        renamedTabName = p.tab.renamedTabName
+                                        isPinned = p.tab.isPinned
+                                        fillColor = p.tab.fillColor |> Option.bind parseColorRRGGBBAA
+                                        underlineColor = p.tab.underlineColor |> Option.bind parseColorRRGGBBAA
+                                        borderColor = p.tab.borderColor |> Option.bind parseColorRRGGBBAA
+                                        tabAlign = p.tab.align |> Option.map tabAlignOfSavedAlign
+                                        tabEdge = TabEdges.edgeOfSaved p.tab.edge
+                                        groupRef = SavedToken(g.token)
+                                        tabIndex = p.rank
+                                        closedHwnd = p.tab.hwnd
+                                        closedAt = DateTime.Now
+                                        isRestoreSeed = p.isRestoreSeed
+                                        isAmbiguous = t.outcome = SavedSession.Ambiguous
+                                        // A seed that outlives a WindowTabs
+                                        // restart has to carry its position, or
+                                        // the twin disambiguation and the
+                                        // title-less fallback lose their
+                                        // reference point.
+                                        savedRect = p.tab.rect
+                                        savedGroupIndex = Some gi
+                                        savedDesktop = RestorePosition.desktop g.desktop
+                                        seedSince = p.tab.seedSince
+                                        orderSnapshot = restoreOrder
+                                        stateIsCertain = t.stateIsCertain
+                                    }
+                                    RestoreTrace.log (fun () -> sprintf "  %s rank=%d token=%X unique=%b align=%A pin=%b"
+                                                                        (if byUser then "closed" else "seed") t.rank (e.hwnd.ToInt64())
+                                                                        t.stateIsCertain e.align e.isPinned)
+                                    closedTabCache.map(fun l -> info :: l |> List.truncate closedTabCacheLimit)
+                            | _ -> ())
+
+#if DEBUG
+                // The cache limit and handle deduplication can reject a planned
+                // seed. Report what survived the whole pass, not only the plan.
+                for gi,g in List.indexed planned do
+                    for ti,t in List.indexed g.tabs do
+                        if t.outcome = SavedSession.Waiting || t.outcome = SavedSession.Ambiguous then
+                            let retained = closedTabCache.value |> List.exists (fun e ->
+                                e.savedGroupIndex = Some gi && e.tabIndex = ti && e.closedHwnd = t.saved.hwnd)
+                            if not retained then
+                                lock completionGate (fun () -> rejected.[(gi,ti)] <- "seed-not-retained-duplicate-or-capacity")
+#endif
+                isRestoringTabGroups.set(false)
+                // Do NOT clear saved data here - keep it for watchdog restart scenarios
+                // Data will be overwritten on normal shutdown/restart
+            | _ -> ()
+        with
+        | ex ->
+            isRestoringTabGroups.set(false)
+            RestoreTrace.log (fun () -> sprintf "restore-error type=%s" (ex.GetType().Name))
+#if DEBUG
+        completePlacement ignore
+#endif
+
+    interface IProgram with
+        member x.version = version
+        member x.isUpgrade = version <> originalVersion
+        member x.isFirstRun = isFirstRun
+        member x.refresh() = this.refresh()
+        member x.suspendTabMonitoring() = 
+            DragTrace.log (fun () -> sprintf "suspendTabMonitoring (already=%b)\r\n%s" isTabMonitoringSuspendedCell.value (DragTrace.callers 6))
+            this.isTabMonitoringSuspended <- true
+
+        member x.beginWorkspaceRestore() =
+            if workspaceRestorePending then invalidOp "A workspace restore is already running."
+            (this :> IProgram).suspendTabMonitoring()
+            let generation = tabMonitoringSuspendGeneration
+            workspaceRestorePending <- true
+            let mutable finished = false
+            fun () ->
+                if not finished then
+                    finished <- true
+                    workspaceRestorePending <- false
+                    if generation = tabMonitoringSuspendGeneration then (this :> IProgram).resumeTabMonitoring()
+
+        member x.resumeTabMonitoringAfter(delayMs) =
+            // The resume must not be owned by the calling group's UI thread:
+            // that thread can exit before the delay elapses (detaching the
+            // second-to-last tab empties and destroys the group), taking the
+            // pending WinForms timer - and the resume - with it. The main
+            // thread outlives every group.
+            let generation = tabMonitoringSuspendGeneration
+            invoker.asyncInvoke <| fun() ->
+                (ThreadHelper.cancelablePostBack delayMs <| fun() ->
+                    // Only this call's own suspension may be lifted: another
+                    // operation may have suspended during the delay, and its
+                    // own resume is the one that has to end it.
+                    if tabMonitoringSuspendGeneration = generation then
+                        this.isTabMonitoringSuspended <- false
+                        DragTrace.log (fun () -> "resumeTabMonitoring (delayed)")
+                        this.refresh()
+                    else
+                        DragTrace.log (fun () -> "resumeTabMonitoring (delayed, superseded)")) |> ignore
+
+        member x.resumeTabMonitoring() = 
+            DragTrace.log (fun () -> "resumeTabMonitoring")
+            this.isTabMonitoringSuspended <- false
+            this.refresh()
+
+        member x.shutdown() =
+            ShutdownDeadline.start()
+            if invoker.invokeRequired then
+                invoker.asyncInvoke(fun () -> (this :> IProgram).shutdown())
+            elif not shutdownRequested then
+                shutdownRequested <- true
+                let attempt = ShutdownDeadline.attempt
+                attempt "shutdown trace begin" ShutdownTrace.beginShutdown
+                attempt "watchdog stop" Watchdog.stop
+                // Preserve the final-save and AppID-return order before teardown.
+                attempt "periodic save timer stop" periodicSaveTimer.Stop
+                attempt "desktop pass timer stop" desktopPassTimer.Stop
+                attempt "desktop reader stop" desktopReader.Stop
+                // SessionEnding has already frozen the last known-good snapshot.
+                if inSessionEnd.value.not then
+                    attempt "final settings save" this.saveTabGroupsToSettings
+                    attempt "AppID return" (fun () -> TaskbarAppId.releaseAndWait "exit" 2000)
+                ShutdownDeadline.saved()
+                attempt "shutdown state" (fun () -> inShutdown.set(true))
+                attempt "title timer stop" titleSyncTimer.Stop
+                attempt "hotkey timer stop" hotKeyRetryTimer.Stop
+                attempt "catch-up timer stop" catchUpTimer.Stop
+                attempt "pending update cancel" (fun () ->
+                    pendingUpdateAppWindowsToken |> Option.iter (fun token -> token.Dispose()))
+                pendingUpdateAppWindowsToken <- None
+                attempt "WinEvent disable" (fun () -> WinEventHooks.setEnabled false)
+                attempt "foreground hook dispose" (fun () -> foregroundHotKeyHook |> Option.iter (fun hook -> hook.Dispose()))
+                attempt "cloak hook dispose" (fun () -> cloakHook |> Option.iter (fun hook -> hook.Dispose()))
+                attempt "shell hooks dispose" registerShellHooks.Dispose
+                attempt "hotkeys sync" this.syncHotKeys
+                attempt "hotkeys dispose" (fun () -> (hotKeyManager :> IDisposable).Dispose())
+#if DEBUG
+                attempt "debug shutdown stall" ShutdownDeadline.stall
+#endif
+                attempt "group windows removal" (fun () ->
+                    this.desktop.groups.iter <| fun gi ->
+                        gi.windows.iter <| fun window ->
+                            attempt "group window removal" (fun () -> gi.removeWindow window))
+                attempt "shutdown window update" this.updateAppWindows
+                attempt "shutdown completion check" this.exitIfNeeded
+
+
+        member x.tabLimit = None
+     
+        member x.setWindowNameOverride((hwnd, name)) = 
+            windowNameOverride.set(windowNameOverride.value.add hwnd name)
+
+        member x.getWindowNameOverride(hwnd) =
+            (readSnapshot windowNameOverride windowNameOverrideSnapshot).tryFind(hwnd).bind(id)
+
+        member x.setWindowFillColor(hwnd, color : Color option) =
+            match color with
+            | Some(c) ->
+                windowFillColor.set(windowFillColor.value.add hwnd c)
+                windowUnderlineColor.set(windowUnderlineColor.value.remove hwnd)
+                windowBorderColor.set(windowBorderColor.value.remove hwnd)
+            | None -> windowFillColor.set(windowFillColor.value.remove hwnd)
+
+        member x.getWindowFillColor(hwnd) =
+            (readSnapshot windowFillColor windowFillColorSnapshot).tryFind(hwnd)
+
+        member x.setWindowUnderlineColor(hwnd, color : Color option) =
+            match color with
+            | Some(c) ->
+                windowUnderlineColor.set(windowUnderlineColor.value.add hwnd c)
+                windowFillColor.set(windowFillColor.value.remove hwnd)
+                windowBorderColor.set(windowBorderColor.value.remove hwnd)
+            | None -> windowUnderlineColor.set(windowUnderlineColor.value.remove hwnd)
+
+        member x.getWindowUnderlineColor(hwnd) =
+            (readSnapshot windowUnderlineColor windowUnderlineColorSnapshot).tryFind(hwnd)
+
+        member x.setWindowBorderColor(hwnd, color : Color option) =
+            match color with
+            | Some(c) ->
+                windowBorderColor.set(windowBorderColor.value.add hwnd c)
+                windowFillColor.set(windowFillColor.value.remove hwnd)
+                windowUnderlineColor.set(windowUnderlineColor.value.remove hwnd)
+            | None -> windowBorderColor.set(windowBorderColor.value.remove hwnd)
+
+        member x.getWindowBorderColor(hwnd) =
+            (readSnapshot windowBorderColor windowBorderColorSnapshot).tryFind(hwnd)
+
+        member x.setWindowPinned(hwnd, pinned : bool) =
+            if pinned then windowPinned.set(windowPinned.value.add hwnd)
+            else windowPinned.set(windowPinned.value.remove hwnd)
+
+        member x.isWindowPinned(hwnd) =
+            (readSnapshot windowPinned windowPinnedSnapshot).contains(hwnd)
+
+        member x.setWindowAlignment(hwnd, alignment : TabAlign option) =
+            match alignment with
+            | Some(a) -> windowAlignment.set(windowAlignment.value.add hwnd a)
+            | None -> windowAlignment.set(windowAlignment.value.remove hwnd)
+
+        member x.getWindowAlignment(hwnd) =
+            (readSnapshot windowAlignment windowAlignmentSnapshot).tryFind(hwnd)
+
+        member x.setWindowEdge(hwnd, edge) =
+            if os.windowFromHwnd(hwnd).isWindow then
+                windowEdges.map(fun m -> m.add hwnd edge)
+
+        member x.getWindowEdge(hwnd) =
+            (readSnapshot windowEdges windowEdgesSnapshot).tryFind(hwnd) |> Option.defaultValue TabEdges.Edge.Top
+
+        member x.getWindowAlignmentEdge(hwnd) =
+            match windowAlignmentEdges.TryGetValue(hwnd) with
+            | true, edge -> Some edge
+            | _ -> None
+
+        member x.setWindowAlignmentEdge(hwnd, edge) =
+            windowAlignmentEdges.[hwnd] <- edge
+
+        member x.appWindows =
+            os.windowsInZorder.where(this.isAppWindow).map(fun w -> w.hwnd)
+
+        member x.getAutoGroupingEnabled procPath =
+            AppPath.containsApp settingsManager.settings.autoGroupingPaths.items.list procPath
+
+        // Off to on regroups the application's windows; on to off deliberately
+        // does nothing, so a group the user has built up is not torn apart by
+        // unticking a box.
+        //
+        // The setting is written BEFORE the regroup: the regroup asks these
+        // same getters what the application is grouped by, and must be told the
+        // new answer.
+        //
+        // What stood here was a tabbing off/on toggle with the comment "toggle
+        // tabbing for the process to force regrouping". It was the right idea -
+        // disabling tabbing makes removeUntabableWindows let the windows go,
+        // re-enabling it makes ensureWindowIsGrouped pick them up - and it
+        // worked when it was written. It stopped working when the two refresh()
+        // calls became debounced: refresh is receive(Timer) is
+        // scheduleUpdateAppWindows, which now only re-arms a 50ms timer, so the
+        // two collapse into one pass that runs after tabbing is back on and the
+        // releasing pass never runs at all. That is the whole of why ticking
+        // the box changed nothing. It is not revived here because it cannot
+        // serve categories (they do not touch tabbing at all), because it
+        // destroys and rebuilds a group even when the windows were already
+        // together, and because it forces tabbing ON as a side effect.
+        member x.setAutoGroupingEnabled procPath enabled =
+            let wasEnabled = (x :> IProgram).getAutoGroupingEnabled(procPath)
+            this.saveSettingsAndUpdateAppWindows <| fun s ->
+                { s with
+                    autoGroupingPaths =
+                        Set2(List2(
+                            if enabled then AppPath.addApp s.autoGroupingPaths.items.list procPath
+                            else AppPath.removeApp s.autoGroupingPaths.items.list procPath)) }
+            if enabled && wasEnabled.not then
+                this.regroupProcessWindows(procPath, fun () -> (x :> IProgram).getAutoGroupingEnabled(procPath))
+
+        // An application belongs to one category. If the file somehow lists
+        // it under several - hand-edited, or written by a version that let it
+        // happen - the lowest number is the one that counts, everywhere,
+        // including the tick the dialog draws.
+        member x.getCategoryEnabled (procPath, categoryNum) =
+            (x :> IProgram).getCategoryNumber(procPath) = categoryNum
+
+        member x.getCategoryNumber procPath =
+            let settingsJson = settingsManager.settingsJsonReadOnly
+            let listedIn i =
+                let paths = settingsJson.getStringArray(sprintf "Category%dPaths" i).def(List2())
+                AppPath.containsApp paths.list procPath
+            let rec firstListed i =
+                if i > 10 then 0
+                elif listedIn i then i
+                else firstListed (i + 1)
+            firstListed 1
+
+        // The auto-grouping setting is not consulted here. The dialog only
+        // shows the category boxes for an application whose auto-grouping is
+        // already on, so the combination cannot be reached by clicking; making
+        // the code ask anyway would add a condition that no click can produce
+        // and that would have to be kept in step with the dialog for ever.
+        member x.setCategoryEnabled procPath categoryNum enabled =
+            let wasEnabled = (x :> IProgram).getCategoryEnabled(procPath, categoryNum)
+            let settingsJson = settingsManager.settingsJson
+            // Ticking a category unticks the rest: an application in two
+            // categories has no defined home, and only the lower number would
+            // ever be acted on.
+            for i in 1..10 do
+                let key = sprintf "Category%dPaths" i
+                let paths = settingsJson.getStringArray(key).def(List2())
+                let newPaths =
+                    if enabled && i = categoryNum then AppPath.addApp paths.list procPath
+                    else AppPath.removeApp paths.list procPath
+                if newPaths <> paths.list then settingsJson.setStringArray(key, List2(newPaths))
+            settingsManager.settingsJson <- settingsJson
+            if enabled && wasEnabled.not then
+                this.regroupProcessWindows(procPath, fun () -> (x :> IProgram).getCategoryEnabled(procPath, categoryNum))
+
+        member x.tabAppearanceInfo = 
+            (settingsManager :> ISettings).getValue("tabAppearance") :?> TabAppearanceInfo
+
+        member x.defaultTabAppearanceInfo = settingsManager.defaultTabAppearance
+
+        member x.darkModeTabAppearanceInfo = 
+            settingsManager.darkModeTabAppearance
+
+        member x.darkModeBlueTabAppearanceInfo =
+            settingsManager.darkModeBlueTabAppearance
+
+        member x.lightMonoTabAppearanceInfo =
+            settingsManager.lightMonoTabAppearance
+
+        member x.darkMonoTabAppearanceInfo =
+            settingsManager.darkMonoTabAppearance
+
+        member x.darkMono2TabAppearanceInfo =
+            settingsManager.darkMono2TabAppearance
+
+        member x.darkMono3TabAppearanceInfo =
+            settingsManager.darkMono3TabAppearance
+
+        member x.nightHorizonTabAppearanceInfo =
+            settingsManager.nightHorizonTabAppearance
+
+        member x.darkRedFrameTabAppearanceInfo =
+            settingsManager.darkRedFrameTabAppearance
+            
+        member x.getHotKey key = 
+            let hotKeys = settingsManager.settingsJsonReadOnly.getObject("HotKeys").def(JObject())
+            match hotKeys.getInt32(key) with
+            | Some(value) -> value
+            | None -> hotKeyDefaults.tryFind(key).def(HotKeyPolicy.noKey)
+
+        member x.setHotKey key value = 
+            let settings = settingsManager.settingsJson
+            let hotKeys = settings.getObject("HotKeys").def(JObject())
+            hotKeys.setInt32(key, value)
+            settings.setObject("HotKeys", hotKeys)
+            settingsManager.settingsJson <- settings
+            this.syncHotKeys()
+
+        member x.ping() = 
+            ()
+
+        member x.notifyNewVersion() = notifyNewVersionEvt.Trigger()
+        member x.newVersion = notifyNewVersionEvt.Publish
+        member x.llMouse = llMouseEvent.Publish
+        member x.isDisabled = (readSnapshot isDisabledCell isDisabledCellSnapshot)
+        member x.isShuttingDown = (readSnapshot inShutdown inShutdownSnapshot)
+        member x.saveTabGroupsBeforeExit() =
+            if inSessionEnd.value.not then
+                this.saveTabGroupsToSettings()
+        member x.setDisabled(value) =
+            // Save disabled state to settings
+            try
+                let json = settingsManager.settingsJson
+                json.setBool("IsDisabled", value)
+                settingsManager.settingsJson <- json
+            with
+            | ex -> ()  // Ignore errors when saving settings
+
+            if value then
+                // When disabling, save current tab group configuration first (with per-group tab position)
+                // As the save writes them (savedMembers): a window moved and
+                // followed comes back in the group of the desktop it went to
+                // only; a genuinely shared window keeps each of its memberships.
+                let groupsNow = this.desktop.groups.list
+                let members = groupsNow |> List.map (fun gi ->
+                    gi, SavedSession.mergedOrder gi.visualOrderThreadSafe.list gi.visualOrder.list)
+                let keeps, marked = this.savedMembers members
+                let groupConfigs =
+                    members |> List.mapi (fun i (gi, order) ->
+                        let inStrip = gi.visualOrderThreadSafe.list |> Set.ofList
+                        let tabs = order |> List.filter (keeps i) |> List.map (fun hwnd ->
+                            // Freeze each group's own state before its strip is destroyed.
+                            // Global maps describe only the last group of a shared window.
+                            { SavedTabState.ofHwnd hwnd with
+                                edge = TabEdges.savedOfEdge (this.allowedWindowEdge (if marked.Contains hwnd then (try gi.tabEdgeThreadSafe(hwnd) with _ -> TabEdges.Edge.Top) else windowEdges.value.tryFind(hwnd) |> Option.defaultValue TabEdges.Edge.Top))
+                                // A reserved arrival may not have reached the strip yet.
+                                isPinned = if inStrip.Contains hwnd then gi.isPinnedThreadSafe(hwnd) else windowPinned.value.contains(hwnd)
+                                align = (if inStrip.Contains hwnd then gi.explicitTabAlign(hwnd) else windowAlignment.value.tryFind(hwnd)) |> Option.map savedAlignOfTabAlign
+                                renamedTabName = windowNameOverride.value.tryFind(hwnd) |> Option.bind id
+                                fillColor = (if inStrip.Contains hwnd then gi.getTabFillColorThreadSafe(hwnd) else windowFillColor.value.tryFind(hwnd)) |> Option.map colorToRRGGBBAA
+                                underlineColor = (if inStrip.Contains hwnd then gi.getTabUnderlineColorThreadSafe(hwnd) else windowUnderlineColor.value.tryFind(hwnd)) |> Option.map colorToRRGGBBAA
+                                borderColor = (if inStrip.Contains hwnd then gi.getTabBorderColorThreadSafe(hwnd) else windowBorderColor.value.tryFind(hwnd)) |> Option.map colorToRRGGBBAA })
+                        let token = tabs |> List.tryHead |> Option.map (fun t -> t.hwnd) |> Option.defaultValue IntPtr.Zero
+                        tabs |> List.iteri (fun rank tab ->
+                            RestoreTrace.log (fun () ->
+                                sprintf "disable-snapshot token=%X rank=%d hwnd=%X reason=saved"
+                                    (int64 token) rank (int64 tab.hwnd)))
+                        (tabs, gi.perGroupTabPositionValue, gi.snapTabHeightMargin, gi.lockWindowPosition, gi.desktopHome))
+                savedTabGroups.set(List2(groupConfigs))
+
+                // Set disabled state before destroying groups
+                isDisabledCell.set(true)
+                WinEventHooks.setEnabled false
+                // No desktop pass runs while disabled; give the buttons back now.
+                TaskbarAppId.release "disable"
+
+                // Destroy all tab groups to hide them
+                this.desktop.groups.iter <| fun gi ->
+                    gi.windows.iter <| fun window ->
+                        gi.removeWindow window
+                    gi.destroy()
+            else
+                // When enabling, restore saved tab group configuration
+                isDisabledCell.set(false)
+                WinEventHooks.setEnabled true
+
+                // Suspend tab monitoring to prevent auto-grouping during restore
+                this.isTabMonitoringSuspended <- true
+
+                // After a restart there is nothing in memory to restore from -
+                // the switch was thrown in an earlier run - so the groups come
+                // back from the frozen snapshot in the settings, the same way
+                // they do when WindowTabs starts.
+                if savedTabGroups.value.length = 0 then
+                    this.restoreTabGroupsFromSettings()
+                // The groups are back now, one way or the other. A start in the
+                // disabled state left the startup restore pending; letting it
+                // run on the next pass built every group a second time, each
+                // window in two groups - two tabs for one window, and a second
+                // group putting a moved or minimized window back.
+                needsRestoreOnStartup.set(false)
+
+                // Restore saved tab groups
+                savedTabGroups.value.iter <| fun (tabs, savedTabPos, savedSnapMargin, savedLockPosition, home) ->
+                    let token = tabs |> List.tryHead |> Option.map (fun t -> t.hwnd) |> Option.defaultValue IntPtr.Zero
+                    let trace rank hwnd reason =
+                        RestoreTrace.log (fun () ->
+                            sprintf "reenable token=%X rank=%d hwnd=%X reason=%s"
+                                (int64 token) rank (int64 hwnd) reason)
+                    let valid = tabs |> List.indexed |> List.filter (fun (rank, tab) ->
+                        let window = os.windowFromHwnd(tab.hwnd)
+                        let keep = VirtualDesktopGroups.keepOnReenable false window.isWindow false false &&
+                                   not (Services.filter.isTabbingExcludedForWindow(tab.hwnd))
+                        if not keep then trace rank tab.hwnd "destroyed-or-untabbed"
+                        keep)
+                    let allowed = try TabEdgeSettings.allowedOf Services.settings.root with _ -> TabEdges.topOnly
+                    let valid = valid |> TabEdges.residentsFirst allowed (fun (_, tab) -> TabEdges.edgeOfSaved tab.edge)
+                    if not valid.IsEmpty then
+                        let group = Services.desktop.createGroup()
+                        group.perGroupTabPositionValue <- savedTabPos
+                        group.snapTabHeightMargin <- savedSnapMargin
+                        group.lockWindowPosition <- savedLockPosition
+                        group.desktopHome <- home
+                        match group :> obj with
+                        | :? GroupInfo as gi ->
+                            // Reserve every member before any asynchronous insertion.
+                            // Restore in place: cloaked members must not switch desktops.
+                            gi.reserveWorkspaceWindows(valid |> List.map (fun (_, t) -> t.hwnd))
+                            gi.invokeGroup <| fun () ->
+                                let wg = gi.group
+                                for rank, tab in valid do
+                                    if not (os.windowFromHwnd(tab.hwnd).isWindow) then
+                                        trace rank tab.hwnd "destroyed-before-add"
+                                    else
+                                        try
+                                            windowAlignmentEdges.[tab.hwnd] <- TabEdges.edgeOfSaved tab.edge
+                                            wg.addWindowPlaced(tab.hwnd, false, false,
+                                                ?alignment=(tab.align |> Option.map tabAlignOfSavedAlign), pinned=tab.isPinned,
+                                                edge=TabEdges.edgeOfSaved tab.edge)
+                                            // None also has meaning: clear another desktop's state.
+                                            if tab.align.IsNone then
+                                                wg.ts.clearTabAlign(Tab(tab.hwnd))
+                                                Services.program.setWindowAlignment(tab.hwnd, None)
+                                            wg.setTabFillColor(tab.hwnd, tab.fillColor |> Option.bind parseColorRRGGBBAA)
+                                            wg.setTabUnderlineColor(tab.hwnd, tab.underlineColor |> Option.bind parseColorRRGGBBAA)
+                                            wg.setTabBorderColor(tab.hwnd, tab.borderColor |> Option.bind parseColorRRGGBBAA)
+                                            wg.setTabName(tab.hwnd, tab.renamedTabName)
+                                            trace rank tab.hwnd "restored-by-hwnd"
+                                        with _ ->
+                                            trace rank tab.hwnd "add-failed"
+                                            reraise()
+                                // Insertion and pin normalization must not replace saved order.
+                                wg.ts.setVisualOrder(valid |> List.map (fun (_, t) -> Tab(t.hwnd)))
+                        | _ ->
+                            valid |> List.iter (fun (rank, tab) -> trace rank tab.hwnd "unsupported-group")
+
+                // Clear saved configuration
+                savedTabGroups.set(List2())
+
+                // Resume tab monitoring
+                this.isTabMonitoringSuspended <- false
+
+            this.refresh()
+#if DEBUG
+            WinEventPump.post(fun () -> PerfTrace.winEventHookInventory (if value then "disabled" else "enabled") value)
+#endif
+
+        member x.launchNewWindow(groupHwnd)(invokerHwnd)(processPath) =
+            this.startExplicitWindow(processPath, JoinGroup(groupHwnd, invokerHwnd))
+
+        member x.launchStandaloneWindow(processPath)(postAction) =
+            this.startExplicitWindow(processPath, FreshGroup(postAction))
+
+        member x.getAllConfiguredProcessPaths() =
+            let paths = System.Collections.Generic.HashSet<string>()
+            // Collect from includedPaths and excludedPaths
+            let settings = settingsManager.settings
+            settings.includedPaths.items.iter(fun p -> paths.Add(p) |> ignore)
+            settings.excludedPaths.items.iter(fun p -> paths.Add(p) |> ignore)
+            // Collect from autoGroupingPaths
+            settings.autoGroupingPaths.items.iter(fun p -> paths.Add(p) |> ignore)
+            // Collect from Category1Paths through Category10Paths
+            let settingsJson = settingsManager.settingsJsonReadOnly
+            for i in 1..10 do
+                let categoryKey = sprintf "Category%dPaths" i
+                let categoryPaths = settingsJson.getStringArray(categoryKey).def(List2())
+                categoryPaths.iter(fun p -> paths.Add(p) |> ignore)
+            // One entry per application: the same application can be listed
+            // in several of these under different spellings if the settings
+            // predate AppPath and have not been collapsed yet.
+            List2(AppPath.canonicalise paths)
+
+        member x.forgetClosedTabsOfUntabbedApps() = this.forgetClosedTabsOfUntabbedApps()
+
+        member x.removeProcessSettings(procPath) =
+            // Remove from includedPaths, excludedPaths, autoGroupingPaths
+            this.saveSettingsAndUpdateAppWindows <| fun s ->
+                { s with
+                    includedPaths = Set2(List2(AppPath.removeApp s.includedPaths.items.list procPath))
+                    excludedPaths = Set2(List2(AppPath.removeApp s.excludedPaths.items.list procPath))
+                    autoGroupingPaths = Set2(List2(AppPath.removeApp s.autoGroupingPaths.items.list procPath)) }
+            // Remove from Category1-10Paths
+            let settingsJson = settingsManager.settingsJson
+            for i in 1..10 do
+                let categoryKey = sprintf "Category%dPaths" i
+                let paths = settingsJson.getStringArray(categoryKey).def(List2())
+                let newPaths = AppPath.removeApp paths.list procPath
+                settingsJson.setStringArray(categoryKey, List2(newPaths))
+            settingsManager.settingsJson <- settingsJson
+
+        member x.markDetachedLock (hwnd: IntPtr) (locked: bool) =
+            pendingDetachedLocks.map(fun m -> m.add hwnd locked)
+
+        member x.markRecentlyPlaced(hwnds) =
+            let now = DateTime.Now
+            recentlyPlacedHwnds.map(fun m ->
+                hwnds |> List.fold (fun acc h -> acc.add h now) m)
+
+    interface IDesktopNotification with
+        member x.dragDrop(hwnd, snapMargin, edge) =
+            pendingDragEdges.map(fun m ->
+                match edge with
+                | Some value -> m.add hwnd value
+                | None -> m.remove hwnd)
+            DragTrace.log (fun () -> sprintf "Program.dragDrop: hwnd=%X" (hwnd.ToInt64()))
+            pendingDragSnapMargins.map <| fun m ->
+                match snapMargin with
+                | Some margin -> m.add hwnd margin
+                | None -> m.remove hwnd
+            isDroppedAndAwaitingGrouping.map <| fun s -> s.add hwnd
+
+        member x.dragEnd() = 
+            this.updateAppWindows()
+            
+
+    member this.run(ipcPipe: string option, plugins:List2<IPlugin>) =
+
+        // Initialize localization with language setting
+        let language =
+            try
+                let value = settingsManager.settingsJsonReadOnly.["language"]
+                if value = null then "English" else value.ToString()
+            with
+            | _ -> "English"
+        Localization.initLanguage(language)
+
+        // Check if there are saved tab groups to restore
+        let hasSavedTabGroups =
+            try
+                let json = settingsManager.settingsJsonReadOnly
+                match json.getValueCI("SavedTabGroupsForRestart") with
+                | Some(:? JArray as arr) when arr.Count > 0 -> true
+                | _ -> false
+            with _ -> false
+
+        // If saved tab groups exist, set flag to restore before auto-grouping
+        if hasSavedTabGroups then
+            needsRestoreOnStartup.set(true)
+
+        Services.register(this :> IProgram)
+        Services.register(FilterService() :> IFilterService)
+        let managerView = ManagerViewService()
+        Services.register(managerView :> IManagerView)
+        Services.program.refresh()
+
+        // Pay settings construction cost during startup, before the watchdog
+        // is armed. Preloading never shows a window or acquires the dialog gate.
+#if DEBUG
+        // Test hook: imitate a slow start (a loaded machine) by holding the
+        // startup here, after the periodic save timer has started and before
+        // the message loop runs the startup restore.
+        RestoreTrace.log (fun () ->
+            sprintf "debug hooks: cloak invalidate delay=%s, prune trusts reading=%s"
+                (match Environment.GetEnvironmentVariable("WINDOWTABS_DEBUG_CLOAK_INVALIDATE_DELAY_MS") with null -> "off" | v -> v)
+                (match Environment.GetEnvironmentVariable("WINDOWTABS_DEBUG_PRUNE_TRUST_READING") with null -> "off" | v -> v))
+        match Int32.TryParse(Environment.GetEnvironmentVariable("WINDOWTABS_DEBUG_STARTUP_DELAY_MS")) with
+        | true, ms when ms > 0 ->
+            RestoreTrace.log (fun () -> sprintf "debug startup delay %d ms" ms)
+            System.Threading.Thread.Sleep(ms)
+        | _ -> ()
+#endif
+        if ipcPipe.IsNone then managerView.preload()
+
+        // The uTools bridge is optional. A normal standalone WindowTabs
+        // launch has no pipe argument and keeps the original behaviour.
+        let ipc =
+            match ipcPipe with
+            | Some pipe ->
+                let server = WindowTabsIpc.Server(pipe, version, fun message -> Debug.WriteLine(message))
+                server.Start()
+                Some server
+            | None -> None
+
+        plugins.iter <| fun p -> p.init()
+
+        SettingsBenchmark.install()
+#if DEBUG
+        use shutdownAfter = new System.Windows.Forms.Timer()
+        match Int32.TryParse(Environment.GetEnvironmentVariable("WINDOWTABS_DEBUG_SHUTDOWN_AFTER_MS")) with
+        | true, ms when ms > 0 ->
+            shutdownAfter.Interval <- ShutdownTrace.remainingDelay ms
+            shutdownAfter.Tick.Add(fun _ ->
+                shutdownAfter.Stop()
+                Services.program.shutdown())
+            shutdownAfter.Start()
+        | _ -> ()
+#endif
+        Application.Run()
+        ipc |> Option.iter(fun server -> server.Dispose())
+        ShutdownDeadline.setStage "main plugins dispose"
+        ShutdownTrace.write "main message loop ended"
+#if DEBUG
+        DesktopManagerFormState.log "shutdown: message loop returned; disposing plugins"
+#endif
+        plugins.iter <| fun p ->
+            match p with
+            | :? IDisposable as d -> d.Dispose()
+            | _ -> ()
+        ShutdownDeadline.setStage "main timers dispose"
+        periodicSaveTimer.Dispose()
+        desktopPassTimer.Dispose()
+        titleSyncTimer.Dispose()
+        hotKeyRetryTimer.Dispose()
+        catchUpTimer.Dispose()
+        shutdownTimer.Dispose()
+        ShutdownDeadline.setStage "manager view dispose"
+        managerView.dispose()
+        // Every group's thread has ended, and its strips' glass backdrops
+        // with it: the thread they lived on lets go of the compositor.
+        ShutdownDeadline.setStage "tab glass host stop"
+        TabGlassHost.shutdown()
+        ShutdownDeadline.setStage "main invoker dispose"
+        (invoker :> IDisposable).Dispose()
+        ShutdownDeadline.setStage "main COM release"
+        VirtualDesktopHelper.ReleaseCurrentThread()
+        ShutdownDeadline.setStage "main cleanup complete; process termination wait"
+        ShutdownTrace.write "main cleanup complete"
+#if DEBUG
+        DesktopManagerFormState.log "shutdown: plugins disposed"
+#endif
+
+[<STAThread>]
+[<EntryPoint>]
+let main argv =
+    ShutdownTrace.install()
+    CrashLog.install()
+    let restarting = Watchdog.awaitRestartParent argv
+#if DEBUG
+    SettingsTiming.startStartup()
+#endif
+    // Per-Monitor-V2 DPI awareness, before anything creates a window or a DC.
+    // app.manifest declares the same thing and normally wins, in which case
+    // this call simply fails and changes nothing; keeping it means the tab
+    // strips still render natively if a packaging step ever drops the win32
+    // manifest from the executable.
+    Dpi.enablePerMonitorV2()
+    // The single-instance check must run before Program() is constructed.
+    // The constructor registers shell hooks and starts timers, and the
+    // "already running" MessageBox pumps messages, so checking later lets
+    // a second instance run updateAppWindows before services are registered
+    // and crash with KeyNotFoundException.
+    let mutex = new Mutex(false, "BemoSoftware.WindowTabs")
+    // A watchdog restart ends the old process without releasing the mutex,
+    // and while the restart helper still holds a handle to it the next
+    // instance gets it as abandoned: that is an acquisition, not a failure.
+    // Left unhandled, it killed the instance the restart had just started.
+    let acquired () =
+        try mutex.WaitOne(TimeSpan.FromSeconds(0.5), false)
+        with :? AbandonedMutexException -> true
+    if System.Diagnostics.Debugger.IsAttached.not then
+        if acquired().not then
+            if not restarting && (WindowTabsIpc.pipeArgument argv).IsNone then
+                MessageBox.Show("Another instance of WindowTabs is running, please close it before running this instance.", "WindowTabs is already running.").ignore
+            exit(0)
+
+    Application.EnableVisualStyles()
+
+    // WinForms takes ONE process-wide DPI snapshot, the first time any Control
+    // is constructed, and uses it for its legacy scaling decisions. Take that
+    // snapshot here, under a DPI-unaware context, so it reads 96 dpi.
+    //
+    // This line predates the settings dialog becoming DPI-aware and its reason
+    // has changed, but its value has not, and it is kept deliberately.
+    // WinForms' snapshot is a SYSTEM dpi (120 on this desktop, from the 125%
+    // primary monitor) and is the same number on every monitor. Letting it be
+    // anything but 96 would have WinForms silently pre-scale ToolStrip image
+    // sizes, owner-drawn item heights and the like by the wrong, non-per-
+    // monitor factor - on top of the explicit per-monitor scaling in
+    // SettingsDpi. Pinned at 96, WinForms' own scaling is a no-op everywhere
+    // and every device pixel in this process is decided by the Dpi /
+    // SettingsDpi modules, from the DPI of the monitor the window is on.
+    //
+    // Everything WindowTabs draws itself was already scaled explicitly, so the
+    // tab strips are unaffected either way.
+    //
+    // Placed AFTER EnableVisualStyles because that call has to happen before
+    // the process creates any window handle, and this one does. Placed BEFORE
+    // Program() because its constructor resolves InvokerService.invoker, and
+    // Invoker() builds a Form and forces its handle (Shared/Invoker.fs:14) -
+    // that Form would otherwise take the snapshot first, under the per-monitor
+    // context enabled at the top of main, making this block a no-op.
+    //
+    // Placed AFTER the single-instance check so a losing instance, which only
+    // shows a message box and exits, never touches the snapshot at all.
+    Dpi.withUnawareContext <| fun() ->
+        try
+            use c = new Control()
+            c.DeviceDpi.ignore
+        with _ -> ()
+
+    TaskbarAppId.startRecovery()
+    let ipcPipe = WindowTabsIpc.pipeArgument argv
+    let program = Program()
+    program.run(ipcPipe, List2<obj>([
+        yield CaptionDragPlugin() :> obj
+        if ipcPipe.IsNone then yield NotifyIconPlugin() :> obj
+        yield ExceptionHandlerPlugin() :> obj
+    ]).map(fun o -> o.cast<IPlugin>()))
+    // Keep the single-instance mutex alive for the whole process lifetime;
+    // if the GC collected it, its handle would close and release the mutex.
+    GC.KeepAlive(mutex)
+    0

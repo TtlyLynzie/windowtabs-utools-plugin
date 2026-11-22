@@ -1,0 +1,2172 @@
+namespace Bemo
+open System
+open System.Drawing
+open System.IO
+open System.Text.RegularExpressions
+open System.Windows.Forms
+open System.Windows.Forms.VisualStyles
+open Bemo.Win32
+open Bemo.Win32.Forms
+open Microsoft.FSharp.Reflection
+open Newtonsoft.Json.Linq
+
+type AppearanceProperty = {
+    displayText : string
+    key: string
+    propertyType : AppearancePropertyType
+    }
+
+and AppearancePropertyType =
+    | HotKeyProperty
+    | IntProperty
+    | ColorProperty
+
+// Custom theme type for storage
+type ColorThemeData = {
+    name: string
+    inactiveTextColor: int
+    selectedTextColor: int
+    mouseOverTextColor: int
+    activeTextColor: int
+    flashTextColor: int
+    inactiveTabColor: int
+    selectedTabColor: int
+    mouseOverTabColor: int
+    activeTabColor: int
+    flashTabColor: int
+    inactiveBorderColor: int
+    selectedBorderColor: int
+    mouseOverBorderColor: int
+    activeBorderColor: int
+    flashBorderColor: int
+}
+
+// ComboBox item types
+type ThemeItem =
+    | Preset of string
+    | CustomTheme of string
+    | UnsavedCustom
+
+type AppearanceView() as this =
+    let settingsPropertyBool name (defaultValue:bool) =
+        {
+            new IProperty<bool> with
+                member x.value
+                    with get() =
+                        try
+                            let json = Services.settings.root
+                            match json.getBool(name) with
+                            | Some(value) -> value
+                            | None -> defaultValue
+                        with | _ -> defaultValue
+                    and set(value) =
+                        let json = Services.settings.root
+                        json.setBool(name, value)
+                        Services.settings.root <- json
+        }
+
+    let colorConfig key displayText =
+        { displayText=displayText; key=key; propertyType=ColorProperty }
+
+    let intConfig key displayText =
+        { displayText=displayText; key=key; propertyType=IntProperty }
+
+    let hkConfig key displayText =
+        { displayText=displayText; key=key; propertyType=HotKeyProperty }
+        
+    let mutable suppressEvents = false
+    let mutable initializingTheme = true
+
+    let placementRefreshers = ResizeArray<unit -> unit>()
+    let save key value =
+        if not suppressEvents then Services.settings.setValue(key, value)
+
+    let placementChoice key normalize options =
+        let combo = EdgeRows.choice (options |> List.map (snd >> Localization.getString))
+        let current () = Services.settings.getValue key |> unbox<string> |> normalize
+        let refresh () =
+            combo.SelectedIndex <- options |> List.findIndex (fun (value, _) -> value = current ())
+        refresh ()
+        placementRefreshers.Add refresh
+        combo.SelectedIndexChanged.Add(fun _ ->
+            if not suppressEvents && combo.SelectedIndex >= 0 then
+                let value = fst options.[combo.SelectedIndex]
+                // Re-notifying an unchanged alignment would reset every group.
+                if value <> current () then save key (box value))
+        combo :> Control
+
+    let defaultTabPositionCombo =
+        placementChoice "tabPositionByDefault"
+            (fun mode -> if mode = "TopLeft" then "TopLeft" else "TopRight")
+            ["TopLeft", "AlignTopLeft"; "TopRight", "AlignTopRight"]
+
+    let tabVerticalDirectionCombo =
+        placementChoice "tabVerticalDirection"
+            TabBehaviorPolicy.normalizeVerticalDirection
+            [TabBehaviorPolicy.verticalAuto, "TabVerticalAuto";
+             TabBehaviorPolicy.verticalAlwaysDown, "TabVerticalAlwaysDown"]
+
+    let hideTabsRadio, refreshHideTabs =
+        EdgeRows.hideTabsControls
+            (fun () -> Services.settings.getValue("hideTabsWhenDownByDefault") :?> string,
+                       Services.settings.getValue("hideTabsDelayMilliseconds") :?> int)
+            (fun mode delay ->
+                if not suppressEvents then
+                    if mode <> (Services.settings.getValue("hideTabsWhenDownByDefault") :?> string) then
+                        save "hideTabsWhenDownByDefault" mode
+                    if delay <> (Services.settings.getValue("hideTabsDelayMilliseconds") :?> int) then
+                        save "hideTabsDelayMilliseconds" delay)
+    do placementRefreshers.Add refreshHideTabs
+
+    // Read the unified "Dark Mode" toggle. Used by child dialogs (Save
+    // Theme / Edit Theme) so they inherit the parent dialog's theme on
+    // open.
+    let isDarkModeEnabled () =
+        try
+            match Services.settings.root.getBool("EnableDarkMode") with
+            | Some(v) -> v
+            | None -> false
+        with _ -> false
+
+    let checkBox (prop:IProperty<bool>) =
+        let checkbox = BoolEditor() :> IPropEditor
+        checkbox.value <- box(prop.value)
+        checkbox.changed.Add <| fun() -> prop.value <- unbox<bool>(checkbox.value)
+        checkbox.control
+
+    let settingsCheckboxBool settingsKey defaultValue = checkBox(settingsPropertyBool settingsKey defaultValue)
+
+    // Separate int and color properties for cleaner UI layout
+    let intProperties = List2([
+        intConfig "tabHeight" "Height"
+        intConfig "tabMaxWidth" "Width (max)"
+        intConfig "tabOverlap" "Tab Overlap"
+        intConfig "tabIndentNormal" "Indent Normal"
+        intConfig "tabIndentNormalRight" "Right"
+        intConfig "tabIndentFlipped" "Indent Flipped"
+        intConfig "tabIndentFlippedRight" "Right"
+        ])
+
+    // Color properties organized by state (for new grid layout)
+    // Each state has: TabColor, TextColor, BorderColor (in that order for columns)
+    let colorStateRows = [
+        ("Inactive", [("tabInactiveTabColor", "TabColor"); ("tabInactiveTextColor", "TextColor"); ("tabInactiveBorderColor", "BorderColor")])
+        ("Selected", [("tabSelectedTabColor", "TabColor"); ("tabSelectedTextColor", "TextColor"); ("tabSelectedBorderColor", "BorderColor")])
+        ("MouseOver", [("tabMouseOverTabColor", "TabColor"); ("tabMouseOverTextColor", "TextColor"); ("tabMouseOverBorderColor", "BorderColor")])
+        ("Active", [("tabActiveTabColor", "TabColor"); ("tabActiveTextColor", "TextColor"); ("tabActiveBorderColor", "BorderColor")])
+        ("Flash", [("tabFlashTabColor", "TabColor"); ("tabFlashTextColor", "TextColor"); ("tabFlashBorderColor", "BorderColor")])
+    ]
+
+    // All color property keys for iteration
+    let colorPropertyKeys =
+        colorStateRows
+        |> List.collect (fun (_, cols) -> cols |> List.map fst)
+
+    // Combined list of all properties (int + color) for setEditorValues
+    let allPropertyKeys =
+        (intProperties.list |> List.map (fun p -> p.key)) @ ["tabPinnedTabWidth"; "tabPinnedTabWidthIcon"; "tabShape"] @ colorPropertyKeys
+
+    // Caption key of each tab shape (TabShape.all order in the drop-down).
+    let tabShapeCaption shape =
+        match TabShape.normalize shape with
+        | TabShape.strong -> "TabShapeStrong"
+        | TabShape.slant -> "TabShapeSlant"
+        | TabShape.rounded -> "TabShapeRounded"
+        | TabShape.angular -> "TabShapeAngular"
+        | TabShape.cutLeft -> "TabShapeCutLeft"
+        | TabShape.cutRight -> "TabShapeCutRight"
+        | TabShape.rectangle -> "TabShapeRectangle"
+        | TabShape.roundedRectangle -> "TabShapeRoundedRectangle"
+        | TabShape.strongRoundedRectangle -> "TabShapeStrongRoundedRectangle"
+        | TabShape.angularRectangle -> "TabShapeAngularRectangle"
+        | _ -> "TabShapeSCurve"
+
+    // Both pages share one set of editors and theme state.
+    // Upper panel: shape, paired size, pinned width, overlap, and two paired distances.
+    let upperRowCount = 6
+    let colorGridRowCount = 7  // theme + header + five states
+
+    let createPage rowCount =
+        let page = TableLayoutPanel()
+        page.SuspendLayout()
+        page.AutoScroll <- true
+        page.Dock <- DockStyle.Fill
+        page.GrowStyle <- TableLayoutPanelGrowStyle.FixedSize
+        page.Padding <- UIHelper.settingsPagePadding
+        page.RowCount <- rowCount
+        page.ColumnCount <- 1
+        for _ in 1..rowCount do
+            page.RowStyles.Add(RowStyle(SizeType.AutoSize)).ignore
+        page.ColumnStyles.Add(ColumnStyle(SizeType.Percent, 100.0f)).ignore
+        page
+
+    let edgeChecks = TabEdges.priority |> List.map (fun edge ->
+        let check = new CheckBox(AutoSize = true, Anchor = AnchorStyles.Left,
+                                 Margin = Padding(0, EdgeRows.marginPx, 0, EdgeRows.marginPx))
+        check.Text <- Localization.getString("Use" + TabEdgeSettings.edgeName edge + "Tabs")
+        edge, check)
+    let topHeader, topCopyButton =
+        EdgeRows.pageHeader (edgeChecks |> List.find (fun (edge, _) -> edge = TabEdges.Edge.Top) |> snd)
+            "ApplySameSettingsToBottomEdge" (fun () -> this.copyToBottom())
+    let panel = createPage 1
+    let topEdgePanel = createPage 3
+    do
+        // Only the outer Appearance page scrolls; the tab grows to its content.
+        topEdgePanel.AutoScroll <- false
+        topEdgePanel.AutoSize <- true
+        topEdgePanel.AutoSizeMode <- AutoSizeMode.GrowAndShrink
+        topEdgePanel.Padding <- Padding(0)
+        topEdgePanel.Margin <- Padding(0)
+    let placementPanel =
+        let fields = List2([
+            ("TabPositionByDefault", defaultTabPositionCombo)
+            ("TabVerticalDirection", tabVerticalDirectionCombo)
+            ("HideTabsWhenDownByDefault", hideTabsRadio :> Control)
+        ])
+        let grid = UIHelper.form fields
+        grid.Dock <- DockStyle.Top
+        grid.Margin <- Padding(0, UIHelper.settingsRowHeightPx / 2, 0, 0)
+        grid.AutoScroll <- false
+        for combo in [defaultTabPositionCombo; tabVerticalDirectionCombo] do
+            combo.Anchor <- AnchorStyles.Left ||| AnchorStyles.Right
+        grid
+    let colorPage =
+        let page = createPage 2
+        page.ColumnCount <- 2
+        page.ColumnStyles.Clear()
+        page.ColumnStyles.Add(ColumnStyle(SizeType.Absolute, float32 UIHelper.settingsLabelWidthPx)).ignore
+        page.ColumnStyles.Add(ColumnStyle(SizeType.Percent, 100.0f)).ignore
+        page
+
+    // Appearance controls retain their order, starting with tab shape.
+    let upperPanel =
+        let p = TableLayoutPanel()
+        p.SuspendLayout()
+        p.Dock <- DockStyle.Top
+        p.AutoSize <- true
+        // The page owns the shared inset; nested panels add no horizontal margin.
+        p.Margin <- Padding(0)
+        p.GrowStyle <- TableLayoutPanelGrowStyle.FixedSize
+        p.RowCount <- upperRowCount
+        p.ColumnCount <- 3
+        // AutoSize rather than a fixed 35 px, for the same reason
+        // UIHelper.buildForm is: a caption that does not fit the label column
+        // wraps onto a second line, and a fixed row height cut the wrapped
+        // text off. "Indent Normal" and "Indent Flipped" can overflow
+        // 250 px in French and Portuguese, so this panel needs the same
+        // treatment. Every label in column 0 carries a
+        // minimum height that reproduces the old 35-px row, so single-line
+        // rows are unchanged and only the wrapping ones grow.
+        List2([0..upperRowCount - 1]).iter <| fun _ ->
+            p.RowStyles.Add(RowStyle(SizeType.AutoSize)).ignore
+        // Match the Interaction page's UIHelper.form column width (250 px) so the
+        // longest translated labels still stay on a single line.
+        p.ColumnStyles.Add(ColumnStyle(SizeType.Absolute, float32 UIHelper.settingsLabelWidthPx)).ignore  // Label
+        p.ColumnStyles.Add(ColumnStyle(SizeType.Percent, 100.0f)).ignore   // Input
+        p.ColumnStyles.Add(ColumnStyle(SizeType.AutoSize)).ignore          // Reset button
+        p
+
+    // Color grid panel for color settings (separate from upper panel)
+    let colorPanel =
+        let p = TableLayoutPanel()
+        p.SuspendLayout()
+        p.Dock <- DockStyle.Top
+        p.AutoSize <- true
+        // Separate the theme section by half a settings row.
+        p.Margin <- Padding(0, UIHelper.settingsRowHeightPx / 2, 0, 0)
+        p.GrowStyle <- TableLayoutPanelGrowStyle.FixedSize
+        p.RowCount <- colorGridRowCount
+        p.ColumnCount <- 4
+        List2([0..colorGridRowCount - 1]).iter <| fun _ ->
+            p.RowStyles.Add(RowStyle(SizeType.Absolute, float32 UIHelper.settingsRowHeightPx)).ignore
+        // Match upperPanel's first column width (250px)
+        p.ColumnStyles.Add(ColumnStyle(SizeType.Absolute, float32 UIHelper.settingsLabelWidthPx)).ignore  // State label
+        p.ColumnStyles.Add(ColumnStyle(SizeType.Percent, 33.33f)).ignore   // Tab color
+        p.ColumnStyles.Add(ColumnStyle(SizeType.Percent, 33.33f)).ignore   // Text color
+        p.ColumnStyles.Add(ColumnStyle(SizeType.Percent, 33.34f)).ignore   // Border color
+        p
+
+    // Add sub-panels to main panel
+    do
+        topEdgePanel.Controls.Add(topHeader, 0, 0)
+        topEdgePanel.Controls.Add(upperPanel, 0, 1)
+        topEdgePanel.Controls.Add(placementPanel, 0, 2)
+        upperPanel.TabIndex <- 0
+        placementPanel.TabIndex <- 1
+        colorPage.Controls.Add(colorPanel, 0, 1)
+        colorPage.SetColumnSpan(colorPanel, 2)
+
+   
+    let getDefaultValue key =
+        let defaultAppearance = Services.program.defaultTabAppearanceInfo
+        Serialize.readField defaultAppearance key
+
+    let formatDefaultValue key =
+        let value = getDefaultValue key
+        match value with
+        | :? int as i -> sprintf "%d" i
+        | :? Color as c -> sprintf "#%06X" (c.ToArgb() &&& 0xFFFFFF)
+        | _ -> value.ToString()
+
+    // Content height that reproduces the historical fixed 35-px upperPanel row
+    // once a label's own top and bottom margins are added. The rows are
+    // AutoSize now, so without this a row would shrink to its tallest cell
+    // (the reset Button, 24 px + 10 px of margin) and every 100% layout would
+    // move. Scaled with everything else: Control.Scale multiplies MinimumSize.
+    // The state captions sit under "Tab colour", indented by about two
+    // characters of the settings font (about 10 px each at 96 dpi).
+    let colorCaptionIndentPx = 20
+
+    let rowMinimumHeight (topMargin: int) (bottomMargin: int) = UIHelper.settingsRowHeightPx - topMargin - bottomMargin
+
+    // Helper to create and place an int property editor at a specific row in upperPanel
+    let createIntEditorAt (target: TableLayoutPanel) (column: int) (prop: AppearanceProperty) (row: int) =
+        let label =
+            let label = Label()
+            label.AutoSize <- true
+            label.Text <- Localization.getString(prop.displayText)
+            label.TextAlign <- ContentAlignment.MiddleLeft
+            label.Anchor <- AnchorStyles.Left
+            label.Margin <- Padding(0, UIHelper.settingsRowMarginPx, 0, UIHelper.settingsRowMarginPx)
+            label.MinimumSize <- Size(0, rowMinimumHeight UIHelper.settingsRowMarginPx UIHelper.settingsRowMarginPx)
+            label
+        let editor = IntEditor() :> IPropEditor
+
+        editor.control.Anchor <- AnchorStyles.Left ||| AnchorStyles.Right
+        editor.control.Margin <- Padding(0, UIHelper.settingsRowMarginPx, 0, UIHelper.settingsRowMarginPx)
+        target.Controls.Add(label)
+        target.Controls.Add(editor.control)
+        target.SetRow(label, row)
+        target.SetColumn(label, column)
+        target.SetRow(editor.control, row)
+        target.SetColumn(editor.control, column + 1)
+
+        let resetBtn =
+            let btn = Button()
+            btn.Text <- sprintf "%s:%s" (Localization.getString("Reset")) (formatDefaultValue prop.key)
+            btn.AutoSize <- true
+            btn.AutoSizeMode <- AutoSizeMode.GrowAndShrink
+            btn.MinimumSize <- Size(0, SettingsField.heightPx)
+            btn.Dock <- DockStyle.Fill
+            btn.TextAlign <- ContentAlignment.MiddleLeft
+            btn.Margin <- Padding(5, UIHelper.settingsRowMarginPx, 0, UIHelper.settingsRowMarginPx)
+            btn.Click.Add <| fun _ ->
+                let previous = suppressEvents
+                suppressEvents <- true
+                try
+                    let defaultValue = getDefaultValue prop.key
+                    editor.value <- defaultValue
+                    this.applyAppearance()
+                finally
+                    suppressEvents <- previous
+            btn
+        target.Controls.Add(resetBtn)
+        target.SetRow(resetBtn, row)
+        target.SetColumn(resetBtn, column + 2)
+
+        (prop.key, editor)
+
+    // Row indices for each section
+    // Appearance page: tab shape -> size and spacing properties.
+    let darkModeRow = 0
+    let tabShapeRow = 0
+    // Color panel: theme row (0) -> header row (1) -> state rows (2-5)
+    let themeRow = 0  // Now in colorPanel
+    let colorHeaderRow = 1
+    let colorStateStartRow = 2
+
+    // Size and distance fields share the same paired layout.
+    let intEditors =
+        let regular = [createIntEditorAt upperPanel 0 (intProperties.list.[2]) 3]
+        let pairs = ResizeArray<TableLayoutPanel>()
+        let paired =
+            ["Tab size", "tabHeight", "Height", "tabMaxWidth", "Width (max)", 1
+             "Indent Normal", "tabIndentNormal", "Left", "tabIndentNormalRight", "Right", 4
+             "Indent Flipped", "tabIndentFlipped", "Left", "tabIndentFlippedRight", "Right", 5]
+            |> List.collect (fun (caption, leftKey, leftCaption, rightKey, rightCaption, row) ->
+                let label = Label(AutoSize = true, Text = Localization.getString(caption),
+                                  TextAlign = ContentAlignment.MiddleLeft, Anchor = AnchorStyles.Left,
+                                  Margin = Padding(0, UIHelper.settingsRowMarginPx, 0, UIHelper.settingsRowMarginPx),
+                                  MinimumSize = Size(0, rowMinimumHeight UIHelper.settingsRowMarginPx UIHelper.settingsRowMarginPx))
+                upperPanel.Controls.Add(label, 0, row)
+                let pair = EdgeRows.pairTable ()
+                pair.SuspendLayout()
+                let left = createIntEditorAt pair 0 (intConfig leftKey leftCaption) 0
+                let right = createIntEditorAt pair 3 (intConfig rightKey rightCaption) 0
+                EdgeRows.preparePair pair
+                upperPanel.Controls.Add(pair, 1, row)
+                upperPanel.SetColumnSpan(pair, 2)
+                pair.ResumeLayout(true)
+                pairs.Add(pair)
+                [left; right])
+        EdgeRows.alignPairs (upperPanel.GetControlFromPosition(2, 3)) pairs
+        List2(regular @ paired)
+
+    // Custom pinned tab width row with radio buttons (row 2 in upperPanel).
+    let pinnedWidthRow = 2
+
+    let pinnedWidthLabel =
+        let label = Label()
+        label.AutoSize <- true
+        label.Text <- Localization.getString("Pinned Tab Width")
+        label.TextAlign <- ContentAlignment.MiddleLeft
+        label.Anchor <- AnchorStyles.Left
+        label.Margin <- Padding(0, UIHelper.settingsRowMarginPx, 0, UIHelper.settingsRowMarginPx)
+        label.MinimumSize <- Size(0, rowMinimumHeight UIHelper.settingsRowMarginPx UIHelper.settingsRowMarginPx)
+        upperPanel.Controls.Add(label)
+        upperPanel.SetRow(label, pinnedWidthRow)
+        upperPanel.SetColumn(label, 0)
+        label
+
+    let pinnedWidthIconOnlyRadio = RadioButton()
+    let pinnedWidthSpecifyRadio = RadioButton()
+    let pinnedWidthNumeric = SettingsNumericUpDown.Create()
+
+    let pinnedWidthInputPanel =
+        let tbl = TableLayoutPanel()
+        tbl.ColumnCount <- 3
+        tbl.RowCount <- 1
+        tbl.Dock <- DockStyle.Fill
+        tbl.Margin <- Padding(0, UIHelper.settingsRowMarginPx, 0, UIHelper.settingsRowMarginPx)
+        // This cell in upperPanel contains a nested
+        // container rather than a single control, and that is what makes
+        // AutoSize on it mandatory. A TableLayoutPanel measuring an AutoSize
+        // ROW asks a child that is itself AutoSize for its preferred size, but
+        // takes a non-AutoSize child's CURRENT Size - and a Panel that has
+        // never been laid out is still at its 200 x 100 default. The row was
+        // therefore 100 px + 10 px of margin = 110 px instead of 35 px, which
+        // is what pushed the spinner above the radio buttons and stretched the
+        // Dock=Fill reset button into a tall grey box. Measured: rows go
+        // 35,35,110,35,35,35,35 -> 35,35,35,35,35,35,35 at 100% with these two
+        // lines plus the AutoSize row style below.
+        tbl.AutoSize <- true
+        tbl.AutoSizeMode <- AutoSizeMode.GrowAndShrink
+        tbl.ColumnStyles.Add(ColumnStyle(SizeType.AutoSize)).ignore   // Icon-only radio
+        tbl.ColumnStyles.Add(ColumnStyle(SizeType.AutoSize)).ignore   // Specify radio
+        tbl.ColumnStyles.Add(ColumnStyle(SizeType.Percent, 100.0f)).ignore  // NumericUpDown (fill)
+        // Percent here would ask the panel to fill a height it is no longer
+        // being given, leaving it with no intrinsic height to report upwards.
+        tbl.RowStyles.Add(RowStyle(SizeType.AutoSize)).ignore
+
+        pinnedWidthIconOnlyRadio.Text <- Localization.getString("PinnedWidthIconOnly")
+        pinnedWidthIconOnlyRadio.AutoSize <- true
+        // No vertical margins inside the row: the radios are centred in the
+        // row like the spinner beside them and the caption to the left.
+        // A 3-px bottom margin lifts the centred radio by about 1.5 px, which
+        // puts its text on the caption's line.
+        pinnedWidthIconOnlyRadio.Margin <- Padding(0,0,10,3)
+        pinnedWidthIconOnlyRadio.Anchor <- AnchorStyles.Left
+
+        pinnedWidthSpecifyRadio.Text <- Localization.getString("PinnedWidthSpecify")
+        pinnedWidthSpecifyRadio.AutoSize <- true
+        pinnedWidthSpecifyRadio.Margin <- Padding(0,0,5,3)
+        pinnedWidthSpecifyRadio.Anchor <- AnchorStyles.Left
+
+        pinnedWidthNumeric.Minimum <- 50m
+        pinnedWidthNumeric.Maximum <- 500m
+        pinnedWidthNumeric.Value <- 90m
+        pinnedWidthNumeric.Anchor <- AnchorStyles.Left ||| AnchorStyles.Right
+        pinnedWidthNumeric.Margin <- Padding(0)
+
+        tbl.Controls.Add(pinnedWidthIconOnlyRadio)
+        tbl.SetRow(pinnedWidthIconOnlyRadio, 0)
+        tbl.SetColumn(pinnedWidthIconOnlyRadio, 0)
+        tbl.Controls.Add(pinnedWidthSpecifyRadio)
+        tbl.SetRow(pinnedWidthSpecifyRadio, 0)
+        tbl.SetColumn(pinnedWidthSpecifyRadio, 1)
+        tbl.Controls.Add(pinnedWidthNumeric)
+        tbl.SetRow(pinnedWidthNumeric, 0)
+        tbl.SetColumn(pinnedWidthNumeric, 2)
+
+        upperPanel.Controls.Add(tbl)
+        upperPanel.SetRow(tbl, pinnedWidthRow)
+        upperPanel.SetColumn(tbl, 1)
+        tbl
+
+    let pinnedWidthResetBtn =
+        let btn = Button()
+        let defaultWidth = unbox<int>(getDefaultValue "tabPinnedTabWidth")
+        btn.Text <- sprintf "%s:%d" (Localization.getString("Reset")) defaultWidth
+        btn.AutoSize <- true
+        btn.AutoSizeMode <- AutoSizeMode.GrowAndShrink
+        btn.MinimumSize <- Size(btn.Width, SettingsField.heightPx)
+        btn.Dock <- DockStyle.Fill
+        btn.TextAlign <- ContentAlignment.MiddleLeft
+        btn.Margin <- Padding(5, UIHelper.settingsRowMarginPx, 0, UIHelper.settingsRowMarginPx)
+        btn.Click.Add <| fun _ ->
+            let previous = suppressEvents
+            suppressEvents <- true
+            try
+                pinnedWidthNumeric.Value <- decimal defaultWidth
+                this.applyAppearance()
+            finally
+                suppressEvents <- previous
+        upperPanel.Controls.Add(btn)
+        upperPanel.SetRow(btn, pinnedWidthRow)
+        upperPanel.SetColumn(btn, 2)
+        btn
+
+    // IPropEditor for pinned tab width numeric value (always holds the real value like 90)
+    let pinnedWidthNumericEditor : IPropEditor =
+        let changedEvent = Event<unit>()
+        let mutable updating = false
+        pinnedWidthNumeric.ValueChanged.Add(fun _ ->
+            if not updating then changedEvent.Trigger()
+        )
+        { new IPropEditor with
+            member x.value
+                with get() = box(int pinnedWidthNumeric.Value)
+                and set(newValue) =
+                    updating <- true
+                    try
+                        let v = unbox<int>(newValue)
+                        if v > 0 then
+                            pinnedWidthNumeric.Value <- decimal v
+                    finally
+                        updating <- false
+            member x.control = pinnedWidthInputPanel :> Control
+            member x.changed = changedEvent.Publish
+        }
+
+    // IPropEditor for pinned tab width icon-only boolean (radio button state)
+    let pinnedWidthIconEditor : IPropEditor =
+        let changedEvent = Event<unit>()
+        let mutable updating = false
+        pinnedWidthIconOnlyRadio.CheckedChanged.Add(fun _ ->
+            pinnedWidthNumeric.Enabled <- pinnedWidthSpecifyRadio.Checked
+            if not updating then changedEvent.Trigger()
+        )
+        { new IPropEditor with
+            member x.value
+                with get() = box(pinnedWidthIconOnlyRadio.Checked)
+                and set(newValue) =
+                    updating <- true
+                    try
+                        let v = unbox<bool>(newValue)
+                        pinnedWidthIconOnlyRadio.Checked <- v
+                        pinnedWidthSpecifyRadio.Checked <- not v
+                        pinnedWidthNumeric.Enabled <- not v
+                    finally
+                        updating <- false
+            member x.control = pinnedWidthInputPanel :> Control
+            member x.changed = changedEvent.Publish
+        }
+
+    // Tab style row: caption and drop-down, laid out like the
+    // int rows above it. Each item of the open list shows a picture of two
+    // neighbouring tabs next to the shape's name, drawn from the same outline
+    // the tab strip uses and with the Tab Overlap currently in the editor, so
+    // the shapes can be told apart - and how they meet - before one is chosen.
+    let tabShapeLabel =
+        let label = Label()
+        label.AutoSize <- true
+        label.Text <- Localization.getString("Tab Shape")
+        label.TextAlign <- ContentAlignment.MiddleLeft
+        label.Anchor <- AnchorStyles.Left
+        label.Margin <- Padding(0, UIHelper.settingsRowMarginPx, 0, UIHelper.settingsRowMarginPx)
+        label.MinimumSize <- Size(0, rowMinimumHeight UIHelper.settingsRowMarginPx UIHelper.settingsRowMarginPx)
+        upperPanel.Controls.Add(label)
+        upperPanel.SetRow(label, tabShapeRow)
+        upperPanel.SetColumn(label, 0)
+        label
+
+    // Tab Overlap as currently typed in its editor, in design pixels.
+    let editedTabOverlap () =
+        match intEditors.list |> List.tryFind (fun (key, _) -> key = "tabOverlap") with
+        | Some(_, editor) ->
+            match editor.value with
+            | :? int as overlap -> overlap
+            | _ -> 12
+        | None -> 12
+
+    let tabShapeCombo =
+        let combo = new DarkMode.PreviewComboBox()
+        combo.DropDownStyle <- ComboBoxStyle.DropDownList
+        // Variable owner-draw, as the color theme combo: the closed box keeps
+        // the height of a plain drop-down, the open list gets items tall
+        // enough for a picture that tells the shapes apart at 100%.
+        // ItemHeight (the closed box) is a 96-dpi design number, so
+        // SettingsDpi scales it from that; left to the font it is re-derived
+        // from the already scaled font and then scaled again. 14 is a plain
+        // drop-down list's own item height at the dialog font, so the box is
+        // as tall as the other Appearance page fields.
+        combo.DrawMode <- DrawMode.OwnerDrawVariable
+        combo.ItemHeight <- SettingsField.comboItemHeightPx
+        // Outside Bounds, so Control.Scale never sees it (see the color
+        // theme combo's MeasureItem).
+        combo.MeasureItem.Add <| fun e -> e.ItemHeight <- SettingsDpi.px 30
+        TabShape.all |> List.iter (fun shape ->
+            combo.Items.Add(Localization.getString(tabShapeCaption shape)) |> ignore)
+        combo.IntegralHeight <- false
+        combo.MaxDropDownItems <- TabShape.all.Length
+        let fitDropDown() =
+            // Recalculate on every opening, including after a monitor DPI change.
+            let rowsHeight =
+                [0 .. combo.Items.Count - 1]
+                |> List.sumBy (fun index -> max (SettingsDpi.px 30) (combo.GetItemHeight(index)))
+            combo.DropDownHeight <- rowsHeight + SettingsDpi.px 4
+            let textWidth =
+                combo.Items |> Seq.cast<obj>
+                |> Seq.map (fun item -> TextRenderer.MeasureText(string item, combo.Font).Width)
+                |> Seq.fold max 0
+            combo.DropDownWidth <- max combo.Width (textWidth + SettingsDpi.px 140)
+        combo.DropDown.Add(fun _ -> fitDropDown())
+        fitDropDown()
+        combo.SelectedIndex <- 0
+        combo.Anchor <- AnchorStyles.Left ||| AnchorStyles.Right
+        combo.Margin <- Padding(0, UIHelper.settingsRowMarginPx, 0, UIHelper.settingsRowMarginPx)
+        // Colors as in colorThemeComboBox's DrawItem: DarkMode leaves the
+        // drawing of an owner-drawn combo to its owner.
+        combo.DrawItem.Add <| fun e ->
+            let darkOn = isDarkModeEnabled()
+            let isSelected = (e.State &&& DrawItemState.Selected) <> DrawItemState.None
+            let background =
+                if darkOn then (if isSelected then DarkMode.darkAccent else DarkMode.darkPanel)
+                else e.BackColor
+            if darkOn then
+                use bg = new SolidBrush(background)
+                e.Graphics.FillRectangle(bg, e.Bounds)
+            else
+                e.DrawBackground()
+            if e.Index >= 0 && e.Index < TabShape.all.Length then
+                let textColor = if darkOn then DarkMode.darkText else e.ForeColor
+                let pad = max 2 (e.Bounds.Height / 6)
+                let previewHeight = max 4 (e.Bounds.Height - 2 * pad - 1)
+                // The closed box is a plain drop-down's height: one small
+                // tab as a reminder. The open list: two tabs as they meet.
+                let isEdit = (e.State &&& DrawItemState.ComboBoxEdit) <> DrawItemState.None
+                let previewWidth =
+                    EdgeRows.drawTabShapePreview TabEdges.Edge.Top None
+                        false e.Graphics TabShape.all.[e.Index] (e.Bounds.Left + pad + 2) (e.Bounds.Top + pad) previewHeight
+                        (if isEdit then 1 else 2) (editedTabOverlap ()) textColor background
+                let textBounds =
+                    Rectangle(e.Bounds.Left + pad + 2 + previewWidth + pad * 2, e.Bounds.Top,
+                              max 0 (e.Bounds.Width - previewWidth - pad * 4 - 2), e.Bounds.Height)
+                TextRenderer.DrawText(
+                    e.Graphics, combo.Items.[e.Index].ToString(), e.Font, textBounds, textColor,
+                    TextFormatFlags.Left ||| TextFormatFlags.VerticalCenter ||| TextFormatFlags.EndEllipsis)
+            e.DrawFocusRectangle()
+        upperPanel.Controls.Add(combo)
+        upperPanel.SetRow(combo, tabShapeRow)
+        upperPanel.SetColumn(combo, 1)
+        upperPanel.SetColumnSpan(combo, 2)
+        combo
+
+    let tabShapeEditor : IPropEditor =
+        let changedEvent = Event<unit>()
+        let mutable updating = false
+        tabShapeCombo.SelectedIndexChanged.Add(fun _ ->
+            if not updating then changedEvent.Trigger()
+        )
+        { new IPropEditor with
+            member x.value
+                with get() =
+                    let index = tabShapeCombo.SelectedIndex
+                    box(if index >= 0 && index < TabShape.all.Length then TabShape.all.[index] else TabShape.scurve)
+                and set(newValue) =
+                    updating <- true
+                    try
+                        let shape = TabShape.normalize(match newValue with :? string as s -> s | _ -> null)
+                        tabShapeCombo.SelectedIndex <- TabShape.all |> List.findIndex ((=) shape)
+                    finally
+                        updating <- false
+            member x.control = tabShapeCombo :> Control
+            member x.changed = changedEvent.Publish
+        }
+
+    // Create color editors storage
+    let mutable colorEditorsList : (string * IPropEditor) list = []
+
+    // Create color grid header row in colorPanel
+    do
+        let headerLabels = [
+            (Localization.getString("TabColorHeader"), 0)   // State column label
+            (Localization.getString("TabColor"), 1)         // Tab color column header
+            (Localization.getString("TextColor"), 2)        // Text color column header
+            (Localization.getString("BorderColor"), 3)      // Border color column header
+        ]
+        headerLabels |> List.iter (fun (text, col) ->
+            let label = Label()
+            label.AutoSize <- true
+            label.Text <- text
+            label.TextAlign <- ContentAlignment.MiddleLeft
+            // Vertically centred in the row, like the int-editor captions.
+            // The caption column below the color theme is indented by about
+            // two characters; the column headers keep their left edge.
+            label.Anchor <- AnchorStyles.Left
+            label.Margin <- Padding((if col = 0 then colorCaptionIndentPx else 0), 0, 0, 0)
+            colorPanel.Controls.Add(label)
+            colorPanel.SetRow(label, colorHeaderRow)
+            colorPanel.SetColumn(label, col)
+        )
+
+    // Create color state rows with 3 color editors each in colorPanel
+    do
+        colorStateRows |> List.iteri (fun rowIndex (stateName, colorCols) ->
+            let row = colorStateStartRow + rowIndex
+
+            // State label (column 0)
+            let stateLabel = Label()
+            stateLabel.AutoSize <- true
+            stateLabel.Text <- Localization.getString(stateName)
+            stateLabel.TextAlign <- ContentAlignment.MiddleLeft
+            // Centred in the row, on the same line as the color editors.
+            stateLabel.Anchor <- AnchorStyles.Left
+            stateLabel.Margin <- Padding(colorCaptionIndentPx, 0, 0, 0)
+            colorPanel.Controls.Add(stateLabel)
+            colorPanel.SetRow(stateLabel, row)
+            colorPanel.SetColumn(stateLabel, 0)
+
+            // Color editors (columns 1, 2, 3)
+            let lastColIndex = colorCols.Length - 1
+            colorCols |> List.iteri (fun colIndex (key, _) ->
+                let editor = ColorEditor() :> IPropEditor
+                // Dock.Fill so the textbox stretches across the whole cell
+                // and the rightmost editor's right edge sits at the panel's
+                // right edge (no large empty gap on the right side).
+                editor.control.Anchor <- AnchorStyles.Left ||| AnchorStyles.Right
+                let isLastCol = colIndex = lastColIndex
+                let rightMargin = if isLastCol then 0 else 20
+                editor.control.Margin <- Padding(0, 0, rightMargin, 0)
+                colorPanel.Controls.Add(editor.control)
+                colorPanel.SetRow(editor.control, row)
+                colorPanel.SetColumn(editor.control, colIndex + 1)  // columns 1, 2, 3
+                colorEditorsList <- colorEditorsList @ [(key, editor)]
+            )
+        )
+
+    // Combine all editors into a map
+    let editors : Map2<string, IPropEditor> =
+        (intEditors.list @ [("tabPinnedTabWidth", pinnedWidthNumericEditor); ("tabPinnedTabWidthIcon", pinnedWidthIconEditor); ("tabShape", tabShapeEditor)] @ colorEditorsList)
+        |> List.fold (fun (acc: Map2<string, IPropEditor>) (key, editor) -> acc.add key editor) (Map2())
+
+    // Unified dark mode checkbox: drives both menu (system tray / tab
+    // context menu) and settings dialog appearance. The settings dialog
+    // reads the value at open time, so toggling it takes effect on the
+    // NEXT open rather than live-updating the running dialog.
+    let darkModeLabel =
+        let label = Label()
+        label.AutoSize <- true
+        label.Text <- Localization.getString("DarkMode")
+        label.TextAlign <- ContentAlignment.MiddleLeft
+        label.Margin <- Padding(0, UIHelper.settingsRowMarginPx, 0, UIHelper.settingsRowMarginPx)
+        label.MinimumSize <- Size(0, rowMinimumHeight UIHelper.settingsRowMarginPx UIHelper.settingsRowMarginPx)
+        colorPage.Controls.Add(label)
+        colorPage.SetRow(label, darkModeRow)
+        colorPage.SetColumn(label, 0)
+        label
+
+    let darkModeCheckbox =
+        let checkbox = settingsCheckboxBool "EnableDarkMode" false
+        checkbox.Margin <- Padding(0, UIHelper.settingsRowMarginPx, 0, UIHelper.settingsRowMarginPx)
+        // Every other control in the settings views either fills its cell
+        // (Dock), stretches with it (Anchor Left|Right) or sizes itself to its
+        // text (AutoSize). This one does none of those - a bare CheckBox with
+        // no caption - so it is the single control in the dialog whose width
+        // is whatever it happened to be when someone last wrote its Bounds.
+        // Control.Scale writes Bounds on everything it walks, so if the panel
+        // has not been laid out yet the 1-px width a not-yet-sized cell
+        // produced gets frozen in and the user sees a 1-px grey line instead
+        // of a check box. SettingsDpi.applyScale now lays the window out
+        // first, which fixes the cause; pinning the design size as a floor
+        // makes the control immune to it happening again. Control.Scale
+        // multiplies MinimumSize like every other 96-dpi design number, so
+        // this scales with the rest and 100% is untouched.
+        checkbox.MinimumSize <- checkbox.Size
+        colorPage.Controls.Add(checkbox)
+        colorPage.SetRow(checkbox, darkModeRow)
+        colorPage.SetColumn(checkbox, 1)
+        checkbox
+
+    // ---- "Tab position" and the edges' pages (8) ----
+
+    let edgeCaption (edge: TabEdges.Edge) =
+        Localization.getString(
+            match edge with
+            | TabEdges.Edge.Top -> "TopTabs"
+            | TabEdges.Edge.Left -> "LeftTabs"
+            | TabEdges.Edge.Right -> "RightTabs"
+            | TabEdges.Edge.Bottom -> "BottomTabs")
+
+    // The pages of the left, right and bottom edges; the top edge's page is
+    // topEdgePanel.
+    let edgePanels = Collections.Generic.Dictionary<TabEdges.Edge, EdgeSettingsPanel>()
+
+    let mutable refreshingEdges = false
+
+    // Each page keeps its enable toggle available while its settings are disabled.
+    let edgeTabs =
+        let tabs = new SettingsSurfaceTabControl()
+        tabs.Dock <- DockStyle.Top
+        tabs.Margin <- Padding(0)
+        for edge in TabEdges.priority do
+            let page = new TabPage(edgeCaption edge)
+            page.UseVisualStyleBackColor <- false
+            // Inherit the light form surface; DarkMode supplies its form surface.
+            page.BackColor <- SystemColors.Control
+            // The outer Appearance page scrolls when needed; this tab fits its content.
+            page.AutoScroll <- false
+            page.Padding <- UIHelper.settingsPagePadding
+            if edge = TabEdges.Edge.Top then
+                topEdgePanel.Dock <- DockStyle.Top
+                page.Controls.Add(topEdgePanel)
+            tabs.TabPages.Add(page)
+        tabs
+
+    do
+        // Each inner page includes the native tab border in the shared horizontal inset.
+        panel.Padding <- Padding(0, UIHelper.settingsPageMarginPx, 0, UIHelper.settingsPageMarginPx)
+        panel.Controls.Add(edgeTabs)
+        panel.SetRow(edgeTabs, 0)
+        panel.SetColumn(edgeTabs, 0)
+
+    let checkedEdges () = edgeChecks |> List.filter (fun (_, check) -> check.Checked) |> List.map fst
+
+    let alignEdgePageMargins () =
+        let margin = SettingsDpi.px UIHelper.settingsPageMarginPx
+        let display = edgeTabs.DisplayRectangle
+        let padding = Padding(max 0 (margin - display.Left), margin,
+                              max 0 (margin - (edgeTabs.ClientSize.Width - display.Right)), margin)
+        for page in edgeTabs.TabPages do
+            if page.Padding <> padding then page.Padding <- padding
+
+    let resizeEdgeTabs () =
+        alignEdgePageMargins ()
+        let page = edgeTabs.SelectedTab
+        if not (isNull page) && page.Controls.Count > 0 then
+            let content = page.Controls.[0]
+            let width = max 1 (edgeTabs.DisplayRectangle.Width - page.Padding.Horizontal)
+            let height = content.GetPreferredSize(Size(width, 0)).Height
+            let chrome = edgeTabs.Height - edgeTabs.DisplayRectangle.Height
+            let wanted = height + page.Padding.Vertical + max edgeTabs.ItemSize.Height chrome + 4
+            if edgeTabs.Height <> wanted then edgeTabs.Height <- wanted
+
+    do
+        // Build every page in design units before the form's first DPI snapshot.
+        // The form scales and themes the entire tree, including hidden pages.
+        for index, edge in List.indexed TabEdges.priority do
+            if edge <> TabEdges.Edge.Top then
+                let scale = SettingsDpi.current()
+                let p =
+                    SettingsDpi.setCurrent 1.0
+                    try EdgeSettingsPanel(edge, (edgeChecks |> List.find (fun (candidate, _) -> candidate = edge) |> snd), fun () -> this.refresh())
+                    finally SettingsDpi.setCurrent scale
+                edgePanels.Add(edge, p)
+                p.refresh()
+                p.control.Dock <- DockStyle.Top
+                edgeTabs.TabPages.[index].Controls.Add(p.control)
+                // Inherit the form font for both initial and later monitor scaling.
+                p.control.Font <- null
+                p.setEnabled(List.contains edge (checkedEdges ()))
+
+    let refreshEdgePage () =
+        let index = edgeTabs.SelectedIndex
+        if index > 0 then
+            edgePanels.[TabEdges.priority.[index]].refresh()
+        resizeEdgeTabs ()
+
+    let showEdgeState () =
+        let now = checkedEdges ()
+        for edge, check in edgeChecks do
+            check.Enabled <- not (check.Checked && now.Length = 1)
+            if edge = TabEdges.Edge.Top then
+                upperPanel.Enabled <- check.Checked
+                placementPanel.Enabled <- check.Checked
+                topCopyButton.Enabled <- check.Checked
+            else
+                edgePanels.[edge].setEnabled(check.Checked)
+
+    do
+        edgeTabs.SelectedIndexChanged.Add(fun _ -> refreshEdgePage ())
+        edgeTabs.SizeChanged.Add(fun _ -> resizeEdgeTabs ())
+        topEdgePanel.SizeChanged.Add(fun _ -> resizeEdgeTabs ())
+
+    do
+        for _, check in edgeChecks do
+            check.CheckedChanged.Add(fun _ ->
+                showEdgeState ()
+                let now = checkedEdges ()
+                if not suppressEvents && not refreshingEdges && not (List.isEmpty now) then
+                    let root = Services.settings.root
+                    TabEdgeSettings.writeListed root now
+                    Services.settings.root <- root
+                    TabEdgeSettings.changed.Trigger())
+
+    // The checks and the edges' pages as the settings file has them; writes
+    // nothing.
+    let showEdges () =
+        let previous = refreshingEdges
+        refreshingEdges <- true
+        try
+            let listed = try TabEdgeSettings.listedOf Services.settings.root with _ -> [ TabEdges.Edge.Top ]
+            for edge, check in edgeChecks do check.Checked <- List.contains edge listed
+            showEdgeState ()
+        finally refreshingEdges <- previous
+        for p in edgePanels.Values do p.refresh()
+        resizeEdgeTabs ()
+
+    let setEditorValues appearance =
+        allPropertyKeys |> List.iter (fun key ->
+            let editor = editors.find key
+            try
+                editor.value <- Serialize.readField appearance key
+            with | _ -> ()
+        )
+
+    let appearance = Services.program.tabAppearanceInfo
+
+
+    // Color key mapping for clipboard operations
+    let colorKeyMap = [
+        ("tabInactiveTextColor", "InactiveTextColor")
+        ("tabSelectedTextColor", "SelectedTextColor")
+        ("tabMouseOverTextColor", "MouseOverTextColor")
+        ("tabActiveTextColor", "ActiveTextColor")
+        ("tabFlashTextColor", "FlashTextColor")
+        ("tabInactiveTabColor", "InactiveTabColor")
+        ("tabSelectedTabColor", "SelectedTabColor")
+        ("tabMouseOverTabColor", "MouseOverTabColor")
+        ("tabActiveTabColor", "ActiveTabColor")
+        ("tabFlashTabColor", "FlashTabColor")
+        ("tabInactiveBorderColor", "InactiveBorderColor")
+        ("tabSelectedBorderColor", "SelectedBorderColor")
+        ("tabMouseOverBorderColor", "MouseOverBorderColor")
+        ("tabActiveBorderColor", "ActiveBorderColor")
+        ("tabFlashBorderColor", "FlashBorderColor")
+    ]
+
+    // Load custom themes from settings
+    let loadCustomThemes() : ColorThemeData list =
+        try
+            let json = Services.settings.root
+            match json.getObjectArray("CustomColorThemes") with
+            | Some(arr) ->
+                arr.list |> List.choose (fun item ->
+                    try
+                        // Selected colors were added later. For older saved themes
+                        // missing the field, derive a sensible default: tab color
+                        // is the midpoint of Inactive ↔ MouseOver, text and border
+                        // colors fall back to Inactive's values.
+                        let inactiveTab = item.getInt32("inactiveTabColor") |> Option.defaultValue 0
+                        let mouseOverTab = item.getInt32("mouseOverTabColor") |> Option.defaultValue 0
+                        let inactiveText = item.getInt32("inactiveTextColor") |> Option.defaultValue 0
+                        let inactiveBorder = item.getInt32("inactiveBorderColor") |> Option.defaultValue 0
+                        let midpointInt (a: int) (b: int) =
+                            let r = (((a >>> 16) &&& 0xFF) + ((b >>> 16) &&& 0xFF)) / 2
+                            let g = (((a >>> 8) &&& 0xFF) + ((b >>> 8) &&& 0xFF)) / 2
+                            let bl = ((a &&& 0xFF) + (b &&& 0xFF)) / 2
+                            (r <<< 16) ||| (g <<< 8) ||| bl
+                        Some {
+                            name = item.getString("name") |> Option.defaultValue ""
+                            inactiveTextColor = inactiveText
+                            selectedTextColor = item.getInt32("selectedTextColor") |> Option.defaultValue inactiveText
+                            mouseOverTextColor = item.getInt32("mouseOverTextColor") |> Option.defaultValue 0
+                            activeTextColor = item.getInt32("activeTextColor") |> Option.defaultValue 0
+                            flashTextColor = item.getInt32("flashTextColor") |> Option.defaultValue 0
+                            inactiveTabColor = inactiveTab
+                            selectedTabColor = item.getInt32("selectedTabColor") |> Option.defaultValue (midpointInt inactiveTab mouseOverTab)
+                            mouseOverTabColor = mouseOverTab
+                            activeTabColor = item.getInt32("activeTabColor") |> Option.defaultValue 0
+                            flashTabColor = item.getInt32("flashTabColor") |> Option.defaultValue 0
+                            inactiveBorderColor = inactiveBorder
+                            selectedBorderColor = item.getInt32("selectedBorderColor") |> Option.defaultValue inactiveBorder
+                            mouseOverBorderColor = item.getInt32("mouseOverBorderColor") |> Option.defaultValue 0
+                            activeBorderColor = item.getInt32("activeBorderColor") |> Option.defaultValue 0
+                            flashBorderColor = item.getInt32("flashBorderColor") |> Option.defaultValue 0
+                        }
+                    with | _ -> None
+                )
+            | None -> []
+        with | _ -> []
+
+    // Save custom themes to settings
+    let saveCustomThemes (themes: ColorThemeData list) =
+        let json = Services.settings.root
+        let arr = themes |> List.map (fun t ->
+            let item = JObject()
+            item.setString("name", t.name)
+            item.setInt32("inactiveTextColor", t.inactiveTextColor)
+            item.setInt32("selectedTextColor", t.selectedTextColor)
+            item.setInt32("mouseOverTextColor", t.mouseOverTextColor)
+            item.setInt32("activeTextColor", t.activeTextColor)
+            item.setInt32("flashTextColor", t.flashTextColor)
+            item.setInt32("inactiveTabColor", t.inactiveTabColor)
+            item.setInt32("selectedTabColor", t.selectedTabColor)
+            item.setInt32("mouseOverTabColor", t.mouseOverTabColor)
+            item.setInt32("activeTabColor", t.activeTabColor)
+            item.setInt32("flashTabColor", t.flashTabColor)
+            item.setInt32("inactiveBorderColor", t.inactiveBorderColor)
+            item.setInt32("selectedBorderColor", t.selectedBorderColor)
+            item.setInt32("mouseOverBorderColor", t.mouseOverBorderColor)
+            item.setInt32("activeBorderColor", t.activeBorderColor)
+            item.setInt32("flashBorderColor", t.flashBorderColor)
+            item
+        )
+        json.setObjectArray("CustomColorThemes", List2(arr))
+        Services.settings.root <- json
+
+    // Mutable list of custom themes
+    let mutable customThemes = loadCustomThemes()
+
+    // Preset themes (built-in)
+    let presetThemes = ["Light"; "Light Mono"; "Dark"; "Dark Blue"; "Dark Mono 1"; "Dark Mono 2"; "Dark Mono 3"; "Night Horizon"; "Dark Red Frame"]
+
+    // Load saved Custom theme colors from settings
+    let loadSavedCustomColors() : ColorThemeData option =
+        try
+            let json = Services.settings.root
+            match json.getObject("SavedCustomColors") with
+            | Some(item) ->
+                // Check if item has required fields
+                match item.getInt32("inactiveTextColor") with
+                | Some _ ->
+                    let inactiveTab = item.getInt32("inactiveTabColor") |> Option.defaultValue 0
+                    let mouseOverTab = item.getInt32("mouseOverTabColor") |> Option.defaultValue 0
+                    let inactiveText = item.getInt32("inactiveTextColor") |> Option.defaultValue 0
+                    let inactiveBorder = item.getInt32("inactiveBorderColor") |> Option.defaultValue 0
+                    let midpointInt (a: int) (b: int) =
+                        let r = (((a >>> 16) &&& 0xFF) + ((b >>> 16) &&& 0xFF)) / 2
+                        let g = (((a >>> 8) &&& 0xFF) + ((b >>> 8) &&& 0xFF)) / 2
+                        let bl = ((a &&& 0xFF) + (b &&& 0xFF)) / 2
+                        (r <<< 16) ||| (g <<< 8) ||| bl
+                    Some {
+                        name = "Custom"
+                        inactiveTextColor = inactiveText
+                        selectedTextColor = item.getInt32("selectedTextColor") |> Option.defaultValue inactiveText
+                        mouseOverTextColor = item.getInt32("mouseOverTextColor") |> Option.defaultValue 0
+                        activeTextColor = item.getInt32("activeTextColor") |> Option.defaultValue 0
+                        flashTextColor = item.getInt32("flashTextColor") |> Option.defaultValue 0
+                        inactiveTabColor = inactiveTab
+                        selectedTabColor = item.getInt32("selectedTabColor") |> Option.defaultValue (midpointInt inactiveTab mouseOverTab)
+                        mouseOverTabColor = mouseOverTab
+                        activeTabColor = item.getInt32("activeTabColor") |> Option.defaultValue 0
+                        flashTabColor = item.getInt32("flashTabColor") |> Option.defaultValue 0
+                        inactiveBorderColor = inactiveBorder
+                        selectedBorderColor = item.getInt32("selectedBorderColor") |> Option.defaultValue inactiveBorder
+                        mouseOverBorderColor = item.getInt32("mouseOverBorderColor") |> Option.defaultValue 0
+                        activeBorderColor = item.getInt32("activeBorderColor") |> Option.defaultValue 0
+                        flashBorderColor = item.getInt32("flashBorderColor") |> Option.defaultValue 0
+                    }
+                | None -> None
+            | None -> None
+        with | _ -> None
+
+    // Save saved Custom theme colors to settings
+    let saveSavedCustomColors (colors: ColorThemeData option) =
+        let json = Services.settings.root
+        match colors with
+        | Some c ->
+            let item = JObject()
+            item.setInt32("inactiveTextColor", c.inactiveTextColor)
+            item.setInt32("selectedTextColor", c.selectedTextColor)
+            item.setInt32("mouseOverTextColor", c.mouseOverTextColor)
+            item.setInt32("activeTextColor", c.activeTextColor)
+            item.setInt32("flashTextColor", c.flashTextColor)
+            item.setInt32("inactiveTabColor", c.inactiveTabColor)
+            item.setInt32("selectedTabColor", c.selectedTabColor)
+            item.setInt32("mouseOverTabColor", c.mouseOverTabColor)
+            item.setInt32("activeTabColor", c.activeTabColor)
+            item.setInt32("flashTabColor", c.flashTabColor)
+            item.setInt32("inactiveBorderColor", c.inactiveBorderColor)
+            item.setInt32("selectedBorderColor", c.selectedBorderColor)
+            item.setInt32("mouseOverBorderColor", c.mouseOverBorderColor)
+            item.setInt32("activeBorderColor", c.activeBorderColor)
+            item.setInt32("flashBorderColor", c.flashBorderColor)
+            json.setObject("SavedCustomColors", item)
+        | None ->
+            // Remove the key if None
+            json.update("SavedCustomColors", None)
+        Services.settings.root <- json
+
+    // Saved Custom theme colors (for restoring when Custom is selected)
+    // Load from settings on initialization
+    let mutable savedCustomColors : ColorThemeData option = loadSavedCustomColors()
+
+    // Build ComboBox items list (no separator items - separators are drawn in DrawItem)
+    // UnsavedCustom (Custom) is always shown - defaults to Light theme colors if not saved
+    let buildThemeItems() =
+        let items = ResizeArray<ThemeItem>()
+        // Presets
+        presetThemes |> List.iter (fun name -> items.Add(Preset name))
+        // Custom themes
+        customThemes |> List.iter (fun t -> items.Add(CustomTheme t.name))
+        // Always add UnsavedCustom (Custom) - will use Light theme colors as default if not saved
+        items.Add(UnsavedCustom)
+        items.ToArray() |> Array.toList
+
+    let mutable themeItems = buildThemeItems()
+
+    // Color theme ComboBox with owner-draw for separator lines
+    let colorThemeComboBox =
+        let combo = new ComboBox()
+        combo.DropDownStyle <- ComboBoxStyle.DropDownList
+        combo.DrawMode <- DrawMode.OwnerDrawVariable
+        combo.ItemHeight <- SettingsField.comboItemHeightPx
+        combo.Margin <- Padding(0, 0, 3, 0)  // Remove left margin, small right margin
+        combo.IntegralHeight <- false
+        // Show every built-in theme without scrolling; a long custom list still scrolls.
+        combo.DropDown.Add(fun _ ->
+            let rows = min 16 combo.Items.Count
+            combo.DropDownHeight <-
+                ([0 .. rows - 1] |> List.sumBy combo.GetItemHeight) + SettingsDpi.px 4)
+        combo
+
+    // Save button, Edit button, and Up/Down buttons (created early so we can reference them)
+    let saveBtn = new Button()
+    let editBtn = new Button()
+    let upBtn = new Button()
+    let downBtn = new Button()
+
+    // Refresh ComboBox items
+    let refreshComboBoxItems() =
+        themeItems <- buildThemeItems()
+        let previous = suppressEvents
+        suppressEvents <- true
+        try
+            colorThemeComboBox.Items.Clear()
+            themeItems |> List.iter (fun item ->
+                match item with
+                | Preset name -> colorThemeComboBox.Items.Add(name) |> ignore
+                | CustomTheme name -> colorThemeComboBox.Items.Add(name) |> ignore
+                | UnsavedCustom -> colorThemeComboBox.Items.Add("Custom") |> ignore
+            )
+        finally
+            suppressEvents <- previous
+
+    // Initialize ComboBox items
+    do refreshComboBoxItems()
+
+    // Get current colors as ColorThemeData
+    let getCurrentColors() =
+        let getColor key =
+            let editor = editors.find key
+            let c = unbox<Color>(editor.value)
+            c.ToArgb() &&& 0xFFFFFF
+        {
+            name = ""
+            inactiveTextColor = getColor "tabInactiveTextColor"
+            selectedTextColor = getColor "tabSelectedTextColor"
+            mouseOverTextColor = getColor "tabMouseOverTextColor"
+            activeTextColor = getColor "tabActiveTextColor"
+            flashTextColor = getColor "tabFlashTextColor"
+            inactiveTabColor = getColor "tabInactiveTabColor"
+            selectedTabColor = getColor "tabSelectedTabColor"
+            mouseOverTabColor = getColor "tabMouseOverTabColor"
+            activeTabColor = getColor "tabActiveTabColor"
+            flashTabColor = getColor "tabFlashTabColor"
+            inactiveBorderColor = getColor "tabInactiveBorderColor"
+            selectedBorderColor = getColor "tabSelectedBorderColor"
+            mouseOverBorderColor = getColor "tabMouseOverBorderColor"
+            activeBorderColor = getColor "tabActiveBorderColor"
+            flashBorderColor = getColor "tabFlashBorderColor"
+        }
+
+    // Check if colors match a theme
+    let colorsMatch (theme: ColorThemeData) (current: ColorThemeData) =
+        theme.inactiveTextColor = current.inactiveTextColor &&
+        theme.selectedTextColor = current.selectedTextColor &&
+        theme.mouseOverTextColor = current.mouseOverTextColor &&
+        theme.activeTextColor = current.activeTextColor &&
+        theme.flashTextColor = current.flashTextColor &&
+        theme.inactiveTabColor = current.inactiveTabColor &&
+        theme.selectedTabColor = current.selectedTabColor &&
+        theme.mouseOverTabColor = current.mouseOverTabColor &&
+        theme.activeTabColor = current.activeTabColor &&
+        theme.flashTabColor = current.flashTabColor &&
+        theme.inactiveBorderColor = current.inactiveBorderColor &&
+        theme.selectedBorderColor = current.selectedBorderColor &&
+        theme.mouseOverBorderColor = current.mouseOverBorderColor &&
+        theme.activeBorderColor = current.activeBorderColor &&
+        theme.flashBorderColor = current.flashBorderColor
+
+    // Get preset theme colors
+    let getPresetColors (name: string) =
+        let appearance =
+            match name with
+            | "Light" -> Services.program.defaultTabAppearanceInfo
+            | "Light Mono" -> Services.program.lightMonoTabAppearanceInfo
+            | "Dark" -> Services.program.darkModeTabAppearanceInfo
+            | "Dark Blue" -> Services.program.darkModeBlueTabAppearanceInfo
+            | "Dark Mono 1" -> Services.program.darkMonoTabAppearanceInfo
+            | "Dark Mono 2" -> Services.program.darkMono2TabAppearanceInfo
+            | "Dark Mono 3" -> Services.program.darkMono3TabAppearanceInfo
+            | "Night Horizon" -> Services.program.nightHorizonTabAppearanceInfo
+            | "Dark Red Frame" -> Services.program.darkRedFrameTabAppearanceInfo
+            | _ -> Services.program.defaultTabAppearanceInfo
+        {
+            name = name
+            inactiveTextColor = appearance.tabInactiveTextColor.ToArgb() &&& 0xFFFFFF
+            selectedTextColor = appearance.tabSelectedTextColor.ToArgb() &&& 0xFFFFFF
+            mouseOverTextColor = appearance.tabMouseOverTextColor.ToArgb() &&& 0xFFFFFF
+            activeTextColor = appearance.tabActiveTextColor.ToArgb() &&& 0xFFFFFF
+            flashTextColor = appearance.tabFlashTextColor.ToArgb() &&& 0xFFFFFF
+            inactiveTabColor = appearance.tabInactiveTabColor.ToArgb() &&& 0xFFFFFF
+            selectedTabColor = appearance.tabSelectedTabColor.ToArgb() &&& 0xFFFFFF
+            mouseOverTabColor = appearance.tabMouseOverTabColor.ToArgb() &&& 0xFFFFFF
+            activeTabColor = appearance.tabActiveTabColor.ToArgb() &&& 0xFFFFFF
+            flashTabColor = appearance.tabFlashTabColor.ToArgb() &&& 0xFFFFFF
+            inactiveBorderColor = appearance.tabInactiveBorderColor.ToArgb() &&& 0xFFFFFF
+            selectedBorderColor = appearance.tabSelectedBorderColor.ToArgb() &&& 0xFFFFFF
+            mouseOverBorderColor = appearance.tabMouseOverBorderColor.ToArgb() &&& 0xFFFFFF
+            activeBorderColor = appearance.tabActiveBorderColor.ToArgb() &&& 0xFFFFFF
+            flashBorderColor = appearance.tabFlashBorderColor.ToArgb() &&& 0xFFFFFF
+        }
+
+    // Find matching theme index
+    let findMatchingTheme() =
+        let current = getCurrentColors()
+        let mutable found = -1
+        themeItems |> List.iteri (fun i item ->
+            if found < 0 then
+                match item with
+                | Preset name ->
+                    if colorsMatch (getPresetColors name) current then found <- i
+                | CustomTheme name ->
+                    match customThemes |> List.tryFind (fun t -> t.name = name) with
+                    | Some theme -> if colorsMatch theme current then found <- i
+                    | None -> ()
+                | _ -> ()
+        )
+        found
+
+    // Get custom theme index in customThemes list by name
+    let getCustomThemeIndex (name: string) =
+        customThemes |> List.tryFindIndex (fun t -> t.name = name)
+
+    // Update button state based on selection
+    let updateButtonState() =
+        if colorThemeComboBox.SelectedIndex >= 0 && colorThemeComboBox.SelectedIndex < themeItems.Length then
+            match themeItems.[colorThemeComboBox.SelectedIndex] with
+            | Preset _ ->
+                // Hide all buttons for preset themes
+                saveBtn.Visible <- false
+                editBtn.Visible <- false
+                upBtn.Visible <- false
+                downBtn.Visible <- false
+            | CustomTheme name ->
+                // Show edit button for custom themes
+                saveBtn.Visible <- false
+                editBtn.Visible <- true
+                editBtn.Enabled <- true
+                upBtn.Visible <- true
+                downBtn.Visible <- true
+                // Enable/disable up/down buttons based on position
+                match getCustomThemeIndex name with
+                | Some idx ->
+                    upBtn.Enabled <- idx > 0
+                    downBtn.Enabled <- idx < customThemes.Length - 1
+                | None ->
+                    upBtn.Enabled <- false
+                    downBtn.Enabled <- false
+            | UnsavedCustom ->
+                // Show save button for unsaved custom
+                saveBtn.Visible <- true
+                saveBtn.Enabled <- true
+                editBtn.Visible <- false
+                upBtn.Visible <- false
+                downBtn.Visible <- false
+
+    // Helper function to apply color preset
+    let applyColorPreset (presetAppearance: TabAppearanceInfo) =
+        let previous = suppressEvents
+        suppressEvents <- true
+        try
+            let currentAppearance = Services.program.tabAppearanceInfo
+            let mergedAppearance = {
+                tabHeight = currentAppearance.tabHeight
+                tabMaxWidth = currentAppearance.tabMaxWidth
+                tabPinnedTabWidth = currentAppearance.tabPinnedTabWidth
+                tabPinnedTabWidthIcon = currentAppearance.tabPinnedTabWidthIcon
+                tabOverlap = currentAppearance.tabOverlap
+                tabHeightOffset = currentAppearance.tabHeightOffset
+                tabIndentFlipped = currentAppearance.tabIndentFlipped
+                tabIndentFlippedRight = currentAppearance.tabIndentFlippedRight
+                tabIndentNormal = currentAppearance.tabIndentNormal
+                tabIndentNormalRight = currentAppearance.tabIndentNormalRight
+                tabInactiveTextColor = presetAppearance.tabInactiveTextColor
+                tabSelectedTextColor = presetAppearance.tabSelectedTextColor
+                tabMouseOverTextColor = presetAppearance.tabMouseOverTextColor
+                tabActiveTextColor = presetAppearance.tabActiveTextColor
+                tabFlashTextColor = presetAppearance.tabFlashTextColor
+                tabInactiveTabColor = presetAppearance.tabInactiveTabColor
+                tabSelectedTabColor = presetAppearance.tabSelectedTabColor
+                tabMouseOverTabColor = presetAppearance.tabMouseOverTabColor
+                tabActiveTabColor = presetAppearance.tabActiveTabColor
+                tabFlashTabColor = presetAppearance.tabFlashTabColor
+                tabInactiveBorderColor = presetAppearance.tabInactiveBorderColor
+                tabSelectedBorderColor = presetAppearance.tabSelectedBorderColor
+                tabMouseOverBorderColor = presetAppearance.tabMouseOverBorderColor
+                tabActiveBorderColor = presetAppearance.tabActiveBorderColor
+                tabFlashBorderColor = presetAppearance.tabFlashBorderColor
+                tabShape = currentAppearance.tabShape
+            }
+            Services.settings.setValue("tabAppearance", box(mergedAppearance))
+            setEditorValues mergedAppearance
+        finally
+            suppressEvents <- previous
+
+    // Apply custom theme colors
+    let applyCustomTheme (theme: ColorThemeData) =
+        let previous = suppressEvents
+        suppressEvents <- true
+        try
+            let currentAppearance = Services.program.tabAppearanceInfo
+            let toColor value = Color.FromArgb(255, Color.FromArgb(value))
+            let mergedAppearance = {
+                tabHeight = currentAppearance.tabHeight
+                tabMaxWidth = currentAppearance.tabMaxWidth
+                tabPinnedTabWidth = currentAppearance.tabPinnedTabWidth
+                tabPinnedTabWidthIcon = currentAppearance.tabPinnedTabWidthIcon
+                tabOverlap = currentAppearance.tabOverlap
+                tabHeightOffset = currentAppearance.tabHeightOffset
+                tabIndentFlipped = currentAppearance.tabIndentFlipped
+                tabIndentFlippedRight = currentAppearance.tabIndentFlippedRight
+                tabIndentNormal = currentAppearance.tabIndentNormal
+                tabIndentNormalRight = currentAppearance.tabIndentNormalRight
+                tabInactiveTextColor = toColor theme.inactiveTextColor
+                tabSelectedTextColor = toColor theme.selectedTextColor
+                tabMouseOverTextColor = toColor theme.mouseOverTextColor
+                tabActiveTextColor = toColor theme.activeTextColor
+                tabFlashTextColor = toColor theme.flashTextColor
+                tabInactiveTabColor = toColor theme.inactiveTabColor
+                tabSelectedTabColor = toColor theme.selectedTabColor
+                tabMouseOverTabColor = toColor theme.mouseOverTabColor
+                tabActiveTabColor = toColor theme.activeTabColor
+                tabFlashTabColor = toColor theme.flashTabColor
+                tabInactiveBorderColor = toColor theme.inactiveBorderColor
+                tabSelectedBorderColor = toColor theme.selectedBorderColor
+                tabMouseOverBorderColor = toColor theme.mouseOverBorderColor
+                tabActiveBorderColor = toColor theme.activeBorderColor
+                tabFlashBorderColor = toColor theme.flashBorderColor
+                tabShape = currentAppearance.tabShape
+            }
+            Services.settings.setValue("tabAppearance", box(mergedAppearance))
+            setEditorValues mergedAppearance
+        finally
+            suppressEvents <- previous
+
+    // Set up ComboBox measure event - all items have same height
+    do
+        colorThemeComboBox.MeasureItem.Add <| fun e ->
+            // Owner-draw item heights are outside Bounds, so Control.Scale
+            // never sees them. The ComboBox's own ItemHeight above is scaled
+            // by SettingsDpi's fixups from the 20 it is built with; this
+            // handler computes the same number from the current scale.
+            e.ItemHeight <- SettingsDpi.px 20
+
+    // Helper to check if separator should be drawn below an item
+    let shouldDrawSeparatorBelow (index: int) =
+        if index < 0 || index >= themeItems.Length then false
+        else
+            match themeItems.[index] with
+            | Preset "Dark Red Frame" -> true  // Always draw separator after Dark Red Frame
+            | CustomTheme _ ->
+                // Draw separator after last custom theme (before UnsavedCustom)
+                if index + 1 < themeItems.Length then
+                    match themeItems.[index + 1] with
+                    | UnsavedCustom -> true
+                    | _ -> false
+                else false
+            | _ -> false
+
+    // Set up ComboBox draw event for separator lines
+    do
+        colorThemeComboBox.DrawItem.Add <| fun e ->
+            let darkOn = isDarkModeEnabled()
+            // Background: in dark mode use darkAccent for selected and
+            // darkPanel for unselected, replacing the system blue / window
+            // colors which would otherwise stay bright. In light mode the
+            // system DrawBackground rendering is correct.
+            if darkOn then
+                let isSelected = (e.State &&& DrawItemState.Selected) <> DrawItemState.None
+                let bgColor = if isSelected then DarkMode.darkAccent else DarkMode.darkPanel
+                use bg = new SolidBrush(bgColor)
+                e.Graphics.FillRectangle(bg, e.Bounds)
+            else
+                e.DrawBackground()
+            if e.Index >= 0 && e.Index < themeItems.Length then
+                let text =
+                    match themeItems.[e.Index] with
+                    | Preset name | CustomTheme name -> name
+                    | UnsavedCustom -> "Custom"
+                let textColor =
+                    if darkOn then DarkMode.darkText
+                    else e.ForeColor
+                use brush = new SolidBrush(textColor)
+                // Calculate vertical center position for text
+                let textSize = e.Graphics.MeasureString(text, e.Font)
+                let y = float32 e.Bounds.Top + (float32 e.Bounds.Height - textSize.Height) / 2.0f
+                e.Graphics.DrawString(text, e.Font, brush, float32 e.Bounds.Left + 2.0f, y)
+                // Draw separator line below if needed (only at category
+                // boundaries — see shouldDrawSeparatorBelow).
+                if shouldDrawSeparatorBelow e.Index then
+                    let lineY = e.Bounds.Bottom - 1
+                    let penColor =
+                        if darkOn then Color.FromArgb(120, 120, 120)
+                        else Color.Gray
+                    use pen = new Pen(penColor, 1.0f)
+                    e.Graphics.DrawLine(pen, e.Bounds.Left + 2, lineY, e.Bounds.Right - 2, lineY)
+            e.DrawFocusRectangle()
+
+    // Set up ComboBox event handler
+    do
+        colorThemeComboBox.SelectedIndexChanged.Add <| fun _ ->
+            if not initializingTheme && not suppressEvents then
+                let currentIndex = colorThemeComboBox.SelectedIndex
+                if currentIndex >= 0 && currentIndex < themeItems.Length then
+                    match themeItems.[currentIndex] with
+                    | Preset "Light" ->
+                        applyColorPreset(Services.program.defaultTabAppearanceInfo)
+                    | Preset "Light Mono" ->
+                        applyColorPreset(Services.program.lightMonoTabAppearanceInfo)
+                    | Preset "Dark" ->
+                        applyColorPreset(Services.program.darkModeTabAppearanceInfo)
+                    | Preset "Dark Blue" ->
+                        applyColorPreset(Services.program.darkModeBlueTabAppearanceInfo)
+                    | Preset "Dark Mono 1" ->
+                        applyColorPreset(Services.program.darkMonoTabAppearanceInfo)
+                    | Preset "Dark Mono 2" ->
+                        applyColorPreset(Services.program.darkMono2TabAppearanceInfo)
+                    | Preset "Dark Mono 3" ->
+                        applyColorPreset(Services.program.darkMono3TabAppearanceInfo)
+                    | Preset "Night Horizon" ->
+                        applyColorPreset(Services.program.nightHorizonTabAppearanceInfo)
+                    | Preset "Dark Red Frame" ->
+                        applyColorPreset(Services.program.darkRedFrameTabAppearanceInfo)
+                    | Preset _ -> ()
+                    | CustomTheme name ->
+                        match customThemes |> List.tryFind (fun t -> t.name = name) with
+                        | Some theme -> applyCustomTheme theme
+                        | None -> ()
+                    | UnsavedCustom ->
+                        // Restore saved Custom colors if available, else use Light theme colors as default
+                        match savedCustomColors with
+                        | Some colors -> applyCustomTheme colors
+                        | None -> applyCustomTheme (getPresetColors "Light")
+                updateButtonState()
+
+    // Helper to switch to Custom when colors are manually changed
+    let switchToCustom() =
+        if not suppressEvents then
+            // First check if current colors match any theme
+            let matchIndex = findMatchingTheme()
+            if matchIndex >= 0 then
+                let previous = suppressEvents
+                suppressEvents <- true
+                try
+                    colorThemeComboBox.SelectedIndex <- matchIndex
+                finally
+                    suppressEvents <- previous
+            else
+                // Save current colors as Custom theme
+                savedCustomColors <- Some(getCurrentColors())
+                // Persist to settings file
+                saveSavedCustomColors savedCustomColors
+                // Refresh ComboBox items to include UnsavedCustom
+                refreshComboBoxItems()
+                // Switch to Custom (last item)
+                let customIndex = themeItems.Length - 1
+                if colorThemeComboBox.SelectedIndex <> customIndex then
+                    let previous = suppressEvents
+                    suppressEvents <- true
+                    try
+                        colorThemeComboBox.SelectedIndex <- customIndex
+                    finally
+                        suppressEvents <- previous
+            updateButtonState()
+
+    // Helper function to convert theme to JSON object string
+    let themeToJsonObject (theme: ColorThemeData) =
+        sprintf "  {\n    \"ThemeName\": \"%s\",\n    \"InactiveTextColor\": \"#%06X\",\n    \"SelectedTextColor\": \"#%06X\",\n    \"MouseOverTextColor\": \"#%06X\",\n    \"ActiveTextColor\": \"#%06X\",\n    \"FlashTextColor\": \"#%06X\",\n    \"InactiveTabColor\": \"#%06X\",\n    \"SelectedTabColor\": \"#%06X\",\n    \"MouseOverTabColor\": \"#%06X\",\n    \"ActiveTabColor\": \"#%06X\",\n    \"FlashTabColor\": \"#%06X\",\n    \"InactiveBorderColor\": \"#%06X\",\n    \"SelectedBorderColor\": \"#%06X\",\n    \"MouseOverBorderColor\": \"#%06X\",\n    \"ActiveBorderColor\": \"#%06X\",\n    \"FlashBorderColor\": \"#%06X\"\n  }" theme.name theme.inactiveTextColor theme.selectedTextColor theme.mouseOverTextColor theme.activeTextColor theme.flashTextColor theme.inactiveTabColor theme.selectedTabColor theme.mouseOverTabColor theme.activeTabColor theme.flashTabColor theme.inactiveBorderColor theme.selectedBorderColor theme.mouseOverBorderColor theme.activeBorderColor theme.flashBorderColor
+
+    // Helper function to convert themes list to JSON array string
+    let themesToJson (themes: ColorThemeData list) =
+        let jsonObjects = themes |> List.map themeToJsonObject
+        "[\n" + String.Join(",\n", jsonObjects) + "\n]"
+
+    // Mutable reference to "Copy All Saved Themes" menu item for dynamic enable/disable
+    let mutable copyAllSavedMenuItem : System.Windows.Forms.ToolStripMenuItem option = None
+
+    // Update the enabled state of "Copy All Saved Themes" menu item
+    let updateCopyAllSavedMenuState() =
+        match copyAllSavedMenuItem with
+        | Some item -> item.Enabled <- customThemes.Length > 0
+        | None -> ()
+
+    // Clipboard operations dropdown using DropdownButton component
+    let clipboardDropdownBtn =
+        let dropdown = DropdownButton(Localization.getString("ClipboardOperations"), DropdownButtonColor)
+
+        // Menu item 1: Copy Selected Theme
+        dropdown.AddItem(Localization.getString("CopySelectedTheme"), fun () ->
+            try
+                let currentColors = getCurrentColors()
+                let themeName =
+                    if colorThemeComboBox.SelectedIndex >= 0 && colorThemeComboBox.SelectedIndex < themeItems.Length then
+                        match themeItems.[colorThemeComboBox.SelectedIndex] with
+                        | Preset name -> name
+                        | CustomTheme name -> name
+                        | UnsavedCustom -> "Custom"
+                    else
+                        "Custom"
+                let theme = { currentColors with name = themeName }
+                let jsonText = themesToJson [theme]
+                if not (String.IsNullOrEmpty(jsonText)) then
+                    Clipboard.SetText(jsonText)
+            with | _ -> ()
+        ) |> ignore
+
+        // Separator 1
+        dropdown.AddSeparator()
+
+        // Menu item 2: Copy All Preset Themes
+        dropdown.AddItem(Localization.getString("CopyAllPresetThemes"), fun () ->
+            try
+                let presetThemesList = presetThemes |> List.map getPresetColors
+                let jsonText = themesToJson presetThemesList
+                if not (String.IsNullOrEmpty(jsonText)) then
+                    Clipboard.SetText(jsonText)
+            with | _ -> ()
+        ) |> ignore
+
+        // Menu item 3: Copy All Saved Themes
+        let copyAllSavedItem = dropdown.AddItem(Localization.getString("CopyAllSavedThemes"), fun () ->
+            try
+                if customThemes.Length > 0 then
+                    let jsonText = themesToJson customThemes
+                    if not (String.IsNullOrEmpty(jsonText)) then
+                        Clipboard.SetText(jsonText)
+            with | _ -> ()
+        )
+        copyAllSavedMenuItem <- Some copyAllSavedItem
+        copyAllSavedItem.Enabled <- customThemes.Length > 0
+
+        // Separator 2
+        dropdown.AddSeparator()
+
+        // Menu item 4: Paste Themes
+        dropdown.AddItem(Localization.getString("PasteThemes"), fun () ->
+            try
+                if Clipboard.ContainsText() then
+                    let clipboardText = Clipboard.GetText()
+                    // Try to parse as JSON array
+                    let jsonArray = JArray.Parse(clipboardText)
+                    let previous = suppressEvents
+                    suppressEvents <- true
+                    try
+                        let mutable lastAppliedTheme : ColorThemeData option = None
+                        for item in jsonArray do
+                            let jObj = item :?> JObject
+                            // If ThemeName is missing or empty, treat as "Custom"
+                            let themeName =
+                                match jObj.getString("ThemeName") with
+                                | Some name when not (String.IsNullOrWhiteSpace(name)) -> name
+                                | _ -> "Custom"
+                            // Parse colors (optional - only apply if present)
+                            let parseColor (key: string) (existing: int) =
+                                match jObj.getString(key) with
+                                | Some hex when hex.StartsWith("#") && hex.Length = 7 ->
+                                    try
+                                        Int32.Parse(hex.Substring(1), System.Globalization.NumberStyles.HexNumber)
+                                    with | _ -> existing
+                                | _ -> existing
+
+                            // Get base colors (current Custom colors or zeros)
+                            let baseColors = savedCustomColors |> Option.defaultValue {
+                                name = ""
+                                inactiveTextColor = 0
+                                selectedTextColor = 0
+                                mouseOverTextColor = 0
+                                activeTextColor = 0
+                                flashTextColor = 0
+                                inactiveTabColor = 0
+                                selectedTabColor = 0
+                                mouseOverTabColor = 0
+                                activeTabColor = 0
+                                flashTabColor = 0
+                                inactiveBorderColor = 0
+                                selectedBorderColor = 0
+                                mouseOverBorderColor = 0
+                                activeBorderColor = 0
+                                flashBorderColor = 0
+                            }
+
+                            let newTheme = {
+                                name = themeName
+                                inactiveTextColor = parseColor "InactiveTextColor" baseColors.inactiveTextColor
+                                selectedTextColor = parseColor "SelectedTextColor" baseColors.selectedTextColor
+                                mouseOverTextColor = parseColor "MouseOverTextColor" baseColors.mouseOverTextColor
+                                activeTextColor = parseColor "ActiveTextColor" baseColors.activeTextColor
+                                flashTextColor = parseColor "FlashTextColor" baseColors.flashTextColor
+                                inactiveTabColor = parseColor "InactiveTabColor" baseColors.inactiveTabColor
+                                selectedTabColor = parseColor "SelectedTabColor" baseColors.selectedTabColor
+                                mouseOverTabColor = parseColor "MouseOverTabColor" baseColors.mouseOverTabColor
+                                activeTabColor = parseColor "ActiveTabColor" baseColors.activeTabColor
+                                flashTabColor = parseColor "FlashTabColor" baseColors.flashTabColor
+                                inactiveBorderColor = parseColor "InactiveBorderColor" baseColors.inactiveBorderColor
+                                selectedBorderColor = parseColor "SelectedBorderColor" baseColors.selectedBorderColor
+                                mouseOverBorderColor = parseColor "MouseOverBorderColor" baseColors.mouseOverBorderColor
+                                activeBorderColor = parseColor "ActiveBorderColor" baseColors.activeBorderColor
+                                flashBorderColor = parseColor "FlashBorderColor" baseColors.flashBorderColor
+                            }
+
+                            if themeName = "Custom" then
+                                // Apply to Custom (unsaved)
+                                savedCustomColors <- Some newTheme
+                                saveSavedCustomColors savedCustomColors
+                                lastAppliedTheme <- Some newTheme
+                            else
+                                // Check if theme with this name exists
+                                let existingIndex = customThemes |> List.tryFindIndex (fun t -> t.name = themeName)
+                                match existingIndex with
+                                | Some idx ->
+                                    // Overwrite existing theme
+                                    customThemes <- customThemes |> List.mapi (fun i t ->
+                                        if i = idx then newTheme else t
+                                    )
+                                | None ->
+                                    // Add new theme
+                                    customThemes <- customThemes @ [newTheme]
+                                saveCustomThemes customThemes
+                                updateCopyAllSavedMenuState()
+                                lastAppliedTheme <- Some newTheme
+
+                        // Refresh UI and apply last theme
+                        refreshComboBoxItems()
+                        match lastAppliedTheme with
+                        | Some theme ->
+                            applyCustomTheme theme
+                            // Select the theme in ComboBox
+                            let themeIndex = themeItems |> List.tryFindIndex (fun item ->
+                                match item with
+                                | CustomTheme n -> n = theme.name
+                                | UnsavedCustom -> theme.name = "Custom"
+                                | _ -> false
+                            )
+                            match themeIndex with
+                            | Some idx -> colorThemeComboBox.SelectedIndex <- idx
+                            | None -> ()
+                        | None -> ()
+                    finally
+                        suppressEvents <- previous
+                    updateButtonState()
+            with | _ -> ()
+        ) |> ignore
+
+        dropdown.Control
+
+    // Reserved theme names that cannot be used for custom themes
+    // Note: Light, Dark, Dark Blue can be used as custom theme names (will create a custom theme with that name)
+    let reservedThemeNames = ["Custom"]
+
+    // Show Edit Theme dialog for renaming or deleting custom themes
+    // Returns: Some(name) if OK pressed, None if cancelled
+    // Empty name means delete the theme
+    // OK button is disabled until text is changed from current value
+    let showEditThemeDialog (currentName: string) =
+        use form = new DpiAwareDialog()
+        form.Text <- Localization.getString("EditThemeTitle")
+        form.Size <- Size(440, 240)
+        form.StartPosition <- FormStartPosition.CenterParent
+        form.FormBorderStyle <- FormBorderStyle.FixedDialog
+        form.MaximizeBox <- false
+        form.MinimizeBox <- false
+        form.TopMost <- true
+
+        let label = new Label()
+        label.Text <- Localization.getString("EditThemePrompt")
+        label.Location <- Point(30, 30)
+        label.AutoSize <- true
+
+        let hintLabel = new Label()
+        hintLabel.Text <- Localization.getString("DeleteThemeHint")
+        hintLabel.Location <- Point(30, 55)
+        hintLabel.AutoSize <- true
+        hintLabel.ForeColor <- Color.Gray
+
+        let textBox = new TextBox()
+        textBox.Text <- currentName
+        textBox.Location <- Point(30, 90)
+        textBox.Size <- Size(370, 26)
+
+        let okBtn = new Button()
+        okBtn.Text <- Localization.getString("OK")
+        okBtn.DialogResult <- DialogResult.OK
+        okBtn.Location <- Point(235, 141)
+        okBtn.Size <- Size(80, 30)
+        okBtn.Enabled <- false  // Disabled until text changes
+
+        let cancelBtn = new Button()
+        cancelBtn.Text <- Localization.getString("Cancel")
+        cancelBtn.DialogResult <- DialogResult.Cancel
+        cancelBtn.Location <- Point(320, 141)
+        cancelBtn.Size <- Size(80, 30)
+
+        // Enable OK button when text changes from current value
+        textBox.TextChanged.Add <| fun _ ->
+            okBtn.Enabled <- textBox.Text <> currentName
+
+        form.Controls.Add(label)
+        form.Controls.Add(hintLabel)
+        form.Controls.Add(textBox)
+        form.Controls.Add(okBtn)
+        form.Controls.Add(cancelBtn)
+        form.AcceptButton <- okBtn
+        form.CancelButton <- cancelBtn
+
+        // Scale the 96-dpi layout above for the monitor the parent dialog is
+        // on (CenterParent puts this dialog there), before the dark theme so
+        // the theming pass sees final control sizes. Everything here is
+        // absolute Location / Size, which is exactly what Control.Scale
+        // handles.
+        form.InitializeDpi(SettingsDpi.current())
+
+        // Inherit dark mode from the parent settings dialog when the user
+        // has the "Settings Dialog Dark Mode" toggle on.
+        if isDarkModeEnabled() then
+            DarkMode.applyDarkColorsBeforeShow form
+            form.HandleCreated.Add(fun _ ->
+                try DarkMode.applyDarkThemeBranch15ToForm form true
+                with _ -> ())
+
+        let parentForm = colorPage.FindForm()
+        let result =
+            if parentForm <> null then
+                form.ShowDialog(parentForm)
+            else
+                form.ShowDialog()
+        if result = DialogResult.OK then
+            Some(textBox.Text.Trim())
+        else
+            None
+
+    // Show Save As dialog with ComboBox for theme name selection (used for Save As)
+    // Returns: Some(name, isOverwrite) if OK pressed, None if cancelled
+    let showSaveAsDialog (title: string) =
+        use form = new DpiAwareDialog()
+        form.Text <- title
+        form.Size <- Size(440, 210)
+        form.StartPosition <- FormStartPosition.CenterParent
+        form.FormBorderStyle <- FormBorderStyle.FixedDialog
+        form.MaximizeBox <- false
+        form.MinimizeBox <- false
+        form.TopMost <- true
+
+        let label = new Label()
+        label.Text <- Localization.getString("EnterThemeName")
+        label.Location <- Point(30, 30)
+        label.AutoSize <- true
+
+        let comboBox = new ComboBox()
+        comboBox.Location <- Point(30, 60)
+        comboBox.Size <- Size(370, 26)
+        comboBox.DropDownStyle <- ComboBoxStyle.DropDown  // Allow text input
+        // Add existing custom theme names to ComboBox
+        customThemes |> List.iter (fun t -> comboBox.Items.Add(t.name) |> ignore)
+
+        let okBtn = new Button()
+        okBtn.Text <- Localization.getString("OK")
+        okBtn.DialogResult <- DialogResult.OK
+        okBtn.Location <- Point(235, 111)
+        okBtn.Size <- Size(80, 30)
+        okBtn.Enabled <- false  // Initially disabled
+
+        let cancelBtn = new Button()
+        cancelBtn.Text <- Localization.getString("Cancel")
+        cancelBtn.DialogResult <- DialogResult.Cancel
+        cancelBtn.Location <- Point(320, 111)
+        cancelBtn.Size <- Size(80, 30)
+
+        // Validate input and update OK button state
+        let validateInput() =
+            let text = comboBox.Text.Trim()
+            let isReserved = reservedThemeNames |> List.exists (fun n ->
+                String.Equals(n, text, StringComparison.OrdinalIgnoreCase))
+            okBtn.Enabled <- not (String.IsNullOrWhiteSpace(text)) && not isReserved
+
+        comboBox.TextChanged.Add(fun _ -> validateInput())
+        comboBox.SelectedIndexChanged.Add(fun _ -> validateInput())
+
+        form.Controls.Add(label)
+        form.Controls.Add(comboBox)
+        form.Controls.Add(okBtn)
+        form.Controls.Add(cancelBtn)
+        form.AcceptButton <- okBtn
+        form.CancelButton <- cancelBtn
+
+        // See showEditThemeDialog: scale for the parent's monitor first.
+        form.InitializeDpi(SettingsDpi.current())
+
+        // Inherit dark mode from the parent settings dialog.
+        if isDarkModeEnabled() then
+            DarkMode.applyDarkColorsBeforeShow form
+            form.HandleCreated.Add(fun _ ->
+                try DarkMode.applyDarkThemeBranch15ToForm form true
+                with _ -> ())
+
+        let parentForm = colorPage.FindForm()
+        let result =
+            if parentForm <> null then
+                form.ShowDialog(parentForm)
+            else
+                form.ShowDialog()
+        if result = DialogResult.OK then
+            let name = comboBox.Text.Trim()
+            let isOverwrite = customThemes |> List.exists (fun t -> t.name = name)
+            Some(name, isOverwrite)
+        else
+            None
+
+    // Color Theme label (placed in column 0)
+    let themeLabel =
+        let label = Label()
+        label.AutoSize <- true
+        label.Text <- Localization.getString("ColorTheme")
+        label.TextAlign <- ContentAlignment.MiddleLeft
+        // Centred in the row, on the same line as the theme combo box.
+        label.Anchor <- AnchorStyles.Left
+        label.Margin <- Padding(0)
+        label
+
+    // Color Theme dropdown and Save/Rename button (placed in colorPanel column 1)
+    // Simple FlowLayoutPanel for ComboBox and buttons
+    let themePanel =
+        let container = new FlowLayoutPanel()
+        container.FlowDirection <- FlowDirection.LeftToRight
+        container.AutoSize <- true
+        container.WrapContents <- false
+        // Centred in the row, on the same line as the theme caption.
+        container.Anchor <- AnchorStyles.Left
+        container.Margin <- Padding(0)
+        container.Padding <- Padding(0, 0, 0, 0)
+
+        // Configure saveBtn (for UnsavedCustom - Save As)
+        saveBtn.Text <- Localization.getString("SaveAs")
+        saveBtn.AutoSize <- true
+        saveBtn.AutoSizeMode <- AutoSizeMode.GrowAndShrink
+        saveBtn.MinimumSize <- Size(0, SettingsField.heightPx)
+        saveBtn.Margin <- Padding(3, 0, 0, 0)  // Same height as the drop-down beside it
+        saveBtn.Enabled <- false
+        saveBtn.Visible <- false
+
+        saveBtn.Click.Add <| fun _ ->
+            if colorThemeComboBox.SelectedIndex >= 0 && colorThemeComboBox.SelectedIndex < themeItems.Length then
+                match themeItems.[colorThemeComboBox.SelectedIndex] with
+                | UnsavedCustom ->
+                    // Save As - use ComboBox dialog for theme name selection
+                    match showSaveAsDialog (Localization.getString("SaveThemeTitle")) with
+                    | Some (name, isOverwrite) ->
+                        let newTheme = { getCurrentColors() with name = name }
+                        if isOverwrite then
+                            // Overwrite existing theme with same name
+                            customThemes <- customThemes |> List.map (fun t ->
+                                if t.name = name then newTheme else t
+                            )
+                        else
+                            // Add new theme
+                            customThemes <- customThemes @ [newTheme]
+                        saveCustomThemes customThemes
+                        updateCopyAllSavedMenuState()
+                        refreshComboBoxItems()
+                        // Select the saved theme
+                        let newIndex = themeItems |> List.findIndex (fun item ->
+                            match item with
+                            | CustomTheme n -> n = name
+                            | _ -> false
+                        )
+                        colorThemeComboBox.SelectedIndex <- newIndex
+                        updateButtonState()
+                    | None -> ()
+                | _ -> ()
+
+        // Configure editBtn (for CustomTheme - Edit/Rename/Delete)
+        editBtn.Text <- Localization.getString("Edit")
+        editBtn.AutoSize <- true
+        editBtn.AutoSizeMode <- AutoSizeMode.GrowAndShrink
+        editBtn.MinimumSize <- Size(0, SettingsField.heightPx)
+        editBtn.Margin <- Padding(3, 0, 0, 0)  // Align vertically with ComboBox, 1px up
+        editBtn.Enabled <- false
+        editBtn.Visible <- false
+
+        editBtn.Click.Add <| fun _ ->
+            if colorThemeComboBox.SelectedIndex >= 0 && colorThemeComboBox.SelectedIndex < themeItems.Length then
+                match themeItems.[colorThemeComboBox.SelectedIndex] with
+                | CustomTheme currentName ->
+                    // Edit existing custom theme
+                    match showEditThemeDialog currentName with
+                    | Some newName when String.IsNullOrWhiteSpace(newName) ->
+                        // Empty name means delete the theme
+                        customThemes <- customThemes |> List.filter (fun t -> t.name <> currentName)
+                        saveCustomThemes customThemes
+                        updateCopyAllSavedMenuState()
+                        // Ensure Custom item exists (save current colors if needed)
+                        if savedCustomColors.IsNone then
+                            savedCustomColors <- Some(getCurrentColors())
+                            saveSavedCustomColors savedCustomColors
+                        refreshComboBoxItems()
+                        // Switch to Custom (last item) - colors remain unchanged from current
+                        let customIndex = themeItems.Length - 1
+                        colorThemeComboBox.SelectedIndex <- customIndex
+                        updateButtonState()
+                    | Some newName ->
+                        // Rename the theme
+                        customThemes <- customThemes |> List.map (fun t ->
+                            if t.name = currentName then { t with name = newName }
+                            else t
+                        )
+                        saveCustomThemes customThemes
+                        refreshComboBoxItems()
+                        // Select the renamed theme
+                        let newIndex = themeItems |> List.findIndex (fun item ->
+                            match item with
+                            | CustomTheme n -> n = newName
+                            | _ -> false
+                        )
+                        colorThemeComboBox.SelectedIndex <- newIndex
+                        updateButtonState()
+                    | None -> ()
+                | _ -> ()
+
+        // Configure upBtn
+        upBtn.Text <- Localization.getString("Up")
+        upBtn.AutoSize <- true
+        upBtn.AutoSizeMode <- AutoSizeMode.GrowAndShrink
+        upBtn.MinimumSize <- Size(30, SettingsField.heightPx)
+        upBtn.TextAlign <- ContentAlignment.MiddleCenter
+        upBtn.Margin <- Padding(3, 0, 0, 0)  // Align with saveEditBtn
+        upBtn.Enabled <- false
+        upBtn.Visible <- false
+
+        upBtn.Click.Add <| fun _ ->
+            if colorThemeComboBox.SelectedIndex >= 0 && colorThemeComboBox.SelectedIndex < themeItems.Length then
+                match themeItems.[colorThemeComboBox.SelectedIndex] with
+                | CustomTheme name ->
+                    match getCustomThemeIndex name with
+                    | Some idx when idx > 0 ->
+                        // Swap with previous theme
+                        let prev = customThemes.[idx - 1]
+                        let curr = customThemes.[idx]
+                        customThemes <- customThemes |> List.mapi (fun i t ->
+                            if i = idx - 1 then curr
+                            elif i = idx then prev
+                            else t
+                        )
+                        saveCustomThemes customThemes
+                        refreshComboBoxItems()
+                        // Select the moved theme
+                        let newIndex = themeItems |> List.findIndex (fun item ->
+                            match item with
+                            | CustomTheme n -> n = name
+                            | _ -> false
+                        )
+                        colorThemeComboBox.SelectedIndex <- newIndex
+                        updateButtonState()
+                    | _ -> ()
+                | _ -> ()
+
+        // Configure downBtn
+        downBtn.Text <- Localization.getString("Down")
+        downBtn.AutoSize <- true
+        downBtn.AutoSizeMode <- AutoSizeMode.GrowAndShrink
+        downBtn.MinimumSize <- Size(30, SettingsField.heightPx)
+        downBtn.TextAlign <- ContentAlignment.MiddleCenter
+        downBtn.Margin <- Padding(3, 0, 0, 0)  // Align with saveEditBtn
+        downBtn.Enabled <- false
+        downBtn.Visible <- false
+
+        downBtn.Click.Add <| fun _ ->
+            if colorThemeComboBox.SelectedIndex >= 0 && colorThemeComboBox.SelectedIndex < themeItems.Length then
+                match themeItems.[colorThemeComboBox.SelectedIndex] with
+                | CustomTheme name ->
+                    match getCustomThemeIndex name with
+                    | Some idx when idx < customThemes.Length - 1 ->
+                        // Swap with next theme
+                        let curr = customThemes.[idx]
+                        let next = customThemes.[idx + 1]
+                        customThemes <- customThemes |> List.mapi (fun i t ->
+                            if i = idx then next
+                            elif i = idx + 1 then curr
+                            else t
+                        )
+                        saveCustomThemes customThemes
+                        refreshComboBoxItems()
+                        // Select the moved theme
+                        let newIndex = themeItems |> List.findIndex (fun item ->
+                            match item with
+                            | CustomTheme n -> n = name
+                            | _ -> false
+                        )
+                        colorThemeComboBox.SelectedIndex <- newIndex
+                        updateButtonState()
+                    | _ -> ()
+                | _ -> ()
+
+        // Add controls to themePanel (FlowLayoutPanel)
+        container.Controls.Add(colorThemeComboBox)
+        container.Controls.Add(saveBtn)
+        container.Controls.Add(editBtn)
+        container.Controls.Add(upBtn)
+        container.Controls.Add(downBtn)
+
+        container
+
+    do
+        // Increase theme row height to prevent ComboBox from being cut off
+        colorPanel.RowStyles.[themeRow].Height <- float32 UIHelper.settingsRowHeightPx
+
+        // Add theme controls to colorPanel (row 0)
+        // themeLabel in column 0
+        colorPanel.Controls.Add(themeLabel)
+        colorPanel.SetRow(themeLabel, themeRow)
+        colorPanel.SetColumn(themeLabel, 0)
+        // themePanel (ComboBox + buttons) in columns 1-2 (Tab Color + Text Color columns)
+        colorPanel.Controls.Add(themePanel)
+        colorPanel.SetRow(themePanel, themeRow)
+        colorPanel.SetColumn(themePanel, 1)
+        colorPanel.SetColumnSpan(themePanel, 2)  // Span Tab Color and Text Color columns
+        // clipboardDropdownBtn in column 3 (Border Color column).
+        // Anchor.Right so it sits at the right edge of the cell — visually
+        // pinned to the rightmost column boundary instead of floating mid-row.
+        clipboardDropdownBtn.Anchor <- AnchorStyles.Right ||| AnchorStyles.Top
+        clipboardDropdownBtn.Margin <- Padding(0, UIHelper.settingsRowMarginPx, 0, UIHelper.settingsRowMarginPx)
+        colorPanel.Controls.Add(clipboardDropdownBtn)
+        colorPanel.SetRow(clipboardDropdownBtn, themeRow)
+        colorPanel.SetColumn(clipboardDropdownBtn, 3)
+
+        // Initialize editor values and set up change handlers
+        setEditorValues appearance
+        showEdges ()
+        editors.items.map(snd).iter <| fun editor ->
+            editor.changed.Add <| fun() ->
+                if not suppressEvents then
+                    this.applyAppearance()
+                    switchToCustom()
+
+        // Set initial ComboBox selection based on current colors
+        let matchIndex = findMatchingTheme()
+        if matchIndex >= 0 then
+            colorThemeComboBox.SelectedIndex <- matchIndex
+        else
+            // Reflect current colors in memory, as refresh does. Only a user
+            // edit persists Custom colors; constructing the view is read-only.
+            savedCustomColors <- Some(getCurrentColors())
+            refreshComboBoxItems()
+            colorThemeComboBox.SelectedIndex <- themeItems.Length - 1  // Custom
+        updateButtonState()
+
+        // Construction only reflects the current theme; it is not a user edit.
+        initializingTheme <- false
+
+        // Finish all design layout before the containing form captures DPI data.
+        for control in upperPanel.Controls do
+            control.TabIndex <- upperPanel.GetRow(control) * upperPanel.ColumnCount + upperPanel.GetColumn(control)
+        upperPanel.ResumeLayout(true)
+        topEdgePanel.ResumeLayout(true)
+        colorPanel.ResumeLayout(true)
+        colorPage.ResumeLayout(true)
+        panel.ResumeLayout(true)
+
+    member private this.copyToBottom() =
+        let a = Services.program.tabAppearanceInfo
+        let layout = TabEdges.topLayoutOf {
+            tabPositionByDefault = Services.settings.getValue("tabPositionByDefault") :?> string
+            tabVerticalDirection = Services.settings.getValue("tabVerticalDirection") :?> string
+            tabIndentNormal = a.tabIndentNormal
+            tabIndentFlipped = a.tabIndentFlipped }
+        let top = { TabEdgeSettings.noValues with
+                        hideMode = Some(fst (TabEdgeSettings.hideSettings Services.settings.root TabEdges.Edge.Top))
+                        hideDelay = Some(snd (TabEdgeSettings.hideSettings Services.settings.root TabEdges.Edge.Top))
+                        tabHeight = Some a.tabHeight
+                        tabMaxWidth = Some a.tabMaxWidth
+                        tabPinnedTabWidth = Some a.tabPinnedTabWidth
+                        tabPinnedTabWidthIcon = Some a.tabPinnedTabWidthIcon
+                        tabOverlap = Some a.tabOverlap
+                        tabShape = Some a.tabShape
+                        align = Some layout.defaultAlign
+                        direction = Some layout.direction
+                        outsideStart = Some a.tabIndentNormal
+                        outsideEnd = Some a.tabIndentNormalRight
+                        insideStart = Some a.tabIndentFlipped
+                        insideEnd = Some a.tabIndentFlippedRight }
+        let root = Services.settings.root
+        let copied = TabEdgeSettings.copyOppositeValues root TabEdges.Edge.Top top
+        if not (JToken.DeepEquals(root, copied)) then
+            Services.settings.root <- copied
+            TabEdgeSettings.changed.Trigger()
+        edgePanels.[TabEdges.Edge.Bottom].refresh()
+
+    member this.refresh() =
+        let previous = suppressEvents
+        suppressEvents <- true
+        panel.SuspendLayout()
+        colorPage.SuspendLayout()
+        try
+            for refresh in placementRefreshers do refresh()
+            customThemes <- loadCustomThemes()
+            savedCustomColors <- loadSavedCustomColors()
+            setEditorValues Services.program.tabAppearanceInfo
+            showEdges ()
+            refreshComboBoxItems()
+            let matchIndex = findMatchingTheme()
+            if matchIndex >= 0 then
+                colorThemeComboBox.SelectedIndex <- matchIndex
+            else
+                // Reflect current colors without writing settings during refresh.
+                savedCustomColors <- Some(getCurrentColors())
+                colorThemeComboBox.SelectedIndex <- themeItems.Length - 1
+            updateButtonState()
+            updateCopyAllSavedMenuState()
+        finally
+            suppressEvents <- previous
+            colorPage.ResumeLayout(true)
+            panel.ResumeLayout(true)
+
+    member this.applyAppearance() =
+        // Get all current values from UI editors
+        let getValue key = (editors.find key).value
+
+        // Get the current appearance for fields not in UI
+        let currentAppearance = Services.program.tabAppearanceInfo
+
+        // Create new appearance with correct field order
+        let newAppearance = {
+            tabHeight = unbox(getValue "tabHeight")
+            tabMaxWidth = unbox(getValue "tabMaxWidth")
+            tabPinnedTabWidth = unbox(getValue "tabPinnedTabWidth")
+            tabPinnedTabWidthIcon = unbox(getValue "tabPinnedTabWidthIcon")
+            tabOverlap = unbox(getValue "tabOverlap")
+            tabHeightOffset = currentAppearance.tabHeightOffset  // Keep internal value
+            tabIndentFlipped = unbox(getValue "tabIndentFlipped")
+            tabIndentFlippedRight = unbox(getValue "tabIndentFlippedRight")
+            tabIndentNormal = unbox(getValue "tabIndentNormal")
+            tabIndentNormalRight = unbox(getValue "tabIndentNormalRight")
+            tabInactiveTextColor = unbox(getValue "tabInactiveTextColor")
+            tabSelectedTextColor = unbox(getValue "tabSelectedTextColor")
+            tabMouseOverTextColor = unbox(getValue "tabMouseOverTextColor")
+            tabActiveTextColor = unbox(getValue "tabActiveTextColor")
+            tabFlashTextColor = unbox(getValue "tabFlashTextColor")
+            tabInactiveTabColor = unbox(getValue "tabInactiveTabColor")
+            tabSelectedTabColor = unbox(getValue "tabSelectedTabColor")
+            tabMouseOverTabColor = unbox(getValue "tabMouseOverTabColor")
+            tabActiveTabColor = unbox(getValue "tabActiveTabColor")
+            tabFlashTabColor = unbox(getValue "tabFlashTabColor")
+            tabInactiveBorderColor = unbox(getValue "tabInactiveBorderColor")
+            tabSelectedBorderColor = unbox(getValue "tabSelectedBorderColor")
+            tabMouseOverBorderColor = unbox(getValue "tabMouseOverBorderColor")
+            tabActiveBorderColor = unbox(getValue "tabActiveBorderColor")
+            tabFlashBorderColor = unbox(getValue "tabFlashBorderColor")
+            tabShape = unbox(getValue "tabShape")
+        }
+
+        Services.settings.setValue("tabAppearance", box(newAppearance))
+        
+    member this.colorView =
+        { new ISettingsView with
+            member x.key = SettingsViewType.ColorSettings
+            member x.title = Localization.getString("ColorPage")
+            member x.control = colorPage :> Control }
+
+    interface ISettingsView with
+        member x.key = SettingsViewType.AppearanceSettings
+        member x.title = Localization.getString("Appearance")
+        member x.control = panel :> Control

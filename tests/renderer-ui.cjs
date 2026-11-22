@@ -1,0 +1,40 @@
+// Run with Node 20 and jsdom 22 available on NODE_PATH.
+const {JSDOM}=require('jsdom');
+const fs=require('node:fs');
+const path=require('node:path');
+const assert=require('node:assert/strict');
+const root=path.join(__dirname,'..');
+const dom=new JSDOM(fs.readFileSync(path.join(root,'index.html'),'utf8'),{runScripts:'outside-only'});
+const w=dom.window,d=w.document;
+w.structuredClone=structuredClone;
+const schema=JSON.parse(fs.readFileSync(path.join(root,'settings-schema.json')));
+const values=Object.fromEntries(schema.fields.map(f=>[f.path,f.default]));
+const colors=Object.fromEntries(schema.fields.filter(f=>f.type==='color').map(f=>[f.path.split('.')[1],'112233']));
+const snapshot={contractVersion:schema.contractVersion,values,revision:'test',presets:[{name:'测试配色',colors},{name:'同色另一名称',colors}],customThemes:[]};
+let event;
+w.windowTabs={getSchema:()=>schema,onEvent:f=>event=f,getStatus:async()=>({state:'READY',capabilities:['integrated-settings-v1']}),start:async()=>({state:'READY',capabilities:['integrated-settings-v1']}),integrated:async command=>command==='settingsSnapshot'?snapshot:{apps:[],items:[]}};
+w.eval(fs.readFileSync(path.join(root,'settings-model.js'),'utf8'));
+w.eval(fs.readFileSync(path.join(root,'renderer.js'),'utf8'));
+const navigate=page=>event({event:'navigate',payload:{page}});
+setImmediate(async()=>{
+  assert.equal(d.getElementById('connection').hidden,false);
+  navigate('appearance');
+  assert.equal(d.getElementById('connection').hidden,true);
+  const shapes=[...d.querySelectorAll('.shape-picker input')];
+  assert.equal(shapes.length,11);
+  assert.equal(d.querySelectorAll('.shape-picker svg path[d]').length,11);
+  shapes[2].click();assert.equal(shapes[2].checked,true);
+  navigate('colors');
+  let select=d.getElementById('colorScheme');select.value='p1';select.dispatchEvent(new w.Event('change'));
+  select=d.getElementById('colorScheme');assert.equal(select.value,'p1');assert.equal(select.selectedOptions[0].textContent,'同色另一名称');
+  navigate('home');navigate('colors');assert.equal(d.getElementById('colorScheme').value,'p1');
+  const color=d.querySelector('input[type=color]');color.value='#abcdef';color.dispatchEvent(new w.Event('input'));
+  assert.equal(d.getElementById('colorScheme').selectedOptions[0].textContent,'自定义配色');
+  for(const page of ['apps','usage','workspaces','general']){navigate(page);event({event:'stateChanged',payload:{state:'READY'}});assert.equal(d.getElementById('connection').hidden,true);}
+  navigate('general');
+  assert.equal(d.body.textContent.includes('登录 Windows 后自动开启'),false,'startup option is hidden from settings UI');
+  assert.match(d.body.textContent,/旧版本中已开启/,'help explains that an existing startup preference remains active');
+  navigate('home');assert.equal(d.getElementById('connection').hidden,false);
+  await new Promise(resolve=>setImmediate(resolve));
+  console.log('renderer UI interaction tests passed');dom.window.close();
+});

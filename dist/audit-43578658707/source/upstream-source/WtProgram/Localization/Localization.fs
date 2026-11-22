@@ -1,0 +1,80 @@
+namespace Bemo
+open System
+open System.IO
+open System.Reflection
+open System.Collections.Generic
+open Newtonsoft.Json.Linq
+
+module Localization =
+    // Current language stored as string (e.g., "English", "Japanese")
+    let mutable currentLanguage = "English"
+
+    // Loaded strings from JSON file (if any)
+    let mutable private loadedStrings : IDictionary<string, string> option = None
+
+    let languageChanged = Event<unit>()
+
+    // Normalize old format ("en"/"ja") to new format ("English"/"Japanese")
+    let normalizeLanguageString(langStr: string) =
+        match langStr with
+        | "en" -> "English"
+        | "ja" -> "Japanese"
+        | other -> other
+
+    // Load language strings from JSON file (supports JSONC format with comments).
+    // The shipped file under <exe>\Settings\Language is the default; a file of
+    // the same name under %APPDATA%\WindowTabs\Settings\Language is the user's,
+    // and its strings replace the shipped ones key by key - so one corrected
+    // string is a one-line file, and strings added by a later version still
+    // arrive. See UserOverrides.
+    // Nested objects are flattened with dot-separated keys (e.g., "Parent.Child")
+    let loadLanguageFromJson(langName: string) =
+        try
+            match UserOverrides.loadObject UserOverrides.languageDir (langName + ".json") with
+            | Some(jobj) ->
+                let dict = Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+                let rec flattenProps (prefix: string) (obj: JObject) =
+                    for prop in obj.Properties() do
+                        let key = if prefix = "" then prop.Name else prefix + "." + prop.Name
+                        match prop.Value.Type with
+                        | JTokenType.Object ->
+                            flattenProps key (prop.Value :?> JObject)
+                        | _ ->
+                            dict.[key] <- prop.Value.ToString()
+                flattenProps "" jobj
+                Some(dict :> IDictionary<string, string>)
+            | None ->
+                None
+        with
+        | _ -> None
+
+    let setLanguage(langStr: string) =
+        let normalized = normalizeLanguageString(langStr)
+        if currentLanguage <> normalized then
+            currentLanguage <- normalized
+            // Try to load from JSON file
+            loadedStrings <- loadLanguageFromJson(normalized)
+            languageChanged.Trigger()
+
+    // Initialize language (called at startup)
+    let initLanguage(langStr: string) =
+        let normalized = normalizeLanguageString(langStr)
+        currentLanguage <- normalized
+        loadedStrings <- loadLanguageFromJson(normalized)
+
+    let getString(key: string) =
+        // First, try to get from loaded JSON strings
+        match loadedStrings with
+        | Some(dict) ->
+            match dict.TryGetValue(key) with
+            | true, value -> value
+            | false, _ ->
+                // Fallback to Localization_English.fs
+                match Localization_English.strings.TryGetValue(key) with
+                | true, value -> value
+                | false, _ -> key
+        | None ->
+            // No JSON loaded, use built-in English dictionary
+            match Localization_English.strings.TryGetValue(key) with
+            | true, value -> value
+            | false, _ -> key

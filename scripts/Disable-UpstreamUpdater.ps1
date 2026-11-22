@@ -1,40 +1,29 @@
 $ErrorActionPreference = 'Stop'
-$path = Join-Path $env:GITHUB_WORKSPACE 'WindowTabs-source\WtProgram\DesktopPlugins\NotifyIconPlugin.fs'
-$source = Get-Content $path -Raw
-$sections = @(
-    @{
-        Start = '// Auto-update: checks the GitHub releases of this repository and installs a'
-        End = 'type NotifyIconPlugin() as this ='
-        Replacement = ''
-        Name = 'UpdateChecker module'
-    },
-    @{
-        Start = '    // Check the latest GitHub release and report the result.'
-        End = '    // Restart application using normal shutdown'
-        Replacement = ''
-        Name = 'tray updater methods'
-    },
-    @{
-        Start = '            let updateMenuItem = new MenuItem(Localization.getString("CheckForUpdates"))'
-        End = '            // Both ask first:'
-        Replacement = ''
-        Name = 'tray updater menu item'
-    }
+$manifest = Get-Content (Join-Path $env:GITHUB_WORKSPACE 'build\core-manifest.json') -Raw | ConvertFrom-Json
+$sourceRoot = Join-Path $env:GITHUB_WORKSPACE 'WindowTabs-source'
+$patch = Join-Path $env:GITHUB_WORKSPACE $manifest.updaterPatch
+if (-not (Test-Path $patch)) { throw "Updater-disable patch was not found: $patch" }
+git -C $sourceRoot apply --check $patch
+if ($LASTEXITCODE -ne 0) { throw "Updater-disable patch check failed: $LASTEXITCODE" }
+git -C $sourceRoot apply $patch
+if ($LASTEXITCODE -ne 0) { throw "Updater-disable patch failed: $LASTEXITCODE" }
+
+$forbidden = @(
+    'WebClient',
+    'AsyncDownloadString',
+    'AsyncDownloadFile',
+    'api.github.com/repos/standard-software/WindowTabs/releases/latest',
+    'windowtabs.uservoice.com',
+    'this.checkForUpdates()',
+    'this.startUpdate',
+    'UpdateChecker'
 )
-
-foreach ($section in $sections) {
-    $startMatches = [regex]::Matches($source, [regex]::Escape($section.Start))
-    $endMatches = [regex]::Matches($source, [regex]::Escape($section.End))
-    if ($startMatches.Count -ne 1 -or $endMatches.Count -ne 1 -or $startMatches[0].Index -ge $endMatches[0].Index) {
-        throw "Expected one ordered start/end marker for $($section.Name)."
+$sources = Get-ChildItem $sourceRoot -Recurse -File -Include *.fs,*.cs
+foreach ($token in $forbidden) {
+    $matches = Select-String -Path $sources.FullName -SimpleMatch $token
+    if ($matches) {
+        $locations = ($matches | ForEach-Object { "$($_.Path):$($_.LineNumber)" }) -join ', '
+        throw "Runtime network updater token remains in patched source: $token ($locations)"
     }
-    $start = $startMatches[0].Index
-    $end = $endMatches[0].Index
-    $source = $source.Substring(0, $start) + $section.Replacement + $source.Substring($end)
 }
-
-foreach ($forbidden in @('WebClient', 'AsyncDownloadString', 'AsyncDownloadFile', 'api.github.com/repos/standard-software/WindowTabs/releases/latest', 'windowtabs.uservoice.com', 'this.checkForUpdates()', 'this.startUpdate')) {
-    if ($source.Contains($forbidden)) { throw "Updater code remains in patched source: $forbidden" }
-}
-Set-Content -Path $path -Value $source -Encoding utf8
-Write-Host 'Removed tray updater, network check and download/install implementation.'
+Write-Host 'Applied audited updater-disable patch; runtime checks, downloads, execution and feedback URL are absent.'

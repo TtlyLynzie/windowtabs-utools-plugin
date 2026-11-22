@@ -1,7 +1,6 @@
 "use strict";
 const assert = require("assert");
 const path = require("path");
-const fs = require("fs");
 const loadPreload = require("./load-preload.cjs");
 
 function check(root) {
@@ -21,6 +20,5 @@ function check(root) {
 }
 
 check(path.resolve(__dirname, ".."));
-const market = path.resolve(__dirname, "../dist/market");
-if (fs.existsSync(path.join(market, "preload.js"))) check(market);
+check(path.resolve(__dirname, "../dist/market"));
 console.log("integrated parameter validation tests passed");

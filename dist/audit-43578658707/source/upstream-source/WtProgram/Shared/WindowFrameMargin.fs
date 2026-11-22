@@ -1,0 +1,317 @@
+﻿namespace Bemo
+
+open System
+open System.Collections.Generic
+open System.Runtime.InteropServices
+
+module WindowFrameMargin =
+    type Bounds = { x: int; y: int; width: int; height: int }
+    type Margin = { top: int; left: int; right: int; bottom: int }
+    let zero = { top = 0; left = 0; right = 0; bottom = 0 }
+
+    // Input contains only visible, directly owned windows from other processes. Corner pieces may
+    // shorten an edge piece by up to the thickness limit at either end, but a
+    // small popup must not count as a full side. All coordinates are pixels.
+    let detect dpi (owner: Bounds) (frames: Bounds list) =
+        let limit = max 1 ((32 * max 96 dpi + 95) / 96)
+        let spans start length edge extent =
+            length > 0 && start <= edge + limit && start + length >= edge + extent - limit &&
+            length * 2 >= extent
+        let horizontal (r: Bounds) = spans r.x r.width owner.x owner.width
+        let vertical (r: Bounds) = spans r.y r.height owner.y owner.height
+        // A frame may overlap the owner by up to two logical pixels. Only
+        // its outside portion contributes margin; gaps and inside-only pieces do not.
+        let overlapLimit = max 1 ((2 * max 96 dpi + 95) / 96)
+        let outside thickness extent =
+            thickness > 0 && thickness <= limit && extent > 0 &&
+            thickness - extent >= 0 && thickness - extent <= overlapLimit
+        if owner.width <= 0 || owner.height <= 0 then zero
+        else
+            frames |> List.fold (fun m r ->
+                { top = if outside r.height (owner.y - r.y) && horizontal r
+                        then max m.top (owner.y - r.y) else m.top
+                  bottom = if outside r.height (r.y + r.height - owner.y - owner.height) && horizontal r
+                           then max m.bottom (r.y + r.height - owner.y - owner.height) else m.bottom
+                  left = if outside r.width (owner.x - r.x) && vertical r
+                         then max m.left (owner.x - r.x) else m.left
+                  right = if outside r.width (r.x + r.width - owner.x - owner.width) && vertical r
+                          then max m.right (r.x + r.width - owner.x - owner.width) else m.right }) zero
+
+    let scale fromDpi toDpi (margin: Margin) =
+        let px value = int (Math.Round(float value * float (max 1 toDpi) / float (max 1 fromDpi), MidpointRounding.AwayFromZero))
+        px margin.top, px margin.left, px margin.right, px margin.bottom
+
+    // Missing sides retain their original measurement and DPI independently.
+    type Measurement = { pixels: int; dpi: int }
+    type Sticky = { top: Measurement; left: Measurement; right: Measurement; bottom: Measurement }
+    let emptySticky : Sticky =
+        let empty = { pixels = 0; dpi = 96 }
+        { top = empty; left = empty; right = empty; bottom = empty }
+    let remember dpi (detected: Margin) (previous: Sticky) : Sticky =
+        let side pixels previous = if pixels > 0 then { pixels = pixels; dpi = dpi } else previous
+        { top = side detected.top previous.top; left = side detected.left previous.left
+          right = side detected.right previous.right; bottom = side detected.bottom previous.bottom }
+    let readSticky dpi (value: Sticky) =
+        let side m = int (Math.Round(float m.pixels * float (max 1 dpi) / float (max 1 m.dpi), MidpointRounding.AwayFromZero))
+        side value.top, side value.left, side value.right, side value.bottom
+
+    // A shrinking sample must repeat before it replaces the last full frame.
+    // Owned pieces are repositioned separately and can briefly be incomplete.
+    let acceptSample (previous: Margin) pending (detected: Margin) =
+        let shrinks = detected.top < previous.top || detected.left < previous.left ||
+                      detected.right < previous.right || detected.bottom < previous.bottom
+        if shrinks && pending <> Some detected then previous, Some detected
+        else detected, None
+
+    let needsReplacement hasBase normal moving before after =
+        hasBase && normal && not moving && before <> after
+
+    // Both directions use the same group rectangle, including a zero margin.
+    let inset (top, left, right, bottom) (bounds: Bounds) =
+        { x = bounds.x + left; y = bounds.y + top
+          width = bounds.width - left - right; height = bounds.height - top - bottom }
+
+    let outset (top, left, right, bottom) (bounds: Bounds) =
+        { x = bounds.x - left; y = bounds.y - top
+          width = bounds.width + left + right; height = bounds.height + top + bottom }
+
+    // Map the visible normal frame, then recover this member's native frame.
+    // Use the same position-only clamp as a normal same-position move.
+    let mapNormalPlacement sourceArea targetArea sourceMargin targetMargin (native: Bounds) =
+        let visible = outset sourceMargin native
+        let x, y, width, height =
+            SnapGeometry.mapNormalBounds sourceArea targetArea (visible.x, visible.y, visible.width, visible.height)
+        let mapped = { x=x; y=y; width=width; height=height }
+        visible, mapped, inset targetMargin mapped
+
+    // DWM insets are physical pixels. Reject invalid samples instead of
+    // allowing stale or unrelated frame bounds to enlarge a snap.
+    let frameInsets (outer: Bounds) (visible: Bounds) =
+        let t = int64 visible.y - int64 outer.y
+        let l = int64 visible.x - int64 outer.x
+        let r = int64 outer.x + int64 outer.width - int64 visible.x - int64 visible.width
+        let b = int64 outer.y + int64 outer.height - int64 visible.y - int64 visible.height
+        if outer.width <= 0 || outer.height <= 0 || visible.width <= 0 || visible.height <= 0 ||
+           [t;l;r;b] |> List.exists (fun v -> v < 0L || v > 32L) then (0,0,0,0)
+        else int t, int l, int r, int b
+
+    let usePreparedBase hasBase normal = not hasBase && normal
+
+    // Render before entering the logger. Its thunk closes over a string only.
+    let trace (message: string) =
+#if DEBUG
+        let line = sprintf "[margin-placement] tick=%d %s" Environment.TickCount message
+        RestoreTrace.log (fun () -> line)
+#else
+        ignore message
+#endif
+
+#if DEBUG
+    // Main-thread claim tracing reads an immutable publication, never group cells.
+    let private bases = Collections.Concurrent.ConcurrentDictionary<nativeint, nativeint * Bounds>()
+    let publishBase group source bounds = bases.[group] <- (source, bounds)
+    let readBase group =
+        match bases.TryGetValue group with true, value -> Some value | _ -> None
+    let forgetBase group = bases.TryRemove group |> ignore
+#endif
+
+    type private Entry = {
+        mutable value: Sticky
+        mutable pending: Margin option
+#if DEBUG
+        mutable detected: (int * Margin) option
+#endif
+        mutable sampled: int64
+        mutable users: int
+    }
+    let private gate = obj()
+    let private shared = Dictionary<nativeint, Entry>()
+
+    module private Native =
+        [<Struct; StructLayout(LayoutKind.Sequential)>]
+        type RECT =
+            val mutable left: int
+            val mutable top: int
+            val mutable right: int
+            val mutable bottom: int
+#if DEBUG
+        [<DllImport("user32.dll", EntryPoint = "GetWindowRect")>]
+        extern bool TraceNative_GetWindowRect(nativeint hwnd, RECT& rect)
+        let GetWindowRect(hwnd: nativeint, rect: byref<RECT>) =
+            let call = Bemo.Win32.GroupCallTrace.Begin("GetWindowRect", hwnd)
+            try TraceNative_GetWindowRect(hwnd, &rect)
+            finally Bemo.Win32.GroupCallTrace.End(call)
+#else
+        [<DllImport("user32.dll")>]
+        extern bool GetWindowRect(nativeint hwnd, RECT& rect)
+#endif
+        [<DllImport("user32.dll")>]
+        extern nativeint GetWindow(nativeint hwnd, uint32 command)
+        [<DllImport("user32.dll")>]
+        extern nativeint GetTopWindow(nativeint hwnd)
+        [<DllImport("user32.dll")>]
+        extern bool IsWindowVisible(nativeint hwnd)
+        [<DllImport("user32.dll")>]
+        extern bool IsWindow(nativeint hwnd)
+        [<DllImport("user32.dll")>]
+        extern bool IsIconic(nativeint hwnd)
+        [<DllImport("user32.dll")>]
+        extern bool IsZoomed(nativeint hwnd)
+#if DEBUG
+        [<DllImport("user32.dll", EntryPoint = "GetDpiForWindow")>]
+        extern uint32 TraceNative_GetDpiForWindow(nativeint hwnd)
+        let GetDpiForWindow(hwnd: nativeint) =
+            let call = Bemo.Win32.GroupCallTrace.Begin("GetDpiForWindow", hwnd)
+            try TraceNative_GetDpiForWindow(hwnd)
+            finally Bemo.Win32.GroupCallTrace.End(call)
+#else
+        [<DllImport("user32.dll")>]
+        extern uint32 GetDpiForWindow(nativeint hwnd)
+#endif
+        [<DllImport("user32.dll")>]
+        extern uint32 GetWindowThreadProcessId(nativeint hwnd, uint32& processId)
+        [<DllImport("kernel32.dll")>]
+        extern uint32 GetCurrentProcessId()
+
+    let private currentProcessId = Native.GetCurrentProcessId()
+    let isExternalFrame hwnd =
+        let mutable processId = 0u
+        Native.GetWindowThreadProcessId(hwnd, &processId) <> 0u &&
+        processId <> 0u && processId <> currentProcessId
+
+    let private bounds hwnd =
+        let mutable r = Native.RECT()
+        if Native.GetWindowRect(hwnd, &r) then
+            Some { x = r.left; y = r.top; width = r.right - r.left; height = r.bottom - r.top }
+        else None
+
+    // Per-group subscriptions share the HWND's lifetime sample. Removing one
+    // group cannot erase margins while another group still contains the HWND.
+    type Cache() =
+        let members = Dictionary<nativeint, Entry>()
+        let scanned = Dictionary<nativeint, int64>()
+        member this.Attach(hwnd) =
+            lock gate (fun () ->
+                if not (members.ContainsKey hwnd) then
+                    let entry =
+                        match shared.TryGetValue hwnd with
+                        | true, value -> value
+                        | _ ->
+                            let value = { value = emptySticky; pending = None
+#if DEBUG
+                                          detected = None
+#endif
+                                          sampled = 0L; users = 0 }
+                            shared.[hwnd] <- value
+                            value
+                    entry.users <- entry.users + 1
+                    members.[hwnd] <- entry)
+        member this.Seed(hwnd, dpi, (top, left, right, bottom)) =
+            this.Attach(hwnd)
+            let detected : Margin = { top=top; left=left; right=right; bottom=bottom }
+            lock gate (fun () ->
+                let entry = members.[hwnd]
+                entry.value <- remember dpi detected entry.value)
+        member this.Get(hwnd, dpi) =
+            lock gate (fun () ->
+                match members.TryGetValue hwnd with
+                | true, entry -> readSticky dpi entry.value
+                | _ -> 0, 0, 0, 0)
+        // Comparing original measurements avoids losing a physical-pixel change
+        // when two samples round to the same value at the reference DPI.
+        member this.Measurement(hwnd) =
+            lock gate (fun () ->
+                match members.TryGetValue hwnd with
+                | true, entry -> entry.value
+                | _ -> emptySticky)
+        member this.Remove(hwnd) =
+            // Even native lifetime checks belong outside the shared cache lock.
+            let exists = Native.IsWindow hwnd
+            lock gate (fun () ->
+                match members.TryGetValue hwnd with
+                | true, entry ->
+                    members.Remove hwnd |> ignore
+                    entry.users <- entry.users - 1
+                    match shared.TryGetValue hwnd with
+                    | true, current when (entry.users = 0 || not exists) && obj.ReferenceEquals(current, entry) ->
+                        entry.value <- emptySticky
+                        shared.Remove hwnd |> ignore
+                    | _ -> ()
+                | _ -> ()
+                scanned.Remove hwnd |> ignore)
+        member this.Clear() =
+            let handles = lock gate (fun () -> List.ofSeq members.Keys)
+            for hwnd in handles do this.Remove(hwnd)
+        member this.Invalidate(hwnd) = lock gate (fun () -> scanned.Remove hwnd |> ignore)
+        member this.Refresh(hwnd, excluded: nativeint -> bool) =
+            let now = Diagnostics.Stopwatch.GetTimestamp()
+            let due = lock gate (fun () ->
+                match scanned.TryGetValue hwnd with
+                | true, previous -> now - previous >= Diagnostics.Stopwatch.Frequency / 20L
+                | _ -> true)
+            if not (Native.IsWindow hwnd) then
+                lock gate (fun () ->
+                    match shared.TryGetValue hwnd with
+                    | true, entry -> entry.value <- emptySticky; shared.Remove hwnd |> ignore
+                    | _ -> ())
+                this.Remove(hwnd)
+                false
+            elif not due || not (Native.IsWindowVisible hwnd) || Native.IsIconic hwnd || Native.IsZoomed hwnd then
+                // Configured margins used to survive hidden/minimized/maximized
+                // states. Preserve the last normal sample for restoration.
+                false
+            else
+                this.Attach(hwnd)
+                lock gate (fun () -> scanned.[hwnd] <- now)
+                match bounds hwnd with
+                | None -> false
+                | Some owner ->
+                    let rec walk candidate remaining frames =
+                        if candidate = 0n then Some frames
+                        elif remaining = 0 then None
+                        else
+                            let frames =
+                                if not (excluded candidate) && Native.GetWindow(candidate, 4u) = hwnd && Native.IsWindowVisible candidate && isExternalFrame candidate then
+                                    match bounds candidate with Some r -> r :: frames | None -> frames
+                                else frames
+                            walk (Native.GetWindow(candidate, 2u)) (remaining - 1) frames
+                    // Owned frame pieces can sit behind their owner after a reorder.
+                    // Search both sides of the owner in the top-level order.
+                    match walk (Native.GetTopWindow(0n)) 4096 [] with
+                    | None -> false // Incomplete order is not evidence of zero margin.
+                    | Some frames ->
+                        let dpi = try max 96 (int (Native.GetDpiForWindow hwnd)) with _ -> 96
+                        let margin = detect dpi owner frames
+                        let before = this.Get(hwnd, dpi)
+                        // Publish only cache data under the lock. Logging can wait
+                        // on another logger, whose caller may itself read the cache.
+                        let sampleTrace = lock gate (fun () ->
+                            match members.TryGetValue hwnd with
+                            | true, entry when now - entry.sampled >= Diagnostics.Stopwatch.Frequency / 20L ->
+                                let top, left, right, bottom = readSticky dpi entry.value
+                                let previous : Margin = { top=top; left=left; right=right; bottom=bottom }
+                                let accepted, pending = acceptSample previous entry.pending margin
+#if DEBUG
+                                let report = if entry.detected <> Some(dpi, margin) then Some accepted else None
+                                entry.detected <- Some(dpi, margin)
+#endif
+                                entry.pending <- pending
+                                entry.sampled <- now
+                                if accepted <> previous then
+                                    entry.value <- remember dpi accepted emptySticky
+#if DEBUG
+                                report
+                            | _ -> None)
+#else
+                                ()
+                            | _ -> ())
+#endif
+#if DEBUG
+                        sampleTrace |> Option.iter (fun accepted ->
+                            trace (sprintf "sample hwnd=%X detected=%A accepted=%A dpi=%d" (int64 hwnd) margin accepted dpi))
+#endif
+                        let changed = before <> this.Get(hwnd, dpi)
+#if DEBUG
+                        if changed then Diagnostics.Debug.WriteLine(sprintf "[WindowFrameMargin] hwnd=%X margin=%A dpi=%d" (int64 hwnd) margin dpi)
+#endif
+                        changed

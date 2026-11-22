@@ -1,0 +1,526 @@
+﻿namespace Bemo
+open System
+open System.Drawing
+open System.Threading
+open System.Windows.Forms
+
+
+type GroupInfo() as this =
+    let Cell = CellScope(true, true)
+    let windowsCell = Cell.create(List2())
+    let mutable _isExited = false
+    let stripViewGate = obj()
+    let mutable pendingStripView : (bool * VirtualDesktopGroups.StripView) option = None
+#if DEBUG
+    let mutable coalescedStripViews = 0
+#endif
+    let desktopInvoker = InvokerService.invoker
+    let (_group, invoker) = ThreadHelper.startOnThreadAndWait <| fun() ->
+        let plugins = List2<_>([
+            None // MouseScrollPlugin disabled - mouse wheel tab switching removed
+            // Ctrl+1 .. Ctrl+9 used to be a low-level keyboard hook plugin
+            // here (NumericTabHotKeyPlugin). The number keys are
+            // RegisterHotKey hot keys now, owned by Program together with
+            // Next / Previous Tab: see HotKeyPolicy and Program.syncHotKeys.
+            Some(HideTabsOnInactiveGroupPlugin().cast<IPlugin>())
+            ])
+        let plugins = plugins.choose(id)
+
+        let _group = WindowGroup(plugins)
+        _group.exited.Add <| fun _ ->
+            _isExited <- true 
+            ShutdownTrace.write "group ExitThread"
+            Application.ExitThread()
+        (_group, InvokerService.invoker)
+
+    do
+        // asyncInvoke, not invoke: these fire on the group thread, and a
+        // synchronous invoke into the (possibly busy) main thread here is one
+        // half of the display-change deadlock — see NonBlockingSyncContext.
+        // Ordering is preserved by the main thread's message queue.
+        _group.added.Add <| fun _ ->
+            let order = _group.visualOrder.list
+            desktopInvoker.asyncInvoke <| fun() ->
+                // Preserve pending reservations while publishing the actual
+                // order, including arrivals inserted beside an existing tab.
+                windowsCell.map <| fun l ->
+                    List2(order @ (l.list |> List.filter (fun h -> not (List.contains h order))))
+
+        _group.moved.Add <| fun(hwnd, index) ->
+            desktopInvoker.asyncInvoke <| fun() ->
+                windowsCell.map <| fun l -> l.move((=) hwnd, index)
+
+        _group.removed.Add <| fun hwnd ->
+            desktopInvoker.asyncInvoke <| fun() ->
+                windowsCell.map <| fun l -> l.where((<>) hwnd)
+
+    member this.invokeGroup = invoker.asyncInvoke
+    member this.tryInvokeGroup = invoker.tryAsyncInvoke
+    member this.applyStripDesktop(shown, view) =
+        _group.markDesktopShown(shown)
+        let post = lock stripViewGate (fun () ->
+            let post = pendingStripView.IsNone
+#if DEBUG
+            if not post then coalescedStripViews <- coalescedStripViews + 1
+#endif
+            pendingStripView <- Some(shown, view)
+            post)
+        if post then this.invokeGroup <| fun () ->
+#if DEBUG
+            let pending, merged = lock stripViewGate (fun () ->
+                let value, count = pendingStripView, coalescedStripViews
+                pendingStripView <- None
+                coalescedStripViews <- 0
+                value, count)
+#else
+            let pending = lock stripViewGate (fun () ->
+                let value = pendingStripView
+                pendingStripView <- None
+                value)
+#endif
+            pending |> Option.iter (fun (shown, view) ->
+#if DEBUG
+                VirtualDesktopTrace.periodic false (fun () ->
+                    sprintf "desktop-strip-delivery strip=%X coalesced=%d" (_group.hwnd.ToInt64()) merged)
+#endif
+                _group.applyStripDesktop(shown, view))
+    member this.isExited = _isExited
+    member this.exited = _group.exited
+    member this.removed = _group.removed
+    member this.group = _group
+    member this.hwnd = this.group.hwnd
+    member private this.windows = windowsCell.value
+    // Reserve membership before posting, while resolving tab state on its owner.
+    // Keep queued workspace arrivals from looking like an abandoned empty group.
+    // This is called on the main thread, like addWindowWith's reservation.
+    member this.reserveWorkspaceWindows(hwnds: IntPtr list) =
+        windowsCell.map(fun current -> List2((current.list @ hwnds) |> List.distinct))
+
+    member this.addWindowWith(hwnd, add: WindowGroup -> unit) =
+        windowsCell.map <| fun l -> l.append hwnd
+        this.invokeGroup <| fun () -> add this.group
+
+    member private this.addWindow(hwnd, withDelay) =
+        this.addWindowWith(hwnd, fun group -> group.addWindow(hwnd, withDelay))
+    member private this.removeWindow hwnd =
+        this.invokeGroup <| fun() -> this.group.removeWindow(hwnd)
+    member private this.destroy() = this.invokeGroup <| fun() -> this.group.destroy()
+    member private x.switchWindow(next, force) = this.invokeGroup <| fun() -> this.group.switchWindow(next, force)
+    // force = true, as the old Ctrl+number plugin did: the user named the tab
+    // and expects it in front even when its window is the one already active.
+    member private x.activateIndex(index) = this.invokeGroup <| fun() -> this.group.activateIndex(index, true)
+
+    interface IGroup with
+        member x.hwnd = this.hwnd
+        member x.windows
+            with get() = this.windows
+        member x.visualOrder = this.windows  // Use windowsCell which maintains order via added/moved events
+        member x.visualOrderThreadSafe = _group.visualOrderHwndsThreadSafe
+        member x.destroy() = this.destroy()
+        member x.addWindow(hwnd, delay) = this.addWindow(hwnd, delay)
+        member x.removeWindow hwnd = this.removeWindow hwnd
+        member x.switchWindow(next,force) = this.switchWindow(next, force)
+        member x.activateIndex(index) = this.activateIndex(index)
+        member x.perGroupTabPositionValue
+            with get() : string = _group.perGroupTabPositionValue
+            and set(value:string) = this.invokeGroup <| fun() -> _group.perGroupTabPositionValue <- value
+        member x.snapTabHeightMargin
+            with get() = _group.snapTabHeightMargin
+            and set(value) = this.invokeGroup <| fun() -> _group.snapTabHeightMargin <- value
+        member x.lockWindowPosition
+            with get() = _group.lockWindowPosition
+            and set(value) = this.invokeGroup <| fun() -> _group.lockWindowPosition <- value
+        member x.isPinned(hwnd) = _group.isPinnedThreadSafe(hwnd)
+        member x.pinTab(hwnd) = this.invokeGroup <| fun() -> _group.pinTab(hwnd)
+        member x.isPinnedThreadSafe(hwnd) = _group.isPinnedThreadSafe(hwnd)
+        member x.isInMoveSizeThreadSafe = _group.isInMoveSizeThreadSafe
+        member x.reseatWindow(hwnd) = this.invokeGroup <| fun() -> _group.reseatWindow(hwnd)
+        member x.setTabFillColor(hwnd, color) = this.invokeGroup <| fun() -> _group.setTabFillColor(hwnd, color)
+        member x.getTabFillColorThreadSafe(hwnd) = _group.getTabFillColorThreadSafe(hwnd)
+        member x.setTabUnderlineColor(hwnd, color) = this.invokeGroup <| fun() -> _group.setTabUnderlineColor(hwnd, color)
+        member x.getTabUnderlineColorThreadSafe(hwnd) = _group.getTabUnderlineColorThreadSafe(hwnd)
+        member x.setTabBorderColor(hwnd, color) = this.invokeGroup <| fun() -> _group.setTabBorderColor(hwnd, color)
+        member x.getTabBorderColorThreadSafe(hwnd) = _group.getTabBorderColorThreadSafe(hwnd)
+        member x.setTabName(hwnd, name) = this.invokeGroup <| fun() -> _group.setTabName(hwnd, name)
+        member x.setTabAlign(hwnd, align) = this.invokeGroup <| fun() -> _group.setTabAlign(hwnd, align)
+        member x.moveTab(hwnd, index) = this.invokeGroup <| fun() -> _group.ts.moveTab(Tab(hwnd), index)
+        member x.desktopHome
+            with get() = _group.desktopHome
+            and set(value) = _group.desktopHome <- value
+        member x.isDesktopShown = _group.isDesktopShownThreadSafe
+        member x.setDesktopShown(shown) =
+            _group.markDesktopShown(shown)
+            // Keep the decision with the publication that produced it. A
+            // queued old pass must not confirm a newer click's destination.
+            let state = VirtualDesktopGroups.Live.snapshot()
+            this.invokeGroup <| fun() -> _group.applyDesktopState(shown, state)
+        member x.explicitTabAlign(hwnd) = _group.ts.explicitTabAlignThreadSafe(Tab(hwnd))
+        member x.addWindowUnplaced(hwnd) =
+            windowsCell.map <| fun l -> l.append hwnd
+            let edge = Services.program.getWindowEdge(hwnd)
+            this.invokeGroup <| fun() -> _group.addWindowPlaced(hwnd, false, false, edge=edge)
+        member x.unpinTab(hwnd) = this.invokeGroup <| fun() -> _group.unpinTab(hwnd)
+        member x.tabEdgeThreadSafe(hwnd) = _group.tabEdgeThreadSafe(hwnd)
+        member x.setTabEdge(hwnd, edge) = this.invokeGroup <| fun() -> _group.restoreTabEdge(hwnd, edge)
+
+type IDesktopNotification =
+    abstract member dragDrop : IntPtr * bool option * TabEdges.Edge option -> unit
+    abstract member dragEnd : unit -> unit
+
+type Desktop(notify:IDesktopNotification) as this =
+    let os = OS()
+    let Cell = CellScope()
+    let groupCell = Cell.create(Set2<GroupInfo>())
+    let isDraggingCell = Cell.create(false)
+    let invoker = InvokerService.invoker
+    let mutable pendingSnapDrops = 0
+    let mutable snapPreview : SnapPreview option = None
+    let mutable previewPlan : (IntPtr * string * Rect * Rect) option = None
+    let mutable previewSettings : Newtonsoft.Json.Linq.JObject option = None
+    let mutable previewDark = false
+    let mutable previewFailed = false
+    let exitedEvent = Event<_>()
+    let removedEvent = Event<_>()
+    let _dd = DragDropController(this :> IDragDropParent) :> IDragDrop
+    
+    do 
+        Services.register(_dd, false)
+        Services.register(this.cast<IDesktop>())
+
+    member private this.groups : List2<GroupInfo> = groupCell.value.items
+    member private this.isEmpty = this.groups.all(fun g -> g.isExited)
+    member private this.isDragging = isDraggingCell.value || pendingSnapDrops > 0
+    member private this.createGroup() =
+        let group = GroupInfo()
+        groupCell.map(fun g -> g.add(group))
+        group.invokeGroup <| fun() -> 
+            let ig = group.cast<IGroup>()
+            group.exited.Add <| fun _ -> exitedEvent.Trigger ig
+            group.removed.Add <| fun _ -> removedEvent.Trigger ig
+            TabStripDecorator(group.group, fun (hwnd, edge) ->
+                invoker.asyncInvoke <| fun() ->
+                    notify.dragDrop(hwnd, None, Some edge)
+                    notify.dragEnd()
+            ).ignore
+        group.cast<IGroup>() 
+
+    // (windowOffset removed: it had no callers and read the RAW, unscaled
+    // appearance, so reviving it on a scaled monitor would have placed windows
+    // a third of a strip height off.)
+    // A window shown on all virtual desktops is in one group per desktop; the
+    // one meant is the one on the desktop being looked at.
+    member this.findGroupContainingHwnd hwnd : IGroup option =
+        let groups = this.cast<IDesktop>().groups
+        match groups.tryFind(fun g -> g.isDesktopShown && g.windows.contains((=)hwnd)) with
+        | Some(g) -> Some(g)
+        | None -> groups.tryFind(fun g -> g.windows.contains((=)hwnd))
+
+    member private this.dropSnapArea(mon: Mon, pt: Pt, dragInfo: TabDragInfo, edges: Map<IntPtr, TabEdges.Edge>, ?previewRoot: Newtonsoft.Json.Linq.JObject) =
+        let work = mon.workRect
+        let workArea = (work.x, work.y, work.width, work.height)
+        let snapDirection = SnapGeometry.directionForPoint workArea (pt.x, pt.y)
+        // Use the same destination edges for margins, alignment and insertion.
+        let area =
+            let inUse = edges |> Map.toList |> List.map snd |> List.distinct
+            if inUse = [TabEdges.Edge.Top] then
+                let tabHeight =
+                    if TabBehaviorPolicy.reserveTopMargin dragInfo.sourceSnapTabHeightMargin (Services.settings.getValue("tabVerticalDirection") :?> string) then
+                        let scale = Dpi.scaleForMonitorHandle mon.hMonitor
+                        (Dpi.scaleAppearance scale Services.program.tabAppearanceInfo).tabHeight - 1
+                    else 0
+                SnapGeometry.reserveTabHeight tabHeight workArea
+            else
+                let reserve =
+                    try
+                        let scale = Dpi.scaleForMonitorHandle mon.hMonitor
+                        let root = match previewRoot with Some root -> root | None -> Services.settings.root
+                        let values = inUse |> List.map (fun edge -> edge, TabEdgeSettings.valuesOf root edge) |> Map.ofList
+                        TabStripDecorator.snapReserveAt(inUse, values, Services.program.tabAppearanceInfo,
+                                                        Services.program.defaultTabAppearanceInfo, scale, dragInfo.sourceSnapTabHeightMargin,
+                                                        Services.settings.getValue("tabVerticalDirection") :?> string)
+                    with _ ->
+                        if previewRoot.IsSome then reraise() else TabEdgeLayout.noReserve
+                TabEdgeLayout.reserveArea reserve workArea
+
+        snapDirection, area
+
+    member private this.dropSnapBounds(mon, pt, dragInfo, edges, ?previewRoot) =
+        let _, area = this.dropSnapArea(mon, pt, dragInfo, edges, ?previewRoot = previewRoot)
+        let work = mon.workRect
+        let x, y, width, height = SnapGeometry.dropBounds (work.x, work.y, work.width, work.height) area (pt.x, pt.y)
+        Rect(Pt(x, y), Sz(width, height))
+
+    // Variant B uses the menu's 50-percent geometry. Group creation continues
+    // only after the position-first DPI transition, without blocking the UI.
+    member private this.snapDroppedWindow(window: Window, mon: Mon, pt: Pt, dragInfo: TabDragInfo, edges: Map<IntPtr, TabEdges.Edge>, complete: unit -> unit) =
+        let hwnd = window.hwnd
+        let margin = dragInfo.sourceFrameMargins.[hwnd]
+        let snapDirection, area = this.dropSnapArea(mon, pt, dragInfo, edges)
+
+        let finish() =
+            try
+                if window.isWindow then
+                    // Final dimensions are computed after DPI settles. Unlike A,
+                    // B's 50 percent does not depend on the restored window size.
+                    let baseBounds = this.dropSnapBounds(mon, pt, dragInfo, edges)
+                    let x, y, width, height = baseBounds.x, baseBounds.y, baseBounds.width, baseBounds.height
+                    FramePlacement.moveDetachedSnap window margin baseBounds
+                    for selected in dragInfo.selectedHwnds do
+                        FramePlacement.prepareSnap selected dragInfo.sourceFrameMargins.[selected] baseBounds
+                    let realignEnabled =
+                        try (Services.settings.getValue("changeTabPositionOnSnap") :?> string) = "change"
+                        with _ -> false
+                    let handles = hwnd :: dragInfo.selectedHwnds
+                    let aligns =
+                        List.zip handles dragInfo.sourceTabAligns
+                        |> List.map (fun (h, a) -> edges.[h], (if a = TopLeft then TabEdges.AlignStart else TabEdges.AlignEnd))
+                    let realigned = TabEdges.snapRealign realignEnabled snapDirection aligns |> Map.ofList
+                    for h in handles do
+                        match Map.tryFind edges.[h] realigned with
+                        | Some alignment ->
+                            Services.program.setWindowAlignment(h, Some(if alignment = TabEdges.AlignStart then TopLeft else TopRight))
+                        | None -> ()
+                    DragTrace.log (fun () ->
+                        sprintf "Desktop.snapDroppedWindow: hwnd=%X pt=%A direction=%s bounds=%A restoreSize=%A"
+                            (hwnd.ToInt64()) pt snapDirection (x, y, width, height) dragInfo.sourceRestoreSize)
+                    complete()
+            finally
+                pendingSnapDrops <- pendingSnapDrops - 1
+                // dragEnd may have arrived while the timer was pending. Keep
+                // auto-grouping/pruning paused until the placement is complete.
+                if not this.isDragging then notify.dragEnd()
+
+        let schedule interval callback =
+            let timer = new System.Windows.Forms.Timer(Interval = interval)
+            timer.Tick.Add <| fun _ ->
+                timer.Stop()
+                timer.Dispose()
+                callback()
+            timer.Start()
+
+        let currentDpi = WinUserApi.GetDpiForWindow(hwnd)
+        let targetDpi = uint32 (DpiApi.GetDpiForMonitorHandle(mon.hMonitor))
+        let perMonitorAware =
+            try
+                WinUserApi.GetAwarenessFromDpiAwarenessContext(WinUserApi.GetWindowDpiAwarenessContext(hwnd)) = 2
+            with _ -> false
+        // The captured restore size is the staging geometry input, never the
+        // size of the off-screen (or maximized) rectangle. B's final size is 50%.
+        let size = dragInfo.sourceRestoreSize
+        let x, y = SnapGeometry.snapStagingPosition snapDirection area size.width size.height
+        window.setPositionOnly x y
+        pendingSnapDrops <- pendingSnapDrops + 1
+        let started = System.Diagnostics.Stopwatch.StartNew()
+        SnapDrop.finishAfterDpiChange currentDpi targetDpi perMonitorAware
+            (fun() -> window.isWindow)
+            (fun() -> WinUserApi.GetDpiForWindow(hwnd))
+            (fun() -> started.ElapsedMilliseconds)
+            schedule finish
+
+
+
+    interface IDesktop with
+        member x.isDragging = this.isDragging
+        member x.isEmpty = this.isEmpty
+        member x.createGroup() = this.createGroup()
+        member x.groups = this.groups.where(fun(g) -> g.isExited.not).map(fun(g) -> g.cast<IGroup>())
+        member x.groupExited = exitedEvent.Publish
+        member x.groupRemoved = removedEvent.Publish
+        member x.foregroundGroup
+            with get() =
+                let foregroundWindow = os.foreground
+                this.findGroupContainingHwnd(foregroundWindow.hwnd)
+
+    member private this.hideSnapPreview() =
+        let previous = snapPreview
+        snapPreview <- None
+        previous |> Option.iter (fun preview ->
+            try preview.Hide() with _ -> ()
+            try preview.Dispose() with _ -> ())
+        previewPlan <- None
+
+    member private this.dropSnapMonitor(pt) =
+        let enabled =
+            try Services.settings.getValue("snapOnDragDetach") :?> bool
+            with _ -> false
+        if enabled then Mon.nearestFromPoint pt else None
+
+    interface IDragDropParent with
+        member x.dragBegin() = invoker.asyncInvoke <| fun() ->
+            isDraggingCell.set(true)
+            previewFailed <- false
+            previewSettings <- None
+            try
+                let root = Services.settings.root
+                previewSettings <- Some root
+                previewDark <- defaultArg (root.getBool("EnableDarkMode")) false
+            with _ -> previewFailed <- true
+
+        member x.dragPreview((pt, data, image)) = invoker.asyncInvoke <| fun() ->
+            try
+                if not previewFailed && (pt.IsSome || snapPreview.IsSome) then
+                    let bounds =
+                        pt |> Option.bind (fun point ->
+                            this.dropSnapMonitor(point) |> Option.bind (fun mon ->
+                                previewSettings |> Option.map (fun root ->
+                                    let work = mon.workRect
+                                    let direction = SnapGeometry.directionForPoint (work.x, work.y, work.width, work.height) (point.x, point.y)
+                                    match previewPlan with
+                                    | Some(monitor, previous, area, bounds) when monitor = mon.hMonitor && previous = direction && area = work -> bounds
+                                    | _ ->
+                                        let info = unbox<TabDragInfo>(data)
+                                        let allowed = TabEdgeSettings.allowedOf root
+                                        let edges = info.sourceTabEdges |> Map.map (fun _ edge -> TabEdges.fallback allowed edge)
+                                        let bounds = this.dropSnapBounds(mon, point, info, edges, previewRoot = root)
+                                        // Snap bases already describe the visible frame.
+                                        previewPlan <- Some(mon.hMonitor, direction, work, bounds)
+                                        bounds)))
+                    if bounds.IsSome && snapPreview.IsNone then snapPreview <- Some(new SnapPreview())
+                    snapPreview |> Option.iter (fun preview -> preview.UpdateBounds(bounds, previewDark, [image], startBounds = os.windowFromHwnd(image).bounds))
+            with _ ->
+                previewFailed <- true
+                this.hideSnapPreview()
+
+        member x.dragDrop((pt, data)) = invoker.asyncInvoke <| fun() ->
+            this.hideSnapPreview()
+            let dragInfo = unbox<TabDragInfo>(data)
+            let (Tab(hwnd)) = dragInfo.tab
+            DragTrace.log (fun () -> sprintf "Desktop.dragDrop: hwnd=%X pt=%A selected=%d" (hwnd.ToInt64()) pt dragInfo.selectedHwnds.Length)
+            let window = os.windowFromHwnd(hwnd)
+            let allowed =
+                try TabEdgeSettings.allowedOf Services.settings.root
+                with _ -> TabEdges.topOnly
+            let edges = dragInfo.sourceTabEdges |> Map.map (fun _ edge -> TabEdges.fallback allowed edge)
+            // Preserve each source side before adding any detached tab. Snap
+            // realignment, when requested, may override these values below.
+            (hwnd :: dragInfo.selectedHwnds) |> List.iteri (fun i h ->
+                dragInfo.sourceTabAligns |> List.tryItem i
+                |> Option.iter (fun alignment -> Services.program.setWindowAlignment(h, Some alignment)))
+            // "Snap to the screen edge when dragging a tab out": the display is
+            // the one containing the drop point (nearest, for a point in a gap
+            // between monitors). Off, or no display answered: the placement
+            // below, unchanged.
+            let snapMonitor = this.dropSnapMonitor(pt)
+
+            let completeDrop() =
+                // Multi-select drag-detach continuation. Case C:
+                //   selected tabs were hideOffScreen'd by dragExit; we tell
+                //   Program to spare them from removeUntabableWindows for a
+                //   brief grace window (markRecentlyPlaced) so the auto-prune
+                //   pass triggered from Program.dragEnd doesn't strip them
+                //   from the new group before adjustChildWindows puts them
+                //   back on-screen. Then we addWindow + showWindow them and
+                //   re-establish active+selected on the new group's thread.
+                if not (List.isEmpty dragInfo.selectedHwnds) then
+                    Services.program.markRecentlyPlaced(hwnd :: dragInfo.selectedHwnds)
+                    Services.program.suspendTabMonitoring()
+                    try
+                        let newGroup = this.createGroup()
+                        if snapMonitor.IsSome then newGroup.snapTabHeightMargin <- dragInfo.sourceSnapTabHeightMargin
+                        newGroup.lockWindowPosition <- dragInfo.sourceLockWindowPosition
+                        let addDetached h =
+                            match newGroup with
+                            | :? GroupInfo as gi -> gi.addWindowWith(h, fun wg -> wg.addWindow(h, false, edge=edges.[h]))
+                            | _ ->
+                                newGroup.addWindow(h, false)
+                                newGroup.setTabEdge(h, edges.[h])
+                        addDetached hwnd
+                        for selHwnd in dragInfo.selectedHwnds do
+                            if not (newGroup.windows.contains((=) selHwnd)) then
+                                addDetached selHwnd
+                            let selWindow = os.windowFromHwnd(selHwnd)
+                            selWindow.showWindow(ShowWindowCommands.SW_SHOW)
+                        match newGroup with
+                        | :? GroupInfo as gi ->
+                            gi.invokeGroup <| fun() ->
+                                let wg = gi.group
+                                wg.tabActivate(Tab(hwnd), false, drag=true)
+                                for selHwnd in dragInfo.selectedHwnds do
+                                    wg.setSelected(selHwnd, true)
+                        | _ -> ()
+                    finally
+                        Services.program.resumeTabMonitoring()
+                else
+                    // The group this window lands in may not exist yet; the
+                    // lock waits under its handle until it does.
+                    // Recover Z order after a foreign body hover, once dropped.
+                    if not (List.isEmpty dragInfo.transferOrder) then
+                        os.setZorder(List2([WindowHandleTypes.HWND_TOP; hwnd]))
+                    Services.program.markDetachedLock hwnd dragInfo.sourceLockWindowPosition
+                    notify.dragDrop(hwnd, (snapMonitor |> Option.map (fun _ -> dragInfo.sourceSnapTabHeightMargin)), Some edges.[hwnd])
+            match snapMonitor with
+            | Some(mon) ->
+                if window.isMinimized || window.isMaximized then
+                    window.showWindow(ShowWindowCommands.SW_RESTORE)
+                this.snapDroppedWindow(window, mon, pt, dragInfo, edges, completeDrop)
+            | None ->
+                // Non-top drags retain the source image geometry even after the
+                // source strip is removed. Top drags keep the legacy DPI offset.
+                // Device pixels for the monitor the tab was dropped on: the drop
+                // point and the window rectangles are physical now that the process
+                // is DPI aware, so this offset has to be scaled to match or the
+                // window lands about a third of a strip height too high at 150%.
+                let tabAppearance = Dpi.scaleAppearance (Dpi.scaleForPoint pt) Services.program.tabAppearanceInfo
+                let previewWindowOffset = Pt(0, tabAppearance.tabHeight - (tabAppearance.tabHeightOffset + 1))
+                let x, y =
+                    TabEdges.dragPreviewDropPoint (pt.x, pt.y)
+                        (dragInfo.imageOffset.x, dragInfo.imageOffset.y)
+                        (dragInfo.previewWindowOffset |> Option.map (fun at -> at.x, at.y))
+                        (previewWindowOffset.x, previewWindowOffset.y)
+                let windowPt = Pt(x, y)
+                let monitor = Mon.fromPoint windowPt
+                let workspaceOffset = monitor.map(fun mon -> mon.workRect.location.sub(mon.displayRect.location)).def(Pt())
+                let windowPt = windowPt.sub(workspaceOffset)
+
+                // First restore the window if it's minimized or maximized
+                if window.isMinimized || window.isMaximized then
+                    window.showWindow(ShowWindowCommands.SW_RESTORE)
+
+                // Get window size for boundary checking
+                let windowSize = window.bounds.size
+
+                // Calculate window center point to determine which screen it belongs to.
+                // Mon (a live MonitorFromPoint query) instead of Screen.FromPoint:
+                // the WinForms screen cache is process-wide and may have been filled
+                // by the deliberately DPI-unaware settings dialog, whose rectangles
+                // are virtualized rather than device pixels.
+                let centerX = windowPt.x + windowSize.width / 2
+                let centerY = windowPt.y + windowSize.height / 2
+                let workArea =
+                    match Mon.nearestFromPoint(Pt(centerX, centerY)) with
+                    | Some(mon) -> mon.workRect
+                    | None -> Rect(windowPt, windowSize)
+
+                // Limit window size to screen size if it exceeds
+                let maxWidth = workArea.width
+                let maxHeight = workArea.height
+                let finalWidth = min windowSize.width maxWidth
+                let finalHeight = min windowSize.height maxHeight
+
+                // Adjust position to keep window within screen boundaries
+                let adjustedX = max workArea.left (min windowPt.x (workArea.right - finalWidth))
+                let adjustedY = max workArea.top (min windowPt.y (workArea.bottom - finalHeight))
+
+                // Resize window if it exceeds screen size, then move to position
+                if windowSize.width > maxWidth || windowSize.height > maxHeight then
+                    WinUserApi.SetWindowPos(
+                        hwnd,
+                        WindowHandleTypes.HWND_TOP,
+                        adjustedX,
+                        adjustedY,
+                        finalWidth,
+                        finalHeight,
+                        SetWindowPosFlags.SWP_NOACTIVATE ||| SetWindowPosFlags.SWP_NOZORDER) |> ignore
+                else
+                    // Move window position only
+                    window.setPositionOnly adjustedX adjustedY
+
+                completeDrop()
+
+        member x.dragEnd() = invoker.asyncInvoke <| fun() ->
+            this.hideSnapPreview()
+            previewSettings <- None
+            isDraggingCell.set(false)
+            notify.dragEnd()
+
+    

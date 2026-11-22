@@ -1,0 +1,284 @@
+﻿namespace Bemo
+open System
+open System.Drawing
+open System.Windows.Forms
+open Newtonsoft.Json
+open Newtonsoft.Json.Linq
+
+[<AttributeUsage(System.AttributeTargets.Method ||| System.AttributeTargets.Property)>]
+type ServiceMethodAttribute() =
+    inherit Attribute()
+    let mutable _async = false
+
+    // Opt in only for thread-safe implementations. On properties this applies
+    // to the getter only; setters still run on the owning thread.
+    member val direct = false with get, set
+
+    member this.async
+        with get() = _async
+        and set(value) = _async <- value
+
+type IServiceAsyncResult =
+    abstract member onCompleted : (obj -> unit) -> unit
+
+type SettingsRec = {
+    licenseKey: string
+    ticket: string option
+    includedPaths: Set2<string>
+    excludedPaths: Set2<string>
+    autoGroupingPaths : Set2<string>
+    version: string
+    tabAppearance: TabAppearanceInfo
+    runAtStartup: bool
+    hideInactiveTabs: bool
+    groupTaskbarButtons: bool
+    enableTabbingByDefault: bool
+    enableCtrlNumberHotKey: bool
+    // Alt+1 .. Alt+9 activate tabs. Exclusive with the Ctrl setting above in
+    // the dialog; HotKeyPolicy.numberKeyMode settles a file that has both.
+    enableAltNumberHotKey: bool
+    enableHoverActivate: bool
+    enableTabPreview: bool
+    tabPreviewDelay: int
+    tabPreviewSize: int
+    tabCloseButton: string
+    tabPinButton: string
+    tabPositionByDefault: string
+    // "auto": above unless that would leave the screen; "down": always
+    // inside the window at its top edge.
+    tabVerticalDirection: string
+    hideTabsWhenDownByDefault: string
+    hideTabsDelayMilliseconds: int
+    hideTabsOnFullscreen: bool
+    hideTabsWhileMoving: bool
+    lockWindowPosition: bool
+    snapTabHeightMargin: bool
+    // "change": on a snap or move to the left, right or a corner, re-align every
+    // tab of a uniformly aligned group to that side. "nochange": leave alignment alone.
+    changeTabPositionOnSnap: string
+    // Dragging tabs out of a strip to form a new group snaps the window to the
+    // left/right/top/bottom edge of the display, chosen by which triangle of
+    // the work area's two diagonals the drop point falls in.
+    snapOnDragDetach: bool
+    }
+
+type ILicenseManager =
+    abstract member isLicensed : bool
+    abstract member licenseKey : string with get,set
+    abstract member setTicketString : string -> unit
+
+type ISettings =
+    abstract member activePath : string
+    abstract member trusted : bool
+    abstract member commitRoot : JObject -> unit
+    abstract member transferSettings : bool * bool -> unit
+    abstract member setValue: (string * obj) -> unit
+    [<ServiceMethod(direct=true)>]
+    abstract member getValue: string -> obj
+    abstract member notifyValue: string -> (obj -> unit) -> unit
+    [<ServiceMethod(direct=true)>]
+    abstract member root : JObject with get,set
+
+type IFilterService =
+    abstract member isAppWindow : IntPtr -> bool
+    abstract member isWorkspaceWindow : IntPtr -> bool
+    abstract member isAppWindowStyle : IntPtr -> bool
+    abstract member isTabbableWindow : IntPtr -> bool
+    abstract member isTabbingEnabledForAllProcessesByDefault : bool with get, set
+    abstract member setIsTabbingEnabledForProcess : string -> bool -> unit
+    abstract member getIsTabbingEnabledForProcess : string -> bool
+    abstract member getIsTabbingEnabledForWindow : IntPtr -> bool
+    abstract member isTabbingExcludedForWindow : IntPtr -> bool
+    abstract member setIsTabbingEnabledForWindows : List2<IntPtr> -> bool -> unit
+    abstract member forgetWindowTabbing : IntPtr -> unit
+
+type SettingsViewType =
+    | ProgramSettings
+    | LicenseSettings
+    | AppearanceSettings
+    | LayoutSettings
+    // Mouse interaction and general settings pages.
+    | InteractionSettings
+    | GeneralSettings
+    // The "Shortcut Keys" tab.
+    | ShortcutKeySettings
+    | ColorSettings
+    | SystemSettings
+
+type ISettingsView =
+    abstract key : SettingsViewType
+    abstract title : string
+    abstract control : Control
+
+type IPropEditor =
+    abstract member value : obj with get,set
+    abstract member control : Control
+    abstract member changed : IEvent<unit>
+
+type IManagerView =
+    // Prepare the hidden settings dialog before confirming a tray language change.
+    abstract member preparePresentation : unit -> unit
+    abstract member show : unit -> unit
+    abstract member show : SettingsViewType -> unit
+    // Hide settings and release its visible session; keep the prepared form.
+    abstract member close : unit -> unit
+
+type IProgram =
+    abstract member version : string
+    abstract member isUpgrade : bool
+    abstract member isFirstRun : bool
+    [<ServiceMethod(async=true)>]
+    abstract member refresh : unit -> unit
+    [<ServiceMethod(async=true)>]
+    abstract member shutdown : unit -> unit
+    abstract member tabLimit : int option
+    abstract member setWindowNameOverride : (IntPtr * Option<string>) -> unit
+    [<ServiceMethod(direct=true)>]
+    abstract member getWindowNameOverride : IntPtr -> Option<string>
+    abstract member setWindowFillColor : IntPtr * Color option -> unit
+    [<ServiceMethod(direct=true)>]
+    abstract member getWindowFillColor : IntPtr -> Color option
+    abstract member setWindowUnderlineColor : IntPtr * Color option -> unit
+    [<ServiceMethod(direct=true)>]
+    abstract member getWindowUnderlineColor : IntPtr -> Color option
+    abstract member setWindowBorderColor : IntPtr * Color option -> unit
+    [<ServiceMethod(direct=true)>]
+    abstract member getWindowBorderColor : IntPtr -> Color option
+    abstract member setWindowPinned : IntPtr * bool -> unit
+    [<ServiceMethod(direct=true)>]
+    abstract member isWindowPinned : IntPtr -> bool
+    abstract member setWindowEdge : IntPtr * TabEdges.Edge -> unit
+    [<ServiceMethod(direct=true)>]
+    abstract member getWindowEdge : IntPtr -> TabEdges.Edge
+    abstract member setWindowAlignment : IntPtr * TabAlign option -> unit
+    [<ServiceMethod(direct=true)>]
+    abstract member getWindowAlignment : IntPtr -> TabAlign option
+    [<ServiceMethod(direct=true)>]
+    abstract member getWindowAlignmentEdge : IntPtr -> TabEdges.Edge option
+    [<ServiceMethod(direct=true)>]
+    abstract member setWindowAlignmentEdge : IntPtr * TabEdges.Edge -> unit
+    abstract member appWindows : List2<IntPtr>
+    abstract member getAutoGroupingEnabled : string -> bool
+    abstract member setAutoGroupingEnabled : string -> bool -> unit
+    abstract member getCategoryEnabled : string * int -> bool
+    abstract member getCategoryNumber : string -> int
+    abstract member setCategoryEnabled : string -> int -> bool -> unit
+    [<ServiceMethod(direct=true)>]
+    abstract member tabAppearanceInfo : TabAppearanceInfo
+    abstract member defaultTabAppearanceInfo : TabAppearanceInfo
+    abstract member darkModeTabAppearanceInfo : TabAppearanceInfo
+    abstract member darkModeBlueTabAppearanceInfo : TabAppearanceInfo
+    abstract member lightMonoTabAppearanceInfo : TabAppearanceInfo
+    abstract member darkMonoTabAppearanceInfo : TabAppearanceInfo
+    abstract member darkMono2TabAppearanceInfo : TabAppearanceInfo
+    abstract member darkMono3TabAppearanceInfo : TabAppearanceInfo
+    abstract member nightHorizonTabAppearanceInfo : TabAppearanceInfo
+    abstract member darkRedFrameTabAppearanceInfo : TabAppearanceInfo
+    [<ServiceMethod(async=true)>]
+    abstract member ping : unit -> unit
+    abstract member setHotKey: string -> int -> unit
+    abstract member getHotKey: string -> int
+    [<ServiceMethod(async=true)>]
+    abstract member notifyNewVersion : unit -> unit
+    abstract member newVersion : IEvent<unit>
+    abstract member suspendTabMonitoring : unit -> unit
+    abstract member beginWorkspaceRestore : unit -> (unit -> unit)
+    abstract member resumeTabMonitoring : unit -> unit
+    abstract member resumeTabMonitoringAfter : int -> unit
+    abstract member llMouse : IEvent<int32 * IntPtr>
+    [<ServiceMethod(direct=true)>]
+    abstract member isDisabled : bool
+    abstract member setDisabled : bool -> unit
+    [<ServiceMethod(direct=true)>]
+    abstract member isShuttingDown : bool
+    abstract member saveTabGroupsBeforeExit : unit -> unit
+    abstract member launchNewWindow : IntPtr -> IntPtr -> string -> unit
+    // Launch a process as a standalone tab group (bypassing auto-grouping).
+    // postAction runs after the new window has been added to its new group.
+    abstract member launchStandaloneWindow : string -> (IntPtr -> unit) -> unit
+    abstract member getAllConfiguredProcessPaths : unit -> List2<string>
+    // Called after tabbing has been switched off for an application: the
+    // closed-tab records of anything no longer tabbed are dropped, so that
+    // switching it back on later starts clean.
+    abstract member forgetClosedTabsOfUntabbedApps : unit -> unit
+    abstract member removeProcessSettings : string -> unit
+    // Mark hwnds as just-placed-into-a-group so the next
+    // removeUntabableWindows pass spares them even if their bounds are
+    // momentarily off-screen (the dragExit hideOffScreen parking). Cleared
+    // automatically by the implementation after a short window.
+    abstract member markRecentlyPlaced : List<IntPtr> -> unit
+    // A tab detached into a group of its own takes the source group's lock
+    // with it. The group does not exist yet when the drop is handled, so the
+    // value waits here under the window's handle, the way the snap margin of
+    // a snap-on-detach does.
+    abstract member markDetachedLock : IntPtr -> bool -> unit
+
+type IGroup =
+    abstract member hwnd : IntPtr
+    abstract member addWindow: IntPtr * bool -> unit
+    abstract member removeWindow: IntPtr -> unit
+    abstract member switchWindow: bool * bool -> unit
+    // Activate the tab at a 0-based index in the strip's visual order (left
+    // to right). Out of range: nothing happens.
+    abstract member activateIndex: int -> unit
+    abstract member windows: List2<IntPtr>
+    abstract member visualOrder: List2<IntPtr>  // Tab display order (left to right)
+    // Real on-screen order from the tab strip's thread-safe snapshot. The
+    // visualOrder mirror above misses reorders done by pin/unpin/align
+    // normalization, so order-sensitive readers must use this one.
+    abstract member visualOrderThreadSafe: List2<IntPtr>
+    abstract member destroy: unit -> unit
+    abstract member perGroupTabPositionValue: string with get, set
+    abstract member snapTabHeightMargin: bool with get, set
+    abstract member lockWindowPosition: bool with get, set
+    abstract member isPinned: IntPtr -> bool
+    abstract member pinTab: IntPtr -> unit
+    abstract member isPinnedThreadSafe: IntPtr -> bool
+    // True while the group's top window is in a native move/size loop and the
+    // other windows are parked off-screen (thread-safe snapshot)
+    abstract member isInMoveSizeThreadSafe: bool
+    // Put a window of the group back where the group is (a live window found
+    // stranded at the iconic position by the periodic scan)
+    abstract member reseatWindow: IntPtr -> unit
+    abstract member setTabFillColor: IntPtr * Color option -> unit
+    abstract member getTabFillColorThreadSafe: IntPtr -> Color option
+    abstract member setTabUnderlineColor: IntPtr * Color option -> unit
+    abstract member getTabUnderlineColorThreadSafe: IntPtr -> Color option
+    abstract member setTabBorderColor: IntPtr * Color option -> unit
+    abstract member getTabBorderColorThreadSafe: IntPtr -> Color option
+    // The rest of a tab's state, for putting a saved workspace's tabs back
+    // as they were: name, side, and position in the strip
+    abstract member setTabName: IntPtr * string option -> unit
+    abstract member setTabAlign: IntPtr * TabAlign -> unit
+    abstract member moveTab: IntPtr * int -> unit
+    // Tab groups per virtual desktop (VirtualDesktopGroups). The desktop the
+    // group belongs to; whether it is the group of the desktop being looked
+    // at (thread-safe snapshot); and the main thread's pass telling it so.
+    abstract member desktopHome: Guid option with get, set
+    abstract member isDesktopShown: bool
+    abstract member setDesktopShown: bool -> unit
+    // A tab's own alignment, None when it follows the group's side
+    // (thread-safe snapshot).
+    abstract member explicitTabAlign: IntPtr -> TabAlign option
+    // Join a window without putting it where the group is: a window shown on
+    // all desktops given a group on another desktop is where it is already.
+    abstract member addWindowUnplaced: IntPtr -> unit
+    abstract member unpinTab: IntPtr -> unit
+    // The edge a tab of this group is on (thread-safe snapshot; for a tab
+    // that has just left, the edge it was on), and putting back the edge the
+    // restore saved (an edge no longer allowed gives way to the first allowed
+    // one).
+    abstract member tabEdgeThreadSafe: IntPtr -> TabEdges.Edge
+    abstract member setTabEdge: IntPtr * TabEdges.Edge -> unit
+
+type IDesktop =
+    abstract member isDragging : bool
+    abstract member isEmpty : bool
+    abstract member createGroup: unit -> IGroup
+    abstract member groups : List2<IGroup>
+    abstract member groupExited: IEvent<IGroup>
+    abstract member groupRemoved: IEvent<IGroup>
+    abstract member foregroundGroup: IGroup option
+
+type IPlugin =
+    abstract member init: unit -> unit

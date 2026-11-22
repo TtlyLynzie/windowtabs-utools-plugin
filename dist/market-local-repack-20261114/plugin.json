@@ -1,0 +1,27 @@
+{
+  "version": "1.0.6",
+  "main": "index.html",
+  "logo": "logo.png",
+  "preload": "preload.js",
+  "pluginSetting": {
+    "single": true,
+    "height": 640
+  },
+  "features": [
+    {
+      "code": "windowtabs",
+      "description": "启动和管理 WindowTabs",
+      "cmds": [
+        "WindowTabs",
+        "窗口标签"
+      ]
+    },
+    {
+      "code": "windowtabs-settings",
+      "description": "在插件中设置窗口标签",
+      "cmds": [
+        "WindowTabs 设置"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,122 @@
+namespace Bemo
+
+open System
+
+// Build caller-owned data before taking a writer gate. The append callback is
+// the logger's own writer and receives only the finished immutable message.
+module TraceWriter =
+    let write gate build append =
+        try
+            let message = build()
+            lock gate (fun () -> append message)
+        with _ -> ()
+
+    // One queue for both ordinary and handover lines prevents a later synchronous
+    // line from overtaking an earlier handover from the same thread.
+    type Queued(append: string -> unit) =
+        let gate = obj()
+        let pending = Collections.Generic.Queue<string>()
+        let mutable running = false
+        let drain () =
+            let mutable draining = true
+            while draining do
+                let next = lock gate (fun () ->
+                    if pending.Count = 0 then
+                        running <- false
+                        None
+                    else Some(pending.Dequeue()))
+                match next with
+                | Some line -> try append line with _ -> ()
+                | None -> draining <- false
+        member _.Post(build: unit -> string) =
+            try
+                let line = build()
+                let start = lock gate (fun () ->
+                    pending.Enqueue(line)
+                    if running then false
+                    else running <- true; true)
+                if start then Threading.ThreadPool.QueueUserWorkItem(fun _ -> drain()) |> ignore
+            with _ -> ()
+
+// Debug-only trace of the session restore: which saved entry each window
+// claimed, by which route, and where it was placed. Bounded across runs.
+module RestoreTrace =
+#if DEBUG
+    let private path =
+        IO.Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+            "WindowTabs", "restore_trace.log")
+    let mutable private started = false
+    let private runId = Guid.NewGuid().ToString("N").Substring(0, 8)
+
+    // Rotate by size, not by startup: repeated short runs share the same file.
+    // Keep four previous chunks as well as the current one.
+    let private rotate () =
+        if IO.File.Exists(path) && IO.FileInfo(path).Length >= 4L * 1024L * 1024L then
+            let archive n = path + "." + string n
+            if IO.File.Exists(archive 4) then IO.File.Delete(archive 4)
+            for n in 3 .. -1 .. 1 do
+                if IO.File.Exists(archive n) then IO.File.Move(archive n, archive (n + 1))
+            IO.File.Move(path, archive 1)
+
+    let titleIdentity (title: string) =
+        let value = if isNull title then "" else title
+        use hash = Security.Cryptography.SHA256.Create()
+        let digest = hash.ComputeHash(Text.Encoding.UTF8.GetBytes(value))
+        sprintf "length=%d hash=%s" value.Length
+            (BitConverter.ToString(digest, 0, 6).Replace("-", ""))
+    let private gate = obj()
+#endif
+    // Takes a thunk, not a string: an argument is evaluated before the call,
+    // so taking the message itself would leave every sprintf at every call
+    // site running in Release - including two that walk the whole tab strip -
+    // with only the file write compiled out.
+#if DEBUG
+    let log (f: unit -> string) =
+#else
+    let inline log (f: unit -> string) =
+#endif
+#if DEBUG
+        TraceWriter.write gate (fun () ->
+            sprintf "%s run=%s %s\r\n" (DateTime.Now.ToString("HH:mm:ss.fff")) runId (f())) (fun line ->
+            try
+                IO.Directory.CreateDirectory(IO.Path.GetDirectoryName(path)) |> ignore
+                rotate()
+                if not started then
+                    IO.File.AppendAllText(path, sprintf "restore-run run=%s\r\n" runId)
+                    started <- true
+                IO.File.AppendAllText(path, line)
+            with _ -> ())
+#else
+        ignore f
+#endif
+
+
+#if DEBUG
+    let private retentionGate = obj()
+    let private retentionReasons = Collections.Generic.Dictionary<IntPtr * int * IntPtr, string * string>()
+#endif
+
+    // Remember each entry independently: interleaved saves must not make an
+    // unchanged reason noisy again. A changed reason or detail is a new event.
+#if DEBUG
+    let retention (hwnd: IntPtr) (token: IntPtr) rank reason (detail: unit -> string) =
+#else
+    let inline retention (hwnd: IntPtr) (token: IntPtr) rank reason (detail: unit -> string) =
+#endif
+#if DEBUG
+        let text = detail()
+        let changed = lock retentionGate (fun () ->
+            let key = token, rank, hwnd
+            match retentionReasons.TryGetValue key with
+            | true, previous when previous = (reason, text) -> false
+            | _ ->
+                retentionReasons.[key] <- reason, text
+                true)
+        if changed then
+            log (fun () ->
+                sprintf "restore-retention hwnd=%X token=%X rank=%d reason=%s%s"
+                    (hwnd.ToInt64()) (token.ToInt64()) rank reason text)
+#else
+        ()
+#endif

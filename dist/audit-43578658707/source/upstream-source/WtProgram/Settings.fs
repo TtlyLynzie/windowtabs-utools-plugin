@@ -1,0 +1,979 @@
+﻿namespace Bemo
+open System
+open System.Drawing
+open System.Collections.Generic
+open System.IO
+open Microsoft.FSharp.Reflection
+open Newtonsoft.Json
+open Newtonsoft.Json.Linq
+
+// Compute the per-channel midpoint of two RGB colors. Used to derive a
+// "Selected" color from the existing Inactive / MouseOver pair when a
+// preset or saved theme does not specify one explicitly.
+module ColorMix =
+    let midpoint (c1: Color) (c2: Color) =
+        Color.FromArgb(
+            (int c1.R + int c2.R) / 2,
+            (int c1.G + int c2.G) / 2,
+            (int c1.B + int c2.B) / 2)
+
+type Settings(isStandAlone) as this =
+    // Weak keys retain the source path without keeping caller-owned JSON alive.
+    let jsonPaths = System.Runtime.CompilerServices.ConditionalWeakTable<JObject, string>()
+#if DEBUG
+    let mutable pathResolutionCount = 0
+#endif
+    let migrationFailed = lazy (
+#if DEBUG
+        let benchmarkPath = Environment.GetEnvironmentVariable("WINDOWTABS_BENCHMARK_SETTINGS")
+        if not (String.IsNullOrEmpty(benchmarkPath)) then false else
+#endif
+        PortableSettings.migrate (PortableSettings.appDataPath()) (PortableSettings.exePath()))
+    let mutable operationPath : string option = None
+    let mutable cachedPath : string option = None
+    let mutable lastRefusedContent : string option = None
+    let mutable lastSaveSucceeded = false
+    let mutable cachedSettingsString = None
+    // JObject is mutable, so keep an internal parsed template and return a
+    // clone to callers. This avoids reparsing unchanged JSON without allowing
+    // an unsaved caller mutation to leak into later reads.
+    let mutable cachedSettingsJson : (string * JObject) option = None
+    let mutable cachedSettingsRec = None
+    // One safety copy of the settings file per process, taken the first time
+    // this process overwrites it. On 2026-08-24 a freshly started build wrote
+    // pure defaults over the user's settings; whatever causes such a write,
+    // the pre-launch content must stay recoverable. Auto backups follow the
+    // pattern <file>.bak.<stamp> and only the 10 newest are kept.
+    let mutable backedUpThisProcess = false
+    // Latched when a read fails or a parse falls back to empty settings.
+    // While it is set every value the app holds is a default that came from
+    // nowhere, and saving from that state is exactly how the settings file
+    // gets wiped - so writes are refused until a read parses cleanly again.
+    let mutable settingsUntrusted = false
+    // The backup scan below runs at most once per process: a settings file
+    // that no backup can replace would otherwise rescan the whole directory
+    // on every settings access.
+    let mutable recoveryAttempted = false
+    // One log line per kind of failure. Without the record cache to absorb
+    // them (see the settings getter) a fallback is reached on every settings
+    // access, and a log that repeats itself thousands of times buries the
+    // first occurrence - the only one that still explains the incident.
+    let loggedFallbacks = HashSet<string>()
+    let settingChangedEvent = Event<string* obj>()
+    let mutable runAtStartup = false
+    let ownerThreadId = System.Threading.Thread.CurrentThread.ManagedThreadId
+    // The map contains only immutable record fields. The private JSON clone is
+    // never handed out or mutated; each root reader receives a fresh clone.
+    let snapshot = PublishedSnapshot<(Map<string, obj> * JObject) option>(None)
+
+    do
+        this.settings |> ignore
+        Services.register(this :> ISettings)
+
+    member this.clearCaches() =
+        cachedSettingsString <- None
+        cachedSettingsJson <- None
+        cachedSettingsRec <- None
+        this.settings |> ignore
+
+    member private this.resolvePath() =
+#if DEBUG
+        pathResolutionCount <- pathResolutionCount + 1
+        let benchmarkPath = Environment.GetEnvironmentVariable("WINDOWTABS_BENCHMARK_SETTINGS")
+        if not (String.IsNullOrEmpty(benchmarkPath)) then benchmarkPath else
+#endif
+        let appData, exe = PortableSettings.appDataPath(), PortableSettings.exePath()
+        if migrationFailed.Value then PortableSettings.legacyPath appData
+        else PortableSettings.choosePath appData exe (File.Exists(appData)) (File.Exists(exe))
+
+    member this.path =
+        match operationPath with
+        | Some(path) -> path
+        | None -> this.resolvePath()
+
+    // Nested reads and writes share one selection, including recovery and cache publication.
+    member private this.withPath(action: bool -> 'T) : 'T =
+        match operationPath with
+        | Some(_) -> action false
+        | None ->
+            let path = this.resolvePath()
+            let changed = cachedPath.IsSome && cachedPath <> Some(path)
+            operationPath <- Some(path)
+            try
+                if cachedPath <> Some(path) then
+                    cachedPath <- Some(path)
+                    cachedSettingsString <- None
+                    cachedSettingsJson <- None
+                    cachedSettingsRec <- None
+                    backedUpThisProcess <- false
+                    settingsUntrusted <- false
+                    recoveryAttempted <- false
+                    lastRefusedContent <- None
+                    loggedFallbacks.Clear()
+                action changed
+            finally operationPath <- None
+
+    member private this.writeWithPath(action: unit -> unit) =
+        this.withPath(fun changed ->
+            if changed then
+                // The incoming value belongs to the previous file. Reload before accepting edits.
+                lastSaveSucceeded <- false
+                this.settings |> ignore
+            else action())
+
+    member private this.cloneSettingsJson(source: JObject) =
+        let clone = source.DeepClone() :?> JObject
+        let path =
+            match jsonPaths.TryGetValue(source) with
+            | true, path -> Some(path)
+            | _ -> cachedPath
+        path |> Option.iter (fun path -> jsonPaths.Add(clone, path))
+        clone
+
+    member private this.diagnosticPath =
+#if DEBUG
+        let benchmarkPath = Environment.GetEnvironmentVariable("WINDOWTABS_BENCHMARK_SETTINGS")
+        if not (String.IsNullOrEmpty(benchmarkPath)) then benchmarkPath else
+#endif
+        PortableSettings.appDataPath()
+
+    member private this.backupPath =
+        PortableSettings.backupPath (PortableSettings.appDataPath()) (PortableSettings.exePath()) this.path
+
+    member this.fileExists : bool = File.Exists(this.path)
+
+    member this.settingsString
+        with get() =
+            if cachedSettingsString.IsSome then this.settingsStringCore
+            else this.withPath(fun _ -> this.settingsStringCore)
+        and set(value) = this.writeWithPath(fun () -> this.settingsStringCore <- value)
+
+    member private this.settingsStringCore
+        with get() =
+            if cachedSettingsString.IsNone then
+                cachedSettingsString <-
+                    try
+                        // Short retry on sharing violations: during a tray
+                        // restart the old process can still be inside its
+                        // final File.Replace when the new one reads, and one
+                        // failed read here is all it takes for the new
+                        // process to come up with defaults.
+                        let rec readRetry attempts =
+                            try File.ReadAllText(this.path)
+                            with :? IOException when attempts > 0 ->
+                                Threading.Thread.Sleep(100)
+                                readRetry (attempts - 1)
+                        if this.fileExists then Some(readRetry 5) else None
+                    with
+                    | ex ->
+                        // A read failure here is how a later save comes to
+                        // write DEFAULTS over the user's real settings. What
+                        // prevents that is the latch below, not the record:
+                        // no write is allowed until a read succeeds. The
+                        // record is for the machine where the fault is being
+                        // looked into, which runs a debug build.
+                        settingsUntrusted <- true
+#if DEBUG
+                        (try
+                            File.AppendAllText(this.diagnosticPath + ".read_error.log",
+                                sprintf "%s read failed: %O" (DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss")) ex + Environment.NewLine)
+                         with _ -> ())
+#endif
+                        None
+            cachedSettingsString
+
+        and set(newSettings : string option) =
+            lastSaveSucceeded <- false
+            try
+                if migrationFailed.Value then
+                    PortableSettings.notifyMigrationFailure()
+                    failwith "Settings migration failed; saving is disabled."
+                let newContent = newSettings.Value
+                // Dirty check: skip when the on-disk content (mirrored in cache) is identical.
+                // Periodic save fires every 10s; this avoids the ~7 ms disk write when nothing changed.
+                match cachedSettingsString with
+                | _ when settingsUntrusted && lastRefusedContent = Some(newContent) -> ()
+                | Some(prev) when prev = newContent && File.Exists(this.path) && not settingsUntrusted -> lastSaveSucceeded <- true
+                | _ ->
+                    let settingsDir = Path.GetDirectoryName(this.path)
+                    if Directory.Exists(settingsDir).not then
+                        Directory.CreateDirectory(settingsDir).ignore
+                    // Atomic write: write the new content to a sibling temp file,
+                    // then move it over the target. Survives force-quit mid-write
+                    // without corrupting the existing settings file.
+                    // Before overwriting an existing file: keep a timestamped copy the
+                    // first time this process writes, and EVERY time the new
+                    // content is under a third of what is on disk - a shrink
+                    // of that size is how both settings wipes looked
+                    // (2026-08-24 / 08-25), and the per-process-only backup
+                    // missed the second one because the long-running process
+                    // had already used up its single backup.
+                    let existingLen =
+                        if File.Exists(this.path) then (try (FileInfo(this.path)).Length with _ -> 0L) else 0L
+                    if existingLen > 0L && (not backedUpThisProcess || int64 newContent.Length * 3L < existingLen) then
+                        backedUpThisProcess <- true
+                        try
+                            let backupPath = this.backupPath
+                            Directory.CreateDirectory(Path.GetDirectoryName(backupPath)) |> ignore
+                            File.Copy(this.path, backupPath + ".bak." + DateTime.Now.ToString("yyyyMMdd_HHmmss"), true)
+                            let old =
+                                PortableSettings.backups this.backupPath
+                                |> Array.sortDescending
+                            if old.Length > 10 then
+                                old.[10..] |> Array.iter (fun f -> try File.Delete(f) with _ -> ())
+                        with _ -> ()
+                    // Two ways a write is refused, both meaning "this content
+                    // was not derived from the user's real settings":
+                    //  - the last read failed or fell back to empty settings.
+                    //    On 2026-08-26 a saved value holding a URL broke the
+                    //    JSONC comment strip, and the empty state that came
+                    //    back was saved over 39 KB of settings.
+                    //  - the content shrank to a third of the file on disk
+                    //    AND carries no Version. Every legitimate save stamps
+                    //    the running build into Version, so an empty one
+                    //    (08-24 / 08-25) or a missing key (08-26) marks a
+                    //    state that never saw the user's file.
+                    // A refused write leaves the file its last good content;
+                    // in a debug build it is also recorded. The in-memory caches are left alone too,
+                    // so a healthy state formed later can still save normally.
+                    // The marker follows how JObject.ToString() formats the
+                    // settings - two-space indent, ": " between key and value.
+                    // Should that ever change, the key stops being found and
+                    // every sharp shrink is refused instead of allowed: an
+                    // inconvenience, but on the side that keeps the file.
+                    let carriesVersion =
+                        let marker = "\"Version\": \""
+                        let i = newContent.IndexOf(marker)
+                        i >= 0 && i + marker.Length < newContent.Length &&
+                        newContent.[i + marker.Length] <> '"'
+                    let refusedReason =
+                        if settingsUntrusted then
+                            Some("settings had been read as empty")
+                        elif existingLen > 0L &&
+                             int64 newContent.Length * 3L < existingLen &&
+                             carriesVersion.not then
+                            Some("shrank to a third with no Version")
+                        else None
+                    let looksLikeWipe = refusedReason.IsSome
+                    if settingsUntrusted then lastRefusedContent <- Some(newContent)
+                    // DEBUG builds only: trace every write with the caller
+                    // stack, so the next wipe-like incident names the code
+                    // path that produced it. Not compiled into Release - it
+                    // grows with every settings change, and a release build
+                    // writes no log at all.
+                    // At the cap the previous file is kept as .1, the way the
+                    // other traces are: this is the only record of how a wipe
+                    // came about, it fills in a few days of ordinary use, and
+                    // deleting it outright threw away the whole history
+                    // rather than the oldest of it.
+#if DEBUG
+                    try
+                        let tracePath = this.diagnosticPath + ".write_trace.log"
+                        if File.Exists(tracePath) && (FileInfo(tracePath)).Length > 5_000_000L then
+                            let previous = tracePath + ".1"
+                            (try File.Delete(previous) with _ -> ())
+                            (try File.Move(tracePath, previous) with _ -> ())
+                        File.AppendAllText(tracePath,
+                            sprintf "%s %s %d bytes (disk had %d)%s%s%s"
+                                (DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss.fff"))
+                                (match refusedReason with
+                                 | Some(reason) -> sprintf "REFUSED (%s) write of" reason
+                                 | None -> "write")
+                                newContent.Length existingLen
+                                Environment.NewLine Environment.StackTrace (Environment.NewLine + Environment.NewLine))
+                    with _ -> ()
+#endif
+#if DEBUG
+                    if looksLikeWipe then
+                        (try
+                            File.AppendAllText(this.diagnosticPath + ".read_error.log",
+                                sprintf "%s REFUSED settings write (%s: %d bytes over %d on disk)" (DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss.fff")) (refusedReason.def "") newContent.Length existingLen + Environment.NewLine)
+                         with _ -> ())
+#endif
+                    // The refusal itself is what protects the file, and it
+                    // happens in either build; only the note of it is written
+                    // where someone is going to read it.
+                    if looksLikeWipe.not then
+                        let tempPath = this.path + ".tmp"
+                        File.WriteAllText(tempPath, newContent)
+                        if File.Exists(this.path) then
+                            File.Replace(tempPath, this.path, null)
+                        else
+                            File.Move(tempPath, this.path)
+                        lastSaveSucceeded <- true
+                        // Refresh in-memory caches with the freshly written content
+                        cachedSettingsString <- Some(newContent)
+                        cachedSettingsJson <- None
+                        cachedSettingsRec <- None
+                        this.settings |> ignore
+            with
+            | ex ->
+                if this.path = PortableSettings.exePath() then PortableSettings.notifyWriteFailure()
+                // Log error but don't crash
+                System.Diagnostics.Debug.WriteLine(sprintf "Failed to save settings: %s" ex.Message)
+
+
+    // Falling back to an empty JObject is what turns a single swallowed
+    // exception into "the settings are the defaults" further up - the wipe
+    // signature seen on 08-24 / 08-25. The fallbacks stay (crashing here
+    // would be worse); what stops them reaching the file is the latch, which
+    // is set in either build.
+    member private this.logEmptyFallback (where: string) (ex: exn) =
+        settingsUntrusted <- true
+#if DEBUG
+        if loggedFallbacks.Add(where) then
+            try
+                File.AppendAllText(this.diagnosticPath + ".read_error.log",
+                    sprintf "%s %s fell back to empty settings - no setting is saved until a backup is adopted or WindowTabs is restarted: %O" (DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss.fff")) where ex + Environment.NewLine)
+            with _ -> ()
+#else
+        ignore where
+        ignore ex
+#endif
+
+    // A settings file that no longer parses does not have to end as "the
+    // settings are the defaults". The backups taken before every sharp shrink
+    // hold the same settings from minutes earlier, so the newest one that
+    // parses AND carries a non-empty Version is adopted - the Version test is
+    // what skips a backup written from an already-decayed state, the way
+    // .bak.20260826_181345 was. The file that could not be read is kept as
+    // <file>.corrupt.<stamp> instead of being overwritten.
+    member private this.tryRecoverFromBackup() : JObject option =
+        let path = this.path
+        if migrationFailed.Value || recoveryAttempted then None
+        else
+            recoveryAttempted <- true
+            try
+                PortableSettings.backups this.backupPath
+                |> Array.sortDescending
+                |> Array.tryPick (fun backup ->
+                    try
+                        let text = File.ReadAllText(backup)
+                        let parsed = parseJsoncObject(text)
+                        match parsed.getString("Version") with
+                        | Some(version) when version <> "" ->
+                            let stamp = DateTime.Now.ToString("yyyyMMdd_HHmmss")
+                            let kept = PortableSettings.retainedPath (PortableSettings.appDataPath()) (PortableSettings.exePath()) path "corrupt" stamp
+                            let mutable preserved = false
+                            let staging = path + "." + Guid.NewGuid().ToString("N") + ".tmp"
+                            try
+                                File.Copy(backup, staging)
+                                if File.ReadAllText(staging) <> text then failwith "Backup verification failed."
+                                preserved <- PortableSettings.replaceRecovered staging path kept
+                            finally
+                                try File.Delete(staging) with _ -> ()
+                            // File and derived state are replaced together, so
+                            // nothing built while the settings were unreadable
+                            // survives into the recovered process.
+                            cachedSettingsString <- Some(text)
+                            cachedSettingsJson <- None
+                            cachedSettingsRec <- None
+                            settingsUntrusted <- false
+#if DEBUG
+                            (try
+                                File.AppendAllText(this.diagnosticPath + ".read_error.log",
+                                    sprintf "%s RECOVERED the settings from %s (%d bytes, Version %s); unreadable file preserved: %b (%s)"
+                                        (DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss.fff"))
+                                        (Path.GetFileName(backup)) text.Length version preserved (Path.GetFileName(kept))
+                                    + Environment.NewLine)
+                             with _ -> ())
+#endif
+                            Some(parsed)
+                        | _ -> None
+                    with _ -> None)
+            with _ -> None
+
+    member private this.getSettingsJson(cloneForCaller: bool) =
+        if cachedSettingsJson.IsSome then this.getSettingsJsonCore(cloneForCaller)
+        else this.withPath(fun _ -> this.getSettingsJsonCore(cloneForCaller))
+
+    member this.settingsJson
+        with get() = this.getSettingsJson(true)
+        and set(value: JObject) =
+            this.writeWithPath(fun () ->
+                match jsonPaths.TryGetValue(value) with
+                | true, path when Some(path) <> operationPath ->
+                    lastSaveSucceeded <- false
+                    this.clearCaches()
+                | _ -> this.settingsJsonCore <- value)
+
+    member private this.getSettingsJsonCore(cloneForCaller: bool) =
+        let result =
+            try
+                match this.settingsString with
+                | Some(s) ->
+                    try
+                        match cachedSettingsJson with
+                        | Some(cachedSource, cachedJson) when cachedSource = s ->
+                            cachedJson
+                        | _ ->
+                            let parsed = parseJsoncObject(s)
+                            cachedSettingsJson <- Some(s, parsed)
+                            parsed
+                    with
+                    | ex ->
+                        // A later parse succeeding is NOT enough to trust this
+                        // process again: by then a record made of pure defaults
+                        // may already have been built and handed out, and
+                        // saving it would write those defaults over a file that
+                        // reads perfectly well. Only a recovery, which swaps
+                        // the file and every cache together, lifts the latch.
+                        this.logEmptyFallback "settingsJson parse" ex
+                        this.tryRecoverFromBackup().def(JObject())
+                | None ->
+                    // Nothing to parse: either there is no settings file yet -
+                    // a first run, with nothing to protect - or the read failed
+                    // and latched, and a backup may still hold what the file
+                    // will not give up.
+                    if this.fileExists then this.tryRecoverFromBackup().def(JObject())
+                    else JObject()
+            with
+            | ex ->
+                this.logEmptyFallback "settingsJson outer" ex
+                JObject()  // Return empty JObject if any error occurs
+
+        if cloneForCaller then this.cloneSettingsJson(result) else result
+
+    member this.settingsJsonReadOnly =
+        // This object must never escape code that only reads it. Mutating
+        // callers use settingsJson, which returns an isolated clone.
+        this.getSettingsJson(false)
+
+    member private this.settingsJsonCore
+        with get() = this.getSettingsJson(true)
+        and set(settingsJson:JObject) =
+            // Cleanup belongs to a normal save, never to loading or recovery.
+            // Keep the existing refusal path unchanged for untrusted settings.
+            let toSave =
+                if settingsUntrusted then settingsJson
+                else RemovedSettings.remove settingsJson
+            this.settingsString <- Some(toSave.ToString())
+
+    member this.defaultTabAppearance =
+        let inactiveTab = Color.FromRGB(0x9FC4F0)
+        let mouseOverTab = Color.FromRGB(0xBDD5F4)
+        {
+            tabHeight = 25
+            tabMaxWidth = 200
+            tabPinnedTabWidth = 90
+            tabPinnedTabWidthIcon = true
+            tabOverlap = 12
+            tabHeightOffset = 1
+            tabIndentFlipped = 150
+            tabIndentFlippedRight = 150
+            tabIndentNormal = 10
+            tabIndentNormalRight = 10
+            tabInactiveTextColor = Color.FromRGB(0x000000)
+            tabSelectedTextColor = Color.FromRGB(0x000000)
+            tabMouseOverTextColor = Color.FromRGB(0x000000)
+            tabActiveTextColor = Color.FromRGB(0x000000)
+            tabFlashTextColor = Color.FromRGB(0x000000)
+            tabInactiveTabColor = inactiveTab
+            tabSelectedTabColor = ColorMix.midpoint inactiveTab mouseOverTab
+            tabMouseOverTabColor = mouseOverTab
+            tabActiveTabColor = Color.FromRGB(0xFAFCFE)
+            tabFlashTabColor = Color.FromRGB(0xFFBBBB)
+            tabInactiveBorderColor = Color.FromRGB(0x3A70B1)
+            tabSelectedBorderColor = Color.FromRGB(0x3A70B1)
+            tabMouseOverBorderColor = Color.FromRGB(0x3A70B1)
+            tabActiveBorderColor = Color.FromRGB(0x3A70B1)
+            tabFlashBorderColor = Color.FromRGB(0x3A70B1)
+            tabShape = TabShape.rounded
+        }
+
+    member this.darkModeTabAppearance =
+        let inactiveTab = Color.FromRGB(0x0D0D0D)
+        let mouseOverTab = Color.FromRGB(0x1E1E1E)
+        {
+            tabHeight = -1
+            tabMaxWidth = -1
+            tabPinnedTabWidth = -1
+            tabPinnedTabWidthIcon = false
+            tabOverlap = -1
+            tabHeightOffset = -1
+            tabIndentFlipped = -1
+            tabIndentFlippedRight = -1
+            tabIndentNormal = -1
+            tabIndentNormalRight = -1
+            tabInactiveTextColor = Color.FromRGB(0xFFFFFF)
+            tabSelectedTextColor = Color.FromRGB(0xFFFFFF)
+            tabMouseOverTextColor = Color.FromRGB(0xFFFFFF)
+            tabActiveTextColor = Color.FromRGB(0xFFFFFF)
+            tabFlashTextColor = Color.FromRGB(0xFFFFFF)
+            tabInactiveTabColor = inactiveTab
+            tabSelectedTabColor = ColorMix.midpoint inactiveTab mouseOverTab
+            tabMouseOverTabColor = mouseOverTab
+            tabActiveTabColor = Color.FromRGB(0x2D2D2D)
+            tabFlashTabColor = Color.FromRGB(0x772222)
+            tabInactiveBorderColor = Color.FromRGB(0x333333)
+            tabSelectedBorderColor = Color.FromRGB(0x333333)
+            tabMouseOverBorderColor = Color.FromRGB(0x333333)
+            tabActiveBorderColor = Color.FromRGB(0x333333)
+            tabFlashBorderColor = Color.FromRGB(0x333333)
+            tabShape = TabShape.rounded
+        }
+
+    member this.darkModeBlueTabAppearance =
+        let inactiveTab = Color.FromRGB(0x111827)
+        let mouseOverTab = Color.FromRGB(0x4B5970)
+        {
+            tabHeight = -1
+            tabMaxWidth = -1
+            tabPinnedTabWidth = -1
+            tabPinnedTabWidthIcon = false
+            tabOverlap = -1
+            tabHeightOffset = -1
+            tabIndentFlipped = -1
+            tabIndentFlippedRight = -1
+            tabIndentNormal = -1
+            tabIndentNormalRight = -1
+            tabInactiveTextColor = Color.FromRGB(0xE0E0E0)
+            tabSelectedTextColor = Color.FromRGB(0xE0E0E0)
+            tabMouseOverTextColor = Color.FromRGB(0xE0E0E0)
+            tabActiveTextColor = Color.FromRGB(0xE0E0E0)
+            tabFlashTextColor = Color.FromRGB(0xE0E0E0)
+            tabInactiveTabColor = inactiveTab
+            tabSelectedTabColor = ColorMix.midpoint inactiveTab mouseOverTab
+            tabMouseOverTabColor = mouseOverTab
+            tabActiveTabColor = Color.FromRGB(0x273548)
+            tabFlashTabColor = Color.FromRGB(0x991B1B)
+            tabInactiveBorderColor = Color.FromRGB(0x374151)
+            tabSelectedBorderColor = Color.FromRGB(0x374151)
+            tabMouseOverBorderColor = Color.FromRGB(0x374151)
+            tabActiveBorderColor = Color.FromRGB(0x374151)
+            tabFlashBorderColor = Color.FromRGB(0x374151)
+            tabShape = TabShape.rounded
+        }
+
+    member this.lightMonoTabAppearance =
+        let inactiveTab = Color.FromRGB(0xA0A0A0)
+        let mouseOverTab = Color.FromRGB(0xD0D0D0)
+        {
+            tabHeight = -1
+            tabMaxWidth = -1
+            tabPinnedTabWidth = -1
+            tabPinnedTabWidthIcon = false
+            tabOverlap = -1
+            tabHeightOffset = -1
+            tabIndentFlipped = -1
+            tabIndentFlippedRight = -1
+            tabIndentNormal = -1
+            tabIndentNormalRight = -1
+            tabInactiveTextColor = Color.FromRGB(0x000000)
+            tabSelectedTextColor = Color.FromRGB(0x000000)
+            tabMouseOverTextColor = Color.FromRGB(0x000000)
+            tabActiveTextColor = Color.FromRGB(0x000000)
+            tabFlashTextColor = Color.FromRGB(0x000000)
+            tabInactiveTabColor = inactiveTab
+            tabSelectedTabColor = ColorMix.midpoint inactiveTab mouseOverTab
+            tabMouseOverTabColor = mouseOverTab
+            tabActiveTabColor = Color.FromRGB(0xFFFFFF)
+            tabFlashTabColor = Color.FromRGB(0xD4D4D4)
+            tabInactiveBorderColor = Color.FromRGB(0x252525)
+            tabSelectedBorderColor = Color.FromRGB(0x252525)
+            tabMouseOverBorderColor = Color.FromRGB(0x252525)
+            tabActiveBorderColor = Color.FromRGB(0x252525)
+            tabFlashBorderColor = Color.FromRGB(0x252525)
+            tabShape = TabShape.rounded
+        }
+
+    member this.darkMonoTabAppearance =
+        let inactiveTab = Color.FromRGB(0x0D0D0D)
+        let mouseOverTab = Color.FromRGB(0xDDDDDD)
+        {
+            tabHeight = -1
+            tabMaxWidth = -1
+            tabPinnedTabWidth = -1
+            tabPinnedTabWidthIcon = false
+            tabOverlap = -1
+            tabHeightOffset = -1
+            tabIndentFlipped = -1
+            tabIndentFlippedRight = -1
+            tabIndentNormal = -1
+            tabIndentNormalRight = -1
+            tabInactiveTextColor = Color.FromRGB(0xFFFFFF)
+            tabSelectedTextColor = Color.FromRGB(0xFFFFFF)
+            tabMouseOverTextColor = Color.FromRGB(0x111111)
+            tabActiveTextColor = Color.FromRGB(0xFFFFFF)
+            tabFlashTextColor = Color.FromRGB(0xFFFFFF)
+            tabInactiveTabColor = inactiveTab
+            tabSelectedTabColor = ColorMix.midpoint inactiveTab mouseOverTab
+            tabMouseOverTabColor = mouseOverTab
+            tabActiveTabColor = Color.FromRGB(0x616161)
+            tabFlashTabColor = Color.FromRGB(0x808080)
+            tabInactiveBorderColor = Color.FromRGB(0x787878)
+            tabSelectedBorderColor = Color.FromRGB(0x787878)
+            tabMouseOverBorderColor = Color.FromRGB(0xF2F2F2)
+            tabActiveBorderColor = Color.FromRGB(0x6B6B6B)
+            tabFlashBorderColor = Color.FromRGB(0x787878)
+            tabShape = TabShape.rounded
+        }
+
+    member this.darkMono2TabAppearance =
+        let inactiveTab = Color.FromRGB(0x0D0D0D)
+        let mouseOverTab = Color.FromRGB(0x919191)
+        {
+            tabHeight = -1
+            tabMaxWidth = -1
+            tabPinnedTabWidth = -1
+            tabPinnedTabWidthIcon = false
+            tabOverlap = -1
+            tabHeightOffset = -1
+            tabIndentFlipped = -1
+            tabIndentFlippedRight = -1
+            tabIndentNormal = -1
+            tabIndentNormalRight = -1
+            tabInactiveTextColor = Color.FromRGB(0xFFFFFF)
+            tabSelectedTextColor = Color.FromRGB(0xFFFFFF)
+            tabMouseOverTextColor = Color.FromRGB(0xFFFFFF)
+            tabActiveTextColor = Color.FromRGB(0x111111)
+            tabFlashTextColor = Color.FromRGB(0xFFFFFF)
+            tabInactiveTabColor = inactiveTab
+            tabSelectedTabColor = ColorMix.midpoint inactiveTab mouseOverTab
+            tabMouseOverTabColor = mouseOverTab
+            tabActiveTabColor = Color.FromRGB(0xDDDDDD)
+            tabFlashTabColor = Color.FromRGB(0x2C1818)
+            tabInactiveBorderColor = Color.FromRGB(0x787878)
+            tabSelectedBorderColor = Color.FromRGB(0x787878)
+            tabMouseOverBorderColor = Color.FromRGB(0x6B6B6B)
+            tabActiveBorderColor = Color.FromRGB(0xF2F2F2)
+            tabFlashBorderColor = Color.FromRGB(0x787878)
+            tabShape = TabShape.rounded
+        }
+
+    member this.darkMono3TabAppearance =
+        {
+            tabHeight = -1
+            tabMaxWidth = -1
+            tabPinnedTabWidth = -1
+            tabPinnedTabWidthIcon = false
+            tabOverlap = -1
+            tabHeightOffset = -1
+            tabIndentFlipped = -1
+            tabIndentFlippedRight = -1
+            tabIndentNormal = -1
+            tabIndentNormalRight = -1
+            tabInactiveTextColor = Color.FromRGB(0xFFFFFF)
+            tabSelectedTextColor = Color.FromRGB(0xFFFFFF)
+            tabMouseOverTextColor = Color.FromRGB(0x111111)
+            tabActiveTextColor = Color.FromRGB(0xFFFFFF)
+            tabFlashTextColor = Color.FromRGB(0xFFFFFF)
+            tabInactiveTabColor = Color.FromRGB(0x0D0D0D)
+            tabSelectedTabColor = Color.FromRGB(0x4D4D4D)
+            tabMouseOverTabColor = Color.FromRGB(0xDDDDDD)
+            tabActiveTabColor = Color.FromRGB(0x777777)
+            tabFlashTabColor = Color.FromRGB(0x2C1818)
+            tabInactiveBorderColor = Color.FromRGB(0x787878)
+            tabSelectedBorderColor = Color.FromRGB(0x787878)
+            tabMouseOverBorderColor = Color.FromRGB(0xF2F2F2)
+            tabActiveBorderColor = Color.FromRGB(0x6B6B6B)
+            tabFlashBorderColor = Color.FromRGB(0x787878)
+            tabShape = TabShape.rounded
+        }
+
+    member this.nightHorizonTabAppearance =
+        {
+            tabHeight = -1
+            tabMaxWidth = -1
+            tabPinnedTabWidth = -1
+            tabPinnedTabWidthIcon = false
+            tabOverlap = -1
+            tabHeightOffset = -1
+            tabIndentFlipped = -1
+            tabIndentFlippedRight = -1
+            tabIndentNormal = -1
+            tabIndentNormalRight = -1
+            tabInactiveTextColor = Color.FromRGB(0xB4B4B4)
+            tabSelectedTextColor = Color.FromRGB(0xFFFFFF)
+            tabMouseOverTextColor = Color.FromRGB(0xFFFFFF)
+            tabActiveTextColor = Color.FromRGB(0xE297FF)
+            tabFlashTextColor = Color.FromRGB(0xFFFFFF)
+            tabInactiveTabColor = Color.FromRGB(0x0D0D0D)
+            tabSelectedTabColor = Color.FromRGB(0x151515)
+            tabMouseOverTabColor = Color.FromRGB(0x1E1E1E)
+            tabActiveTabColor = Color.FromRGB(0x201020)
+            tabFlashTabColor = Color.FromRGB(0x772222)
+            tabInactiveBorderColor = Color.FromRGB(0x333333)
+            tabSelectedBorderColor = Color.FromRGB(0x333333)
+            tabMouseOverBorderColor = Color.FromRGB(0x444444)
+            tabActiveBorderColor = Color.FromRGB(0x79008A)
+            tabFlashBorderColor = Color.FromRGB(0x333333)
+            tabShape = TabShape.rounded
+        }
+
+    member this.darkRedFrameTabAppearance =
+        let inactiveTab = Color.FromRGB(0x0D0D0D)
+        let mouseOverTab = Color.FromRGB(0xB13A3A)
+        {
+            tabHeight = -1
+            tabMaxWidth = -1
+            tabPinnedTabWidth = -1
+            tabPinnedTabWidthIcon = false
+            tabOverlap = -1
+            tabHeightOffset = -1
+            tabIndentFlipped = -1
+            tabIndentFlippedRight = -1
+            tabIndentNormal = -1
+            tabIndentNormalRight = -1
+            tabInactiveTextColor = Color.FromRGB(0xFFFFFF)
+            tabSelectedTextColor = Color.FromRGB(0xFFFFFF)
+            tabMouseOverTextColor = Color.FromRGB(0x111111)
+            tabActiveTextColor = Color.FromRGB(0xB13A3A)
+            tabFlashTextColor = Color.FromRGB(0xFFFFFF)
+            tabInactiveTabColor = inactiveTab
+            tabSelectedTabColor = ColorMix.midpoint inactiveTab mouseOverTab
+            tabMouseOverTabColor = mouseOverTab
+            tabActiveTabColor = Color.FromRGB(0x250A0B)
+            tabFlashTabColor = Color.FromRGB(0x808080)
+            tabInactiveBorderColor = Color.FromRGB(0xB13A3A)
+            tabSelectedBorderColor = Color.FromRGB(0xB13A3A)
+            tabMouseOverBorderColor = Color.FromRGB(0xFF6666)
+            tabActiveBorderColor = Color.FromRGB(0xCC4444)
+            tabFlashBorderColor = Color.FromRGB(0xB13A3A)
+            tabShape = TabShape.rounded
+        }
+
+    member this.update f = this.settings <- f(this.settings)
+
+    member this.settings
+        with get() =
+            if cachedSettingsRec.IsSome then this.settingsCore
+            else this.withPath(fun _ -> this.settingsCore)
+        and set(value) = this.writeWithPath(fun () -> this.settingsCore <- value)
+
+    member private x.settingsCore
+        with get() =
+            let rebuilding = cachedSettingsRec.IsNone
+            if rebuilding then
+                try
+                    let settingsJson = this.settingsJson
+                    let settings = {
+                        includedPaths = Set2(settingsJson.getStringArray("IncludedPaths").def(List2()))
+                        excludedPaths = Set2(settingsJson.getStringArray("ExcludedPaths").def(List2()))
+                        autoGroupingPaths = Set2(settingsJson.getStringArray("AutoGroupingPaths").def(List2()))
+                        licenseKey = settingsJson.getString("LicenseKey").def("")
+                        ticket = settingsJson.getString("Ticket")
+                        runAtStartup = runAtStartup
+                        hideInactiveTabs = settingsJson.getBool("HideInactiveTabs").def(false)
+                        groupTaskbarButtons = settingsJson.getBool("GroupTaskbarButtons").def(false)
+                        enableTabbingByDefault = settingsJson.getBool("EnableTabbingByDefault").def(false)
+                        enableCtrlNumberHotKey = settingsJson.getBool("EnableCtrlNumberHotKey").def(false)
+                        enableAltNumberHotKey = settingsJson.getBool("EnableAltNumberHotKey").def(false)
+                        enableHoverActivate = settingsJson.getBool("EnableHoverActivate").def(false)
+                        enableTabPreview = settingsJson.getBool("EnableTabPreview").def(true)
+                        tabPreviewDelay = settingsJson.getInt32("TabPreviewDelay").def(500)
+                        tabPreviewSize = settingsJson.getInt32("TabPreviewSize").def(320)
+                        tabCloseButton = settingsJson.getString("TabCloseButton").def(TabButtonPolicy.activeOnly) |> TabButtonPolicy.normalize
+                        tabPinButton = settingsJson.getString("TabPinButton").def(TabButtonPolicy.activeOnly) |> TabButtonPolicy.normalize
+                        tabPositionByDefault =
+                            // Handle backward compatibility: convert old format to new TopXxx format
+                            // (the conversion is shared with the four-edge settings migration)
+                            TabBehaviorPolicy.loadTabPosition (settingsJson.getString("TabPositionByDefault"))
+                        tabVerticalDirection =
+                            settingsJson.getString("TabVerticalDirection")
+                            |> Option.map TabBehaviorPolicy.normalizeVerticalDirection
+                            |> Option.defaultValue TabBehaviorPolicy.verticalAuto
+                        hideTabsWhenDownByDefault =
+                            // Check the JSON type before reading legacy boolean values.
+                            // getString casts directly and would discard the entire load.
+                            match settingsJson.getValueCI("HideTabsWhenDownByDefault") with
+                            | Some(:? JValue as value) when value.Type = JTokenType.Boolean ->
+                                if unbox<bool> value.Value then "down" else "never"
+                            | _ -> settingsJson.getString("HideTabsWhenDownByDefault").def("never")
+                        hideTabsDelayMilliseconds = settingsJson.getInt32("HideTabsDelayMilliseconds").def(3000)
+                        hideTabsOnFullscreen = settingsJson.getBool("HideTabsOnFullscreen").def(true)
+                        hideTabsWhileMoving = settingsJson.getBool("HideTabsWhileMoving").def(false)
+                        lockWindowPosition = settingsJson.getBool("LockWindowPosition").def(false)
+                        snapTabHeightMargin = settingsJson.getBool("SnapTabHeightMargin").def(false)
+                        changeTabPositionOnSnap = settingsJson.getString("ChangeTabPositionOnSnap").def("change")
+                        snapOnDragDetach = settingsJson.getBool("SnapOnDragDetach").def(false)
+                        version = settingsJson.getString("Version").def(String.Empty)
+                        tabAppearance =
+                            try
+                                let appearanceObject = settingsJson.getObject("TabAppearance").def(JObject())
+                                // Legacy settings used one distance for both sides.
+                                for leftKey, rightKey in ["tabIndentNormal", "tabIndentNormalRight"; "tabIndentFlipped", "tabIndentFlippedRight"] do
+                                    if isNull (appearanceObject.Property(rightKey)) then
+                                        let left = appearanceObject.[leftKey]
+                                        if not (isNull left) then appearanceObject.[rightKey] <- left.DeepClone()
+                                appearanceObject.items.fold this.defaultTabAppearance <| fun appearance (key,value) ->
+                                    try
+                                        let value =
+                                            let value = (value :?> JValue).Value
+                                            let fieldType = Serialize.getFieldType (appearance.GetType()) key
+                                            if fieldType = typeof<Int32> then box(unbox<Int64>(value).Int32)
+                                            elif fieldType = typeof<Boolean> then box(unbox<bool>(value))
+                                            elif fieldType = typeof<Color> then box(Color.FromRGB(Int32.Parse(unbox<string>(value), Globalization.NumberStyles.HexNumber)))
+                                            elif fieldType = typeof<String> then
+                                                // Accepted by type, so a new string field is read
+                                                // back without another branch here; the fields that
+                                                // hold a fixed set of values are normalized.
+                                                let text = unbox<string>(value)
+                                                box(if key = "tabShape" then TabShape.normalize text else text)
+                                            else failwith "UNKNOWN TYPE"
+                                        Serialize.writeField appearance key value :?> TabAppearanceInfo
+                                    with
+                                    | _ -> appearance  // Skip invalid field and keep current value
+                            with
+                            | _ -> this.defaultTabAppearance  // Use default appearance if parsing fails
+                    }
+                    cachedSettingsRec <- Some(settings)
+                with
+                | ex ->
+                    // If settings loading completely fails, use all defaults
+                    let defaultSettings = {
+                        includedPaths = Set2(List2())
+                        excludedPaths = Set2(List2())
+                        autoGroupingPaths = Set2(List2())
+                        licenseKey = ""
+                        ticket = None
+                        runAtStartup = runAtStartup
+                        hideInactiveTabs = false
+                        groupTaskbarButtons = false
+                        enableTabbingByDefault = false
+                        enableCtrlNumberHotKey = false
+                        enableAltNumberHotKey = false
+                        enableHoverActivate = false
+                        enableTabPreview = true
+                        tabPreviewDelay = 500
+                        tabPreviewSize = 320
+                        tabCloseButton = TabButtonPolicy.activeOnly
+                        tabPinButton = TabButtonPolicy.activeOnly
+                        tabPositionByDefault = "TopRight"
+                        tabVerticalDirection = TabBehaviorPolicy.verticalAuto
+                        hideTabsWhenDownByDefault = "never"
+                        hideTabsDelayMilliseconds = 3000
+                        hideTabsOnFullscreen = true
+                        hideTabsWhileMoving = false
+                        lockWindowPosition = false
+                        snapTabHeightMargin = false
+                        changeTabPositionOnSnap = "change"
+                        snapOnDragDetach = false
+                        version = String.Empty
+                        tabAppearance = this.defaultTabAppearance
+                    }
+                    this.logEmptyFallback "settings record rebuild" ex
+                    cachedSettingsRec <- Some(defaultSettings)
+                    // Optionally log the error for debugging
+                    System.Diagnostics.Debug.WriteLine(sprintf "Settings loading failed: %s" ex.Message)
+            let loaded = cachedSettingsRec.Value
+            // A record built while the settings are untrusted is made of
+            // defaults. It is handed back - the app has to run on something -
+            // but never kept, so it cannot outlive the state that produced it
+            // and be written back once the file reads cleanly again.
+            if settingsUntrusted then cachedSettingsRec <- None
+            if rebuilding then
+                let fields = FSharpType.GetRecordFields(typeof<SettingsRec>)
+                let values = FSharpValue.GetRecordFields(loaded)
+                let valueMap = Array.zip fields values |> Array.map (fun (field, value) -> field.Name, value) |> Map.ofArray
+                snapshot.publish(Some(valueMap, this.settingsJson))
+            loaded
+
+        and set(settings) =
+            let settingsJson = this.settingsJson
+            settingsJson.setString("Version", settings.version)
+            settingsJson.setString("LicenseKey", settings.licenseKey)
+            settings.ticket.iter <| fun ticket -> settingsJson.setString("Ticket", ticket)
+            settingsJson.setBool("HideInactiveTabs", settings.hideInactiveTabs)
+            settingsJson.setBool("GroupTaskbarButtons", settings.groupTaskbarButtons)
+            settingsJson.setBool("EnableTabbingByDefault", settings.enableTabbingByDefault)
+            settingsJson.setBool("EnableCtrlNumberHotKey", settings.enableCtrlNumberHotKey)
+            settingsJson.setBool("EnableAltNumberHotKey", settings.enableAltNumberHotKey)
+            settingsJson.setBool("EnableHoverActivate", settings.enableHoverActivate)
+            settingsJson.setBool("EnableTabPreview", settings.enableTabPreview)
+            settingsJson.setInt32("TabPreviewDelay", settings.tabPreviewDelay)
+            settingsJson.setInt32("TabPreviewSize", settings.tabPreviewSize)
+            settingsJson.setString("TabCloseButton", TabButtonPolicy.normalize settings.tabCloseButton)
+            settingsJson.setString("TabPinButton", TabButtonPolicy.normalize settings.tabPinButton)
+            settingsJson.setString("TabPositionByDefault", settings.tabPositionByDefault)
+            settingsJson.setString("TabVerticalDirection", settings.tabVerticalDirection)
+            settingsJson.setString("HideTabsWhenDownByDefault", settings.hideTabsWhenDownByDefault)
+            settingsJson.setInt32("HideTabsDelayMilliseconds", settings.hideTabsDelayMilliseconds)
+            settingsJson.setBool("HideTabsOnFullscreen", settings.hideTabsOnFullscreen)
+            settingsJson.setBool("HideTabsWhileMoving", settings.hideTabsWhileMoving)
+            settingsJson.setBool("LockWindowPosition", settings.lockWindowPosition)
+            settingsJson.setBool("SnapTabHeightMargin", settings.snapTabHeightMargin)
+            settingsJson.setString("ChangeTabPositionOnSnap", settings.changeTabPositionOnSnap)
+            settingsJson.setBool("SnapOnDragDetach", settings.snapOnDragDetach)
+            settingsJson.setStringArray("IncludedPaths", settings.includedPaths.items)
+            settingsJson.setStringArray("ExcludedPaths", settings.excludedPaths.items)
+            settingsJson.setStringArray("AutoGroupingPaths", settings.autoGroupingPaths.items)
+            let appearanceObject =
+                let appearance = settings.tabAppearance
+                let obj = JObject()
+                // Use FSharpType.GetRecordFields to get properties in definition order
+                // This matches the order of FSharpValue.GetRecordFields values
+                let props = FSharpType.GetRecordFields(appearance.GetType())
+                let values = FSharpValue.GetRecordFields(appearance)
+                List2(Seq.zip props values).iter <| fun (prop, value) ->
+                    let key = prop.Name
+                    match value with
+                    | :? Color as value -> obj.setString(key, sprintf "%X" (value.ToRGB()))
+                    | :? int as value -> obj.setInt64(key, int64(value))
+                    | :? bool as value -> obj.setBool(key, value)
+                    | :? string as value -> obj.setString(key, value)
+                    | _ -> ()
+                obj
+            settingsJson.setObject("TabAppearance", appearanceObject)
+            this.settingsJson <- settingsJson
+
+    interface ISettings with
+        member _.trusted = this.settings |> ignore; not settingsUntrusted
+        member _.commitRoot(value) =
+            this.settings |> ignore
+            if settingsUntrusted then invalidOp "SETTINGS_UNTRUSTED"
+            this.settingsJson <- value
+            if not lastSaveSucceeded then invalidOp "SAVE_FAILED"
+            // The same notifications as the native editors, after persistence.
+            let fields, _ = snapshot.value.Value
+            for KeyValue(key, value) in fields do settingChangedEvent.Trigger(key, value)
+            TabEdgeSettings.changed.Trigger()
+        member _.activePath = this.settings |> ignore; cachedPath.Value
+        member _.transferSettings(toExe, move) =
+            let appData, exe = PortableSettings.appDataPath(), PortableSettings.exePath()
+            let source, destination = if toExe then appData, exe else exe, appData
+            let validateSource() =
+                if migrationFailed.Value || this.path <> source || not (File.Exists(source)) || settingsUntrusted ||
+                   (not toExe && File.Exists(appData)) then
+                    failwith "Settings source is unavailable."
+            validateSource()
+            if not (PortableSettings.canWrite(destination)) then failwith "Settings destination is not writable."
+            this.settingsJson <- this.settingsJson
+            if not lastSaveSucceeded then failwith "Settings could not be saved."
+            validateSource()
+            // Return must also refuse a destination created after the checks above.
+            try PortableSettings.transfer source destination move toExe
+            finally
+                backedUpThisProcess <- false
+                this.clearCaches()
+
+
+
+        member x.setValue((key,value)) =
+            if key = "runAtStartup" then
+                runAtStartup <- unbox<bool>(value)
+            else
+                let settings = x.settings
+                let settings = Serialize.writeField settings key value
+                x.settings <- unbox<SettingsRec>(settings)
+            settingChangedEvent.Trigger(key, value)
+
+        member x.getValue(key) =
+            // Preserve owner-side retries after an untrusted load. Other threads
+            // only read the last published result and never do disk I/O.
+            if System.Threading.Thread.CurrentThread.ManagedThreadId = ownerThreadId then
+                this.settings |> ignore
+            let values, _ = snapshot.value.Value
+            if key = "runAtStartup" then box runAtStartup else values.[key]
+
+        member x.notifyValue key f =
+            settingChangedEvent.Publish.Add <| fun(changedKey, value) ->
+                if changedKey = key then f(value)
+
+        member x.root
+            with get() =
+                if System.Threading.Thread.CurrentThread.ManagedThreadId = ownerThreadId then
+                    this.settings |> ignore
+                let _, json = snapshot.value.Value
+                this.cloneSettingsJson(json)
+            and set(value) = this.settingsJson <- value

@@ -6,9 +6,10 @@ on:
       core_tag:
         description: WindowTabs Git tag to build
         required: true
-        default: ss_2026.11.11
+        default: ss_2026.11.22
   push:
     paths:
+      - '.gitattributes'
       - '.github/workflows/build-plugin.yml'
       - 'patches/**'
       - 'build/**'
@@ -36,7 +37,7 @@ jobs:
   build:
     runs-on: windows-latest
     env:
-      CORE_TAG: ${{ github.event.inputs.core_tag || 'ss_2026.11.11' }}
+      CORE_TAG: ${{ github.event.inputs.core_tag || 'ss_2026.11.22' }}
 
     steps:
       - name: Checkout plugin
@@ -145,9 +146,6 @@ jobs:
         shell: pwsh
         run: |
           node scripts/Smoke-TestClient.cjs . runtime-proof.json
-          $proof = Get-Content runtime-proof.json -Raw | ConvertFrom-Json
-          $proof | Add-Member -NotePropertyName updaterDisabled -NotePropertyValue $true
-          $proof | ConvertTo-Json -Depth 8 | Set-Content runtime-proof.json -Encoding UTF8
           $current = Get-Content helper\current.json -Raw | ConvertFrom-Json
           $current | Add-Member -NotePropertyName runtimeVerification -NotePropertyValue (Get-Content runtime-proof.json -Raw | ConvertFrom-Json)
           $current | ConvertTo-Json -Depth 8 | Set-Content helper\current.json -Encoding UTF8
@@ -159,10 +157,13 @@ jobs:
       - name: Validate JavaScript
         shell: pwsh
         run: |
+          $PSNativeCommandUseErrorActionPreference = $true
           node --check preload.js
           node --check renderer.js
           node tests/smoke-test.mjs
           node tests/settings-model.cjs
+          node tests/lifecycle-state.cjs
+          node tests/settings-storage.cjs
           node tests/ipc-transport.cjs
           node tests/plugin-lifecycle.cjs
           node tests/integrated-params.cjs
@@ -177,6 +178,10 @@ jobs:
         shell: pwsh
         run: ./scripts/Package-AuditBundle.ps1
 
+      - name: Validate source audit bundle against marketplace package
+        shell: pwsh
+        run: node scripts/validate-audit-manifest.mjs audit-bundle dist/market
+
       - name: Upload plugin artifact
         uses: actions/upload-artifact@v4
         with:
@@ -189,4 +194,5 @@ jobs:
         with:
           name: windowtabs-utools-plugin-${{ env.CORE_TAG }}-audit
           path: audit-bundle
+          include-hidden-files: true
           if-no-files-found: error

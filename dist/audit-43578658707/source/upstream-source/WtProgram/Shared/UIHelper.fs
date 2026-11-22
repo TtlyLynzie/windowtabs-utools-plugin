@@ -1,0 +1,896 @@
+﻿namespace Bemo
+open System
+open System.Drawing
+open System.Windows.Forms
+open Bemo.Win32
+open Aga.Controls.Tree
+
+// The size grip every sizable dialog shows: drawn in the corner only, laid
+// OVER whatever fills the client area, and the same drawing everywhere. The
+// form's own grip needs the corner free (freeing it with padding under a
+// docked control cost a whole row) and is themed differently from this one,
+// so the dialogs looked unlike each other. Dragging this hands the resize to
+// the frame, as taking the corner of the border does.
+type SizeGripOverlay(owner: Form) as this =
+    inherit Control()
+    do
+        this.Size <- Size(16, 16)
+        this.Anchor <- AnchorStyles.Bottom ||| AnchorStyles.Right
+        this.Cursor <- Cursors.SizeNWSE
+        this.TabStop <- false
+        this.BackColor <- owner.BackColor
+        this.Location <- Point(owner.ClientSize.Width - this.Width, owner.ClientSize.Height - this.Height)
+        // The anchor keeps it in the corner from here on; this covers the
+        // scaling pass, which changes the client size before the form shows.
+        owner.Resize.Add(fun _ ->
+            this.Location <- Point(owner.ClientSize.Width - this.Width, owner.ClientSize.Height - this.Height))
+        owner.BackColorChanged.Add(fun _ -> this.BackColor <- owner.BackColor)
+
+    /// Put the grip on a form: the form's own grip is hidden and this one
+    /// goes on top of everything in the corner.
+    static member attach (form: Form) =
+        form.SizeGripStyle <- SizeGripStyle.Hide
+        let grip = new SizeGripOverlay(form)
+        form.Controls.Add(grip)
+        grip.BringToFront()
+
+    override this.OnPaint(e) =
+        ControlPaint.DrawSizeGrip(e.Graphics, this.BackColor, this.ClientRectangle)
+
+    override this.OnMouseDown(e) =
+        if e.Button = MouseButtons.Left && owner.WindowState = FormWindowState.Normal then
+            WinUserApi.ReleaseCapture() |> ignore
+            WinUserApi.SendMessage(owner.Handle, WindowMessages.WM_NCLBUTTONDOWN,
+                                   HitTestMousePositionCodes.HTBOTTOMRIGHT, 0) |> ignore
+        else
+            base.OnMouseDown(e)
+
+type SmoothNodeTextBox() =
+    inherit NodeControls.NodeTextBox()
+    override this.Draw(node, context) =
+        context.Graphics.TextRenderingHint <- System.Drawing.Text.TextRenderingHint.ClearTypeGridFit
+        base.Draw(node, context)
+
+[<AllowNullLiteral>]
+type INode =
+    abstract member showSettings : bool
+
+/// The spin field of the settings dialog. NumericUpDown clamps its height to
+/// the one its font asks for, whatever it is told - putting it in a box of the
+/// wanted height only made its arrows look small in a field too tall for them -
+/// so it keeps its own height and the number inside it is centred.
+type SettingsNumericUpDown() =
+    inherit NumericUpDown()
+    static member Create() =
+        let control = new SettingsNumericUpDown()
+        SettingsField.apply control
+        control
+    override this.OnLayout(e) =
+        if not (SettingsField.arrangingNumeric this) then
+            base.OnLayout(e)
+            SettingsField.reassertNumericLayout this
+    override this.OnTextBoxResize(source, e) =
+        if not (SettingsField.arrangingNumeric this) then base.OnTextBoxResize(source, e)
+    override this.OnPaint(e) =
+        SettingsField.reassertNumericLayout this
+        // The native themed paint assumes the edit still touches the top.
+        // Own the exposed background as well as the single-pixel frame.
+        // Native EDIT uses the system control color when disabled in light mode.
+        let backgroundColor =
+            if not this.Enabled && this.BackColor <> DarkMode.darkPanel then SystemColors.Control
+            else this.BackColor
+        use background = new SolidBrush(backgroundColor)
+        e.Graphics.FillRectangle(background, this.ClientRectangle)
+        let color = if this.BackColor = DarkMode.darkPanel then DarkMode.darkBorder else SystemColors.ControlDark
+        use border = new Pen(color)
+        e.Graphics.DrawRectangle(border, Rectangle(0, 0, this.Width - 1, this.Height - 1))
+
+type IntEditor() =
+    let control = 
+        let control = SettingsNumericUpDown.Create()
+        control.Minimum <- decimal(1)
+        control.Maximum <- decimal(1000)
+        control.Margin <- Padding(0)
+        control
+    interface IPropEditor with
+        member x.value 
+            with get() = box(int(control.Value))
+            and set(newValue) = control.Value <- decimal(unbox<int>(newValue))
+        member x.control = control :> Control
+        member x.changed = control.ValueChanged |> Event.map ignore
+
+type TextEditor() =
+    let control = 
+        let control = TextBox()
+        SettingsField.apply control
+        control
+    interface IPropEditor with
+        member x.value 
+            with get() = box(control.Text)
+            and set(newValue) = control.Text <- unbox<string>(newValue)
+        member x.control = control :> Control
+        member x.changed = control.TextChanged |> Event.map ignore
+
+/// Keep layout and keyboard behavior intact while excluding the unused part
+/// of a settings cell from mouse activation. Read current metrics on every
+/// click so font, caption and monitor-scale changes need no cached geometry.
+type SettingsCheckBox() =
+    inherit CheckBox()
+    let mutable contentHot = false
+    let mutable paintingEmptyCaption = false
+
+    override this.ShowFocusCues =
+        not paintingEmptyCaption && base.ShowFocusCues
+
+    override this.OnPaint(e) =
+        let emptyCaption = String.IsNullOrEmpty(this.Text) && this.Appearance = Appearance.Normal
+        let showFocus = emptyCaption && this.Focused && this.ShowFocusCues
+        // Suppress only the adapter's empty-caption focus, including Paint handlers.
+        paintingEmptyCaption <- emptyCaption
+        try base.OnPaint(e)
+        finally paintingEmptyCaption <- false
+        if showFocus then
+            let glyph =
+                if this.FlatStyle = FlatStyle.Flat then
+                    let bounds = SettingsCheckBoxLayout.glyph this
+                    Rectangle(bounds.Location, Size(bounds.Width + 1, bounds.Height + 1))
+                else
+                    let size = CheckBoxRenderer.GetGlyphSize(e.Graphics, VisualStyles.CheckBoxState.UncheckedNormal)
+                    Rectangle(0, (this.Height - size.Height) / 2, size.Width, size.Height)
+            // Clip at the cell's left edge without moving the glyph or its hit area.
+            let bounds = Rectangle.Intersect(this.ClientRectangle, Rectangle.Inflate(glyph, 2, 2))
+            ControlPaint.DrawFocusRectangle(e.Graphics, bounds, this.ForeColor, this.BackColor)
+
+    member private this.ContainsContent(point: Point) =
+        if not (this.ClientRectangle.Contains(point)) then false
+        else
+            let dark = SettingsCheckBoxLayout.isDark this
+            let glyph =
+                if this.FlatStyle = FlatStyle.Flat then
+                    let bounds = SettingsCheckBoxLayout.glyph this
+                    // DrawRectangle includes the right and bottom border pixel.
+                    Rectangle(bounds.Location, Size(bounds.Width + (if dark then 1 else 0), bounds.Height + (if dark then 1 else 0)))
+                else
+                    use graphics = this.CreateGraphics()
+                    let size = CheckBoxRenderer.GetGlyphSize(graphics, VisualStyles.CheckBoxState.UncheckedNormal)
+                    Rectangle(0, (this.Height - size.Height) / 2, size.Width, size.Height)
+            if glyph.Contains(point) then true
+            elif String.IsNullOrEmpty(this.Text) then false
+            else
+                use graphics = this.CreateGraphics()
+                (SettingsCheckBoxLayout.caption this graphics).Contains(point)
+
+    override this.OnMouseEnter(e) =
+        // MouseMove supplies client coordinates; entering the cell alone is not hot.
+        ()
+
+    override this.OnMouseMove(e) =
+        base.OnMouseMove(e)
+        let hot = this.ContainsContent(e.Location)
+        if hot <> contentHot then
+            contentHot <- hot
+            if hot then base.OnMouseEnter(EventArgs.Empty)
+            else base.OnMouseLeave(EventArgs.Empty)
+
+    override this.OnMouseLeave(e) =
+        contentHot <- false
+        base.OnMouseLeave(e)
+
+    override this.WndProc(message: Message byref) =
+        let mouseDown = message.Msg = 0x0201 || message.Msg = 0x0203
+        let mouseUp = message.Msg = 0x0202
+        if mouseDown || mouseUp then
+            let packed = message.LParam.ToInt64()
+            let point = Point(int (int16 (packed &&& 0xffffL)), int (int16 ((packed >>> 16) &&& 0xffffL)))
+            if mouseDown && not (this.ContainsContent(point)) then
+                message.Result <- IntPtr.Zero
+            else
+                // A press on the glyph followed by release in the empty cell
+                // must also cancel. Let WinForms perform its normal cleanup.
+                if mouseUp && not (this.ContainsContent(point)) then this.Capture <- false
+                base.WndProc(&message)
+        else
+            base.WndProc(&message)
+
+type BoolEditor() =
+    let control = SettingsCheckBox()
+    interface IPropEditor with
+        member x.value
+            with get() = box(control.Checked)
+            and set(newValue) = control.Checked <- unbox<bool>(newValue)
+        member x.control = control :> Control
+        member x.changed = control.CheckedChanged |> Event.map ignore
+
+type EnumEditor<'e when 'e :> Enum>() as this =
+    let control = ComboBox()
+    do SettingsField.apply control
+    let mutable cachedValue = null
+    do this.init()
+
+    member this.init() =
+        for tag in Enum.GetValues(typeof<'e>) do
+            let tag = tag.cast<'e>()
+            control.Items.Add(tag.ToString()).ignore
+        control.SelectedValueChanged.Add <| fun _ ->
+            cachedValue <- control.SelectedItem
+
+    member this.value
+        with get() = 
+            let value = cachedValue
+            Enum.Parse(typeof<'e>, string(value)).cast<'e>()
+        and set(value) =
+            control.SelectedItem <- value.ToString()
+
+    interface IPropEditor with
+        member x.value
+            with get() = this.value.cast<obj>()
+            and set(value) = this.value <- value.cast<'e>()
+        member x.control = control :> Control
+        member x.changed = control.SelectedValueChanged |> Event.map ignore
+
+type ColorEditor() as this =
+    let changedEvent = Event<_>()
+    let chooserButton =
+        let btn = Button()
+        btn.Size <- Size(SettingsField.heightPx, SettingsField.heightPx)
+        btn.Click.Add <| fun _ ->
+            let dlg = System.Windows.Forms.ColorDialog()
+            dlg.Color <- this.color
+            dlg.FullOpen <- true
+            dlg.ShowHelp <- false
+            if dlg.ShowDialog() = DialogResult.OK then
+                (this :> IPropEditor).value <- dlg.Color
+                changedEvent.Trigger()
+        btn.Padding <- Padding(0)
+        btn.Margin <- Padding(0)
+        btn.Dock <- DockStyle.None
+        btn.Anchor <- AnchorStyles.Top ||| AnchorStyles.Left  // Left align
+        // Tag the button so the dark-mode theming walker can skip recoloring
+        // it — the BackColor is the *content* (the chosen color), not chrome.
+        btn.Tag <- box "DarkModePreserveColor"
+        btn
+        
+    let textBox =
+        let tb = TextBox()
+        let maxLen = 6
+        let save() =
+            (this :> IPropEditor).value <- this.colorFromTb
+            changedEvent.Trigger()
+        tb.Dock <- DockStyle.None
+        tb.Anchor <- AnchorStyles.Top ||| AnchorStyles.Left ||| AnchorStyles.Right  // Left align and stretch
+        tb.CharacterCasing <- CharacterCasing.Upper
+        tb.Margin <- Padding(1)
+        SettingsField.apply tb
+        SettingsField.alignHeight tb
+        tb.BorderStyle <- BorderStyle.FixedSingle
+        tb.KeyPress.Add <| fun e ->
+            try
+                if e.KeyChar = (char)Keys.Enter then
+                    e.Handled <- true
+                    save()
+                elif Char.IsControl(e.KeyChar).not then
+                    if tb.Text.Length + 1 - tb.SelectionLength  > maxLen then raise (Exception())
+                    Int32.Parse(e.KeyChar.ToString(), Globalization.NumberStyles.HexNumber).ignore
+            with ex -> 
+                e.Handled <- true            
+        tb.Validating.Add <| fun e ->
+            // Coerce empty / over-long / non-hex input to black ("000000")
+            // so the user is never bothered with a parse-error dialog.
+            // Triggers when the user clears the box, types fewer/more
+            // characters than 6, or pastes something like "XYZ123".
+            let value =
+                if tb.Text.Length = 0 || tb.Text.Length > maxLen then 0
+                else
+                    try Int32.Parse(tb.Text, Globalization.NumberStyles.HexNumber)
+                    with _ -> 0
+            let normalized = sprintf "%06X" value
+            if tb.Text <> normalized then tb.Text <- normalized
+
+        tb.Validated.Add <| fun e -> save()
+        tb
+
+    let panel =
+        let panel = TableLayoutPanel()
+        panel.GrowStyle <- TableLayoutPanelGrowStyle.FixedSize
+        panel.RowCount <- 1
+        panel.ColumnCount <- 2
+        panel.RowStyles.Add(RowStyle(SizeType.Absolute, float32 (SettingsField.heightPx + 2))).ignore
+        // Column 0: Color button (fixed 20%), Column 1: Text box (80% of panel width)
+        panel.ColumnStyles.Add(ColumnStyle(SizeType.Absolute, float32 SettingsField.heightPx)).ignore
+        panel.ColumnStyles.Add(ColumnStyle(SizeType.Percent, 70.0f)).ignore
+        panel.Dock <- DockStyle.Fill  // Fill parent cell
+        panel.Padding <- Padding(0)
+        panel.Margin <- Padding(0)
+        // Same contract the pinned-tab-width panel needs: a nested container
+        // that cannot answer "how tall do you want to be" gets measured at its
+        // 200 x 100 Panel default the moment its row stops being a fixed
+        // height. AppearanceView's colour grid deliberately keeps its rows at
+        // Absolute 35 px (no caption in that grid overflows the label column
+        // in any of the sixteen languages), so today this changes nothing -
+        // measured identical bounds at 100 / 125 / 150 / 175%. It is here so
+        // that making those rows AutoSize later cannot reintroduce the bug.
+        panel.AutoSize <- true
+        panel.AutoSizeMode <- AutoSizeMode.GrowAndShrink
+        panel.Controls.Add(chooserButton)
+        panel.Controls.Add(textBox)
+        panel.SetRow(chooserButton, 0)
+        panel.SetColumn(chooserButton, 0)
+        panel.SetRow(textBox, 0)
+        panel.SetColumn(textBox, 1)
+        // TextBox scaling can round its height differently from Button.
+        // The swatch is the height reference, including after DPI changes.
+        let alignField () =
+            // The dark frame is painted outside the edit's client window.
+            // Reserve its top and bottom pixels inside the swatch bounds.
+            let inset = 1
+            let margin = Padding(textBox.Margin.Left, inset, textBox.Margin.Right, inset)
+            if textBox.Margin <> margin then textBox.Margin <- margin
+        panel.Layout.Add(fun _ -> alignField ())
+        chooserButton.SizeChanged.Add(fun _ -> alignField ())
+        textBox.SizeChanged.Add(fun _ -> alignField ())
+        alignField ()
+        panel
+    member this.colorFromTb =
+        let text = textBox.Text
+        let value = Int32.Parse(text, Globalization.NumberStyles.HexNumber)
+        Color.FromRGB(value)
+
+    member this.color = chooserButton.BackColor
+    interface IPropEditor with
+        member x.value 
+            with get() = 
+                let text = textBox.Text
+                let value = Int32.Parse(text, Globalization.NumberStyles.HexNumber)
+                box(Color.FromRGB(value))
+            and set(newColor) = 
+                let color = unbox<Color>(newColor)
+                chooserButton.BackColor <- color
+                textBox.Text <- sprintf "%06X" (color.ToRGB())
+        member x.control = panel :> Control
+        member x.changed = changedEvent.Publish
+
+
+type HotKeyEditor() =
+    let control = HotKeyControl()
+    do
+        SettingsField.apply control
+        SettingsField.alignHeight control
+    interface IPropEditor with
+        member x.value 
+            with get() = box(control.HotKey)
+            and set(newValue) = control.HotKey <- unbox<int>(newValue)
+        member x.control = control :> Control
+        member x.changed = control.HotKeyChanged |> Event.map (fun _ -> ())
+
+type HotKeyModifiersEditor() as this =
+    let mutable _modifiers = Keys.None
+    let modifiersChanged = Event<_>()
+    let textBox = {  
+        new TextBox() with
+            override x.ProcessCmdKey(msg, keys) =
+                this.modifiers <- Keys.Modifiers &&& keys
+                true
+    }
+    do
+        SettingsField.apply textBox
+        this.modifiers <- Keys.None
+    
+    member this.modifiers 
+        with get() = _modifiers
+        and set(newValue) = 
+            textBox.Text <- newValue.ToString()
+            _modifiers <- newValue
+            modifiersChanged.Trigger()
+
+    interface IPropEditor with    
+        member this.value 
+            with get() = box(this.modifiers)
+            and set(value) = this.modifiers <- unbox<Keys>(value)
+        member this.control = textBox :> Control
+        member this.changed = modifiersChanged.Publish
+
+type HotKeyOnlyEditor() as this =
+    let mutable _hk = Keys.None
+    let hkChanged = Event<_>()
+    let textBox = {  
+        new TextBox() with
+            override x.ProcessCmdKey(msg, keys) =
+                this.hk <- Keys.KeyCode &&& keys
+                true
+    }
+    do
+        SettingsField.apply textBox
+        this.hk <- Keys.None
+    
+    member this.hk 
+        with get() = _hk
+        and set(newValue) = 
+            textBox.Text <- newValue.ToString()
+            _hk <- newValue
+            hkChanged.Trigger()
+
+    interface IPropEditor with    
+        member this.value 
+            with get() = box(this.hk)
+            and set(value) = this.hk <- unbox<Keys>(value)
+        member this.control = textBox :> Control
+        member this.changed = hkChanged.Publish
+
+open System.Windows.Forms.VisualStyles
+
+/// Color mode for DropdownButton focus highlighting
+type DropdownButtonColorMode =
+    /// ComboBox style: label highlights blue when focused AND menu is closed
+    | ComboboxColor
+    /// Button style: label never highlights, dropdown button shows hover state when focused
+    | DropdownButtonColor
+
+/// ComboBox-style dropdown button with label and dropdown icon
+/// Supports keyboard navigation (Alt+Up/Down), focus highlighting, and toggle behavior
+type DropdownButton(text: string, ?colorMode: DropdownButtonColorMode) =
+    let colorMode = defaultArg colorMode ComboboxColor
+    let changedEvent = Event<_>()
+
+    // Container panel with border to look like ComboBox
+    let container = new TableLayoutPanel()
+    let textLabel = new Label()
+    let dropdownBtn = new Button()
+    let menu = new ContextMenuStrip()
+
+    // Track mouse, focus and menu state for proper visual feedback
+    let mutable isMouseOver = false
+    let mutable isMouseDown = false
+    let mutable isMenuOpen = false
+    let mutable isFocused = false
+    let mutable menuClosedTime = DateTime.MinValue
+
+    do
+        // Configure container
+        container.RowCount <- 1
+        container.ColumnCount <- 2
+        container.RowStyles.Add(RowStyle(SizeType.AutoSize)) |> ignore
+        container.ColumnStyles.Add(ColumnStyle(SizeType.AutoSize)) |> ignore
+        container.ColumnStyles.Add(ColumnStyle(SizeType.Absolute, 17.0f)) |> ignore
+        container.AutoSize <- true
+        container.AutoSizeMode <- AutoSizeMode.GrowAndShrink
+        // The same height as a drop-down list, so the two line up where
+        // they sit side by side.
+        container.MinimumSize <- Size(0, SettingsField.heightPx)
+        container.Margin <- Padding(0, 0, 0, 0)
+        container.Padding <- Padding(0)
+        container.Anchor <- AnchorStyles.Right
+        container.BackColor <-
+            if DropdownButton.UseDarkMode then DarkMode.darkPanel
+            else SystemColors.Window
+        // Its own line rather than the system's: a panel's FixedSingle border
+        // is drawn in the classic light grey, which stood out beside the
+        // fields and buttons around it.
+        container.BorderStyle <- BorderStyle.None
+        container.Paint.Add <| fun e ->
+            let colour =
+                if DropdownButton.UseDarkMode then DarkMode.darkBorder
+                else SystemColors.ControlDark
+            use pen = new Pen(colour)
+            e.Graphics.DrawRectangle(pen, Rectangle(0, 0, container.Width - 1, container.Height - 1))
+        container.Cursor <- Cursors.Hand
+
+        // Configure text label
+        textLabel.Text <- text
+        textLabel.AutoSize <- true
+        textLabel.TextAlign <- ContentAlignment.MiddleLeft
+        textLabel.Anchor <- AnchorStyles.Left
+        textLabel.Margin <- Padding(3, 0, 0, 0)
+        textLabel.BackColor <- Color.Transparent
+        textLabel.Cursor <- Cursors.Hand
+
+        // Configure dropdown button
+        dropdownBtn.Text <- ""
+        dropdownBtn.Width <- 17
+        dropdownBtn.Dock <- DockStyle.Fill
+        dropdownBtn.FlatStyle <- FlatStyle.Flat
+        dropdownBtn.FlatAppearance.BorderSize <- 0
+        dropdownBtn.Margin <- Padding(0, 0, 0, 0)
+        dropdownBtn.Cursor <- Cursors.Hand
+        dropdownBtn.TabStop <- true
+
+        // Helper to update label highlight state based on color mode.
+        // When DropdownButton.UseDarkMode is on, swap the system Highlight /
+        // HighlightText / ControlText colors for the dark palette so the
+        // focused label doesn't end up as a system-blue rectangle with light
+        // text vanishing into a dark surrounding.
+        let updateLabelHighlight () =
+            let dark = DropdownButton.UseDarkMode
+            let highlightBg =
+                if dark then DarkMode.darkAccent else SystemColors.Highlight
+            let highlightFg =
+                if dark then DarkMode.darkText else SystemColors.HighlightText
+            let normalBg =
+                if dark then DarkMode.darkPanel else Color.Transparent
+            let normalFg =
+                if dark then DarkMode.darkText else SystemColors.ControlText
+            match colorMode with
+            | ComboboxColor ->
+                // ComboBox style: highlight label when focused AND menu is closed
+                if isFocused && not isMenuOpen then
+                    textLabel.BackColor <- highlightBg
+                    textLabel.ForeColor <- highlightFg
+                else
+                    textLabel.BackColor <- normalBg
+                    textLabel.ForeColor <- normalFg
+            | DropdownButtonColor ->
+                // Button style: label never highlights
+                textLabel.BackColor <- normalBg
+                textLabel.ForeColor <- normalFg
+            // Invalidate dropdown button to update its visual state
+            dropdownBtn.Invalidate()
+
+        // Focus visual feedback
+        dropdownBtn.GotFocus.Add <| fun _ ->
+            isFocused <- true
+            updateLabelHighlight()
+        dropdownBtn.LostFocus.Add <| fun _ ->
+            isFocused <- false
+            updateLabelHighlight()
+
+        // Mouse events
+        dropdownBtn.MouseEnter.Add <| fun _ ->
+            isMouseOver <- true
+            dropdownBtn.Invalidate()
+        dropdownBtn.MouseLeave.Add <| fun _ ->
+            isMouseOver <- false
+            if not isMenuOpen then isMouseDown <- false
+            dropdownBtn.Invalidate()
+        dropdownBtn.MouseDown.Add <| fun _ ->
+            isMouseDown <- true
+            dropdownBtn.Invalidate()
+        dropdownBtn.MouseUp.Add <| fun _ ->
+            if not isMenuOpen then isMouseDown <- false
+            dropdownBtn.Invalidate()
+
+        // Custom paint to draw ComboBox-style dropdown button. When dark mode
+        // is on, paint a flat dark surface and a light chevron ourselves so
+        // the system theme's white arrow background doesn't leak through.
+        dropdownBtn.Paint.Add <| fun e ->
+            if DropdownButton.UseDarkMode then
+                let bgColor =
+                    if isMenuOpen || isMouseDown then DarkMode.darkAccent
+                    elif isMouseOver then Color.FromArgb(60, 60, 60)
+                    else DarkMode.darkPanel
+                use bg = new SolidBrush(bgColor)
+                e.Graphics.FillRectangle(bg, dropdownBtn.ClientRectangle)
+                DarkMode.drawDarkArrow e.Graphics dropdownBtn.ClientRectangle true
+            else
+                let state =
+                    if not dropdownBtn.Enabled then ComboBoxState.Disabled
+                    elif isMenuOpen || isMouseDown then ComboBoxState.Pressed
+                    elif isMouseOver then ComboBoxState.Hot
+                    elif colorMode = DropdownButtonColor && isFocused then ComboBoxState.Hot
+                    else ComboBoxState.Normal
+                if ComboBoxRenderer.IsSupported then
+                    ComboBoxRenderer.DrawDropDownButton(e.Graphics, dropdownBtn.ClientRectangle, state)
+                else
+                    ControlPaint.DrawComboButton(e.Graphics, dropdownBtn.ClientRectangle,
+                        if isMenuOpen || isMouseDown then ButtonState.Pushed else ButtonState.Normal)
+
+        // Menu keyboard events
+        menu.PreviewKeyDown.Add <| fun e ->
+            if e.KeyCode = Keys.Menu then
+                e.IsInputKey <- true
+            elif e.Alt && (e.KeyCode = Keys.Down || e.KeyCode = Keys.Up) then
+                e.IsInputKey <- true
+
+        menu.KeyDown.Add <| fun e ->
+            if e.Alt && (e.KeyCode = Keys.Down || e.KeyCode = Keys.Up) then
+                e.Handled <- true
+                e.SuppressKeyPress <- true
+                menu.Close()
+
+        // Menu state tracking
+        menu.Opened.Add <| fun _ ->
+            isMenuOpen <- true
+            updateLabelHighlight()
+            dropdownBtn.Invalidate()
+        menu.Closed.Add <| fun _ ->
+            isMenuOpen <- false
+            isMouseDown <- false
+            menuClosedTime <- DateTime.Now
+            updateLabelHighlight()
+            dropdownBtn.Invalidate()
+
+        // Toggle menu handler
+        let handleMouseDown () =
+            if isMenuOpen then
+                menu.Close()
+            else
+                let elapsed = (DateTime.Now - menuClosedTime).TotalMilliseconds
+                if elapsed > 200.0 then
+                    menu.Show(container, Point(0, container.Height))
+
+        // Click handlers
+        // Focus the dropdown button when label or container is clicked (like ComboBox)
+        container.MouseDown.Add <| fun _ ->
+            dropdownBtn.Focus() |> ignore
+            handleMouseDown()
+        textLabel.MouseDown.Add <| fun _ ->
+            dropdownBtn.Focus() |> ignore
+            handleMouseDown()
+        dropdownBtn.MouseDown.Add <| fun _ -> handleMouseDown()
+
+        // Keyboard handler
+        dropdownBtn.KeyDown.Add <| fun e ->
+            if e.Alt && (e.KeyCode = Keys.Down || e.KeyCode = Keys.Up) then
+                e.Handled <- true
+                e.SuppressKeyPress <- true
+                if isMenuOpen then
+                    menu.Close()
+                else
+                    menu.Show(container, Point(0, container.Height))
+
+        // Add controls to container
+        container.Controls.Add(textLabel)
+        container.SetRow(textLabel, 0)
+        container.SetColumn(textLabel, 0)
+        container.Controls.Add(dropdownBtn)
+        container.SetRow(dropdownBtn, 0)
+        container.SetColumn(dropdownBtn, 1)
+
+        // The popup is a top-level window, not a child of the dialog, so it
+        // does not inherit the scaled font the way `container` does. Give it
+        // the same one, or its items would be laid out for the system DPI on
+        // every monitor. Left alone at 100% so an unscaled monitor keeps the
+        // system menu font exactly as before.
+        if SettingsDpi.current() <> 1.0 then
+            match SettingsDpi.font (SettingsDpi.current()) with
+            | Some(f) -> (try menu.Font <- f with _ -> ())
+            | None -> ()
+
+        // Apply dark renderer to the popup menu when the static flag is on so
+        // the clipboard/dropdown menus match the rest of the dialog.
+        if DropdownButton.UseDarkMode then
+            DarkMode.attachDarkContextMenuStripTheme menu
+
+    /// Static flag — when true the menu is rendered with the dark
+    /// ProfessionalRenderer from DarkMode. Set this *before* constructing the
+    /// DropdownButton (e.g. in DesktopManagerForm's `do` block when the
+    /// EnableDarkMode setting is on).
+    static member val UseDarkMode = false with get, set
+
+    /// Add a menu item with click handler
+    member this.AddItem(itemText: string, handler: unit -> unit) =
+        let item = new ToolStripMenuItem(itemText)
+        item.Click.Add <| fun _ -> handler()
+        menu.Items.Add(item) |> ignore
+        item
+
+    /// Add a separator to the menu
+    member this.AddSeparator() =
+        menu.Items.Add(new ToolStripSeparator()) |> ignore
+
+    /// Get the container control (for adding to parent)
+    member this.Control = container :> Control
+
+    /// Get the ContextMenuStrip (for advanced customization)
+    member this.Menu = menu
+
+    /// Get/Set the button text
+    member this.Text
+        with get() = textLabel.Text
+        and set(value) = textLabel.Text <- value
+
+    /// Check if menu is currently open
+    member this.IsMenuOpen = isMenuOpen
+
+module UIHelper =
+    open System.Resources
+    open System.Reflection
+
+    let label text =
+        let label = Label()
+        label.AutoSize <- true
+        label.Text <- text
+        label.TextAlign <- ContentAlignment.MiddleLeft
+        label
+        
+    
+
+    // Content height that reproduces the historical fixed 35-px form row once
+    // the label's 8-px top and 5-px bottom margins are added. A 96-dpi design
+    // number like every other one here: Control.Scale multiplies MinimumSize
+    // and Margin along with the rest of the layout, so the row is 35 px at
+    // 100%, 61 px at 175%, and a wrapped caption adds a whole scaled line at
+    // either.
+    // AppearanceView uses 25 px of content plus 5 px above and below. Keep
+    // forms on that same 35-px vertical grid.
+    // Settings rows: every tab lays its rows out on this vertical grid
+    // (design pixels at 96 DPI). A row is its content height plus the same
+    // top and bottom margin on every caption and input.
+    // Shared settings-page geometry in 96-DPI design pixels. SettingsDpi's
+    // layout snapshot scales the padding and absolute label column together.
+    // The remaining width belongs to the input group, including reset buttons
+    // or multiple fields where a setting needs them.
+    let settingsPageMarginPx = 16
+    let settingsLabelWidthPx = 250
+    let settingsPagePadding = Padding(settingsPageMarginPx)
+
+    let settingsRowHeightPx = SettingsField.rowHeightPx
+    let settingsRowMarginPx = SettingsField.rowMarginPx
+    let private rowContentHeightPx = settingsRowHeightPx - 2 * settingsRowMarginPx
+
+    // Keep the first option on the caption line and use the same trailing
+    // space regardless of the number of options.
+    let settingsRadioGroup rowCount columnCount =
+        let table = new TableLayoutPanel()
+        table.AutoSize <- true
+        table.AutoSizeMode <- AutoSizeMode.GrowAndShrink
+        table.Margin <- Padding(0)
+        let radioPitch = 28
+        table.Padding <- Padding(0, 0, 0, 12)
+        table.ColumnCount <- columnCount
+        table.RowCount <- rowCount
+        for _ in 1 .. columnCount do
+            table.ColumnStyles.Add(ColumnStyle(SizeType.AutoSize)) |> ignore
+        for _ in 1 .. rowCount do
+            table.RowStyles.Add(RowStyle(SizeType.Absolute, float32 radioPitch)) |> ignore
+        table
+
+    let settingsRadio captionKey =
+        let radio = new RadioButton()
+        radio.Text <- Localization.getString(captionKey)
+        radio.AutoSize <- true
+        radio.Margin <- Padding(0, settingsRowMarginPx, 0, 0)
+        // Match the caption height and vertical alignment.
+        radio.MinimumSize <- Size(0, rowContentHeightPx)
+        radio
+
+    let settingsRadios (refreshers: ResizeArray<unit -> unit>) save key normalize options =
+        let table = settingsRadioGroup (List.length options) 1
+        let current = unbox<string>(Services.settings.getValue key) |> normalize
+        let radios =
+            options |> List.mapi (fun row (mode, caption) ->
+                let radio = settingsRadio caption
+                radio.Checked <- (mode = current)
+                table.Controls.Add(radio, 0, row)
+                radio.CheckedChanged.Add(fun _ ->
+                    if radio.Checked then save key (box mode))
+                mode, radio)
+        refreshers.Add(fun () ->
+            let mode = unbox<string>(Services.settings.getValue key) |> normalize
+            for value, radio in radios do radio.Checked <- (value = mode))
+        table :> Control
+
+    // centerRows: label and input centred on the same line. The settings tabs
+    // keep the old layout (label held down by a top margin, input at the top
+    // of the row), which lined up with their taller inputs; on the compact
+    // dialogs it left the caption visibly lower than its text box.
+    let private buildForm (fields:List2<_>) (labelWidthPx: float32) (autoScroll: bool) (centerRows: bool) =
+        let panel =
+            let t = TableLayoutPanel()
+            t.AutoScroll <- autoScroll
+            t.AutoSize <- true
+            t.Dock <- DockStyle.Fill
+            t.RowCount <- fields.length
+            t.ColumnCount <- 2
+            t.ColumnStyles.Add(ColumnStyle(SizeType.Absolute, labelWidthPx)).ignore
+            t.ColumnStyles.Add(ColumnStyle(SizeType.Percent, 100.0f)).ignore
+            // AutoSize rather than a fixed 35 px: a caption that does not fit
+            // the label column wraps onto a second line, and a fixed row height
+            // cut the wrapped text off. Every label carries a minimum height
+            // that reproduces the old 35-px row, so single-line rows are
+            // unchanged and only the wrapping ones grow.
+            List2([0..fields.length-1]).iter <| fun row ->
+                t.RowStyles.Add(RowStyle(SizeType.AutoSize)).ignore
+            t
+
+        fields.enumerate.iter <| fun (i,(text, control:Control)) ->
+            let caption = Localization.getString text
+            let label = label caption
+            if centerRows then
+                // No Top/Bottom anchor: both sit at the vertical centre of the
+                // row, whatever their heights. The input's margin keeps the
+                // row about as tall as before.
+                label.Anchor <- AnchorStyles.Left
+                label.Margin <- Padding(0)
+                control.Anchor <- AnchorStyles.Left ||| AnchorStyles.Right
+                control.Margin <- Padding(3, 6, 3, 6)
+            else
+                // Match AppearanceView's property rows: the caption and input
+                // use the same vertical margins, and the input stretches only
+                // horizontally. Top anchoring matters when the input is a
+                // multi-row option group: its caption belongs beside the first
+                // option, not vertically centred beside the whole group.
+                label.Anchor <- AnchorStyles.Top ||| AnchorStyles.Left
+                label.Margin <- Padding(0, settingsRowMarginPx, 0, settingsRowMarginPx)
+                control.Anchor <- AnchorStyles.Top ||| AnchorStyles.Left ||| AnchorStyles.Right
+                control.Margin <- Padding(0, settingsRowMarginPx, 0, settingsRowMarginPx)
+            // Keep the historical 35-px minimum row height. Wrapped labels can
+            // still make an AutoSize row taller.
+            label.MinimumSize <- Size(0, rowContentHeightPx)
+            panel.Controls.Add(label)
+            panel.Controls.Add(control)
+            panel.SetRow(label, i)
+            panel.SetColumn(label, 0)
+            panel.SetRow(control, i)
+            panel.SetColumn(control, 1)
+        panel
+
+    // Default form layout: 250-px label column (matches the Appearance /
+    // Interaction pages where labels are long).
+    let form (fields:List2<_>) =
+        buildForm fields (float32 settingsLabelWidthPx) true false
+
+    // Compact form layout: 100-px label column for short captions
+    // (Workspace edit dialog "Name" / "Title" / "Match Type"). AutoScroll
+    // disabled because the form is sized just for its content — leaving
+    // AutoScroll on would cause spurious horizontal scrollbars when input
+    // controls' preferred size momentarily exceeded the squeezed cell.
+    let formCompact (fields:List2<_>) =
+        buildForm fields 100.0f false true
+              
+    let vbox (controls:List2<Control>) =
+        let t = 
+            let t = TableLayoutPanel()
+            t.AutoScroll <- true
+            t.AutoSize <- true
+            t.RowCount <- controls.length
+            t.ColumnCount <- 1
+            t
+        controls.enumerate.iter <| fun(i,control) ->
+            t.Controls.Add(control)
+            t.SetRow(control, i)
+            t.SetColumn(control, 0)
+            t.RowStyles.Add(RowStyle()).ignore
+        t  
+
+    let hbox (controls:List2<Control>) =
+        let t = 
+            let t = TableLayoutPanel()
+            t.AutoScroll <- true
+            t.AutoSize <- true
+            t.RowCount <- 1
+            t.ColumnCount <- controls.length
+            t
+        controls.enumerate.iter <| fun(i,control) ->
+            t.Controls.Add(control)
+            t.SetRow(control, 0)
+            t.SetColumn(control, i)
+            t.ColumnStyles.Add(ColumnStyle()).ignore
+        t  
+
+    // Builds the frame only; the caller sizes the form and then hands it to
+    // SettingsDpi.applyToChildDialog, which is what puts the scaled font on
+    // it. Doing it here instead would scale the design size the caller has
+    // not assigned yet. See WorkspaceModel.edit.
+    let okCancelForm control =
+        let form = DpiAwareDialog()
+        form.Padding <- Padding(12)
+        // A dialog answered with OK or Cancel has no use for minimize or
+        // maximize; only Close stays in the caption, and no icon - a dialog
+        // has no icon and no system menu to click, as the system's own
+        // dialogs have none. It remains sizable, with the size grip in the
+        // corner.
+        form.MaximizeBox <- false
+        form.MinimizeBox <- false
+        form.ShowIcon <- false
+        SizeGripOverlay.attach form
+
+        let okButton = Button()
+        okButton.Text <- Localization.getString("OK")
+        okButton.Click.Add <| fun _ ->
+            form.DialogResult <- DialogResult.OK
+
+        let cancelButton = Button()
+        cancelButton.Text <- Localization.getString("Cancel")
+        
+        cancelButton.Click.Add <| fun _ ->
+            form.DialogResult <- DialogResult.Cancel
+
+        let buttonPanel = hbox (List2([okButton.cast<Control>(); cancelButton.cast<Control>()]))
+        let vboxLayout = vbox (List2([control; buttonPanel.cast<Control>()]))
+        buttonPanel.AutoScroll <- false
+        vboxLayout.AutoScroll <- false
+        vboxLayout.RowStyles.Item(0).SizeType <- SizeType.AutoSize
+        vboxLayout.RowStyles.Item(1).SizeType <- SizeType.Absolute
+        buttonPanel.Anchor <- AnchorStyles.Bottom ||| AnchorStyles.Right
+        vboxLayout.Dock <- DockStyle.Fill
+        form.Controls.Add(vboxLayout)
+        form

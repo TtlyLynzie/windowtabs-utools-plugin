@@ -1,0 +1,256 @@
+<?xml version="1.0"?>
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi"
+     xmlns:util="http://schemas.microsoft.com/wix/UtilExtension">
+   <Product Id="*"
+            Name="WindowTabs"
+            Language="1033"
+            Version="26.11.11.0"
+            Manufacturer="Satoshi Yamamoto (standard-software)"
+            UpgradeCode="6763D234-BCFA-4172-8190-756DEE9CF2B1">
+
+      <Package Compressed="yes"
+               InstallerVersion="200"
+               Platform="x64"
+               Description="WindowTabs Installer"
+               Comments="Brings browser-style tabbed window management to the desktop" />
+
+      <Media Id="1" Cabinet="product.cab" EmbedCab="yes"/>
+
+      <!-- Upgrade settings: Remove all previous versions -->
+      <!-- AllowSameVersionUpgrades="yes" allows reinstall of same version -->
+      <MajorUpgrade DowngradeErrorMessage="A newer version of WindowTabs is already installed."
+                    Schedule="afterInstallInitialize"
+                    AllowSameVersionUpgrades="yes"
+                    RemoveFeatures="ALL" />
+
+      <!-- Installation directory structure -->
+      <Directory Id="TARGETDIR" Name="SourceDir">
+         <Directory Id="ProgramFiles64Folder">
+            <Directory Id="INSTALLFOLDER" Name="WindowTabs">
+               <Component Id="MainExecutable" Guid="3C67513D-01DD-4637-8A68-80971EB9504F" Win64="yes">
+                  <!-- Main executable (all DLLs are merged using ILRepack) -->
+                  <File Id="WindowTabsExe"
+                        Source="$(var.WtProgram.TargetDir)WindowTabs.exe"
+                        KeyPath="yes" />
+
+                  <!-- Configuration file -->
+                  <File Id="WindowTabsConfig"
+                        Source="$(var.WtProgram.TargetDir)WindowTabs.exe.config" />
+
+                  <!-- Version history file -->
+                  <File Id="VersionMd"
+                        Source="$(var.WtProgram.ProjectDir)..\version.md" />
+
+                  <!-- README file -->
+                  <File Id="ReadmeTxt"
+                        Source="$(var.WtProgram.ProjectDir)..\WtSetup\README.txt" />
+               </Component>
+
+               <!-- Settings folder: every JSON file WindowTabs ships. These are
+                    DEFAULTS. A file of the same name under
+                    %APPDATA%\WindowTabs\Settings is the user's own and is laid
+                    over the shipped one at run time (UserOverrides.fs), so the
+                    installer owns this folder outright: stale files are cleared
+                    before the new defaults are laid down, and a language file
+                    dropped from a release does not linger. RemoveFiles runs
+                    before InstallFiles, and only when the component is being
+                    installed. Nothing here is backed up, because nothing the
+                    user writes lives here. -->
+               <Directory Id="SettingsFolder" Name="Settings">
+                  <Component Id="SettingsFiles" Guid="30060313-F307-4D5C-B7F6-E94898B794FE" Win64="yes">
+                     <RemoveFile Id="RemoveStaleSettingsJson" Name="*.json" On="install" />
+
+                     <File Id="VersionFolderJson"
+                           Source="$(var.WtProgram.TargetDir)Settings\VersionFolder.json" KeyPath="yes" />
+                     <File Id="FramelessWindowJson"
+                           Source="$(var.WtProgram.TargetDir)Settings\FramelessWindow.json" />
+                  </Component>
+
+                  <!-- Languages moved here from <install>\Language. A new
+                       component GUID because the install location changed;
+                       the old component goes with the old product, which the
+                       major upgrade removes first. -->
+                  <Directory Id="LanguageFolder" Name="Language">
+                     <Component Id="LanguageFiles" Guid="7A2C9E41-3B5D-4F86-9C1E-2D8B6F4A0E37" Win64="yes">
+                        <RemoveFile Id="RemoveStaleLanguageJson" Name="*.json" On="install" />
+
+                        <File Id="FileListJson"
+                              Source="$(var.WtProgram.TargetDir)Settings\Language\FileList.json"
+                              KeyPath="yes" />
+                        <File Id="EnglishJson"
+                              Source="$(var.WtProgram.TargetDir)Settings\Language\English.json" />
+                        <File Id="JapaneseJson"
+                              Source="$(var.WtProgram.TargetDir)Settings\Language\Japanese.json" />
+                        <File Id="JapaneseKansaiJson"
+                              Source="$(var.WtProgram.TargetDir)Settings\Language\Japanese_Kansai.json" />
+                        <File Id="JapaneseTohokuJson"
+                              Source="$(var.WtProgram.TargetDir)Settings\Language\Japanese_Tohoku.json" />
+                        <File Id="ChineseSimplifiedJson"
+                              Source="$(var.WtProgram.TargetDir)Settings\Language\Chinese_Simplified.json" />
+                        <File Id="ChineseTraditionalJson"
+                              Source="$(var.WtProgram.TargetDir)Settings\Language\Chinese_Traditional.json" />
+                        <File Id="KoreanJson"
+                              Source="$(var.WtProgram.TargetDir)Settings\Language\Korean.json" />
+                        <File Id="FrenchJson"
+                              Source="$(var.WtProgram.TargetDir)Settings\Language\French.json" />
+                        <File Id="GermanJson"
+                              Source="$(var.WtProgram.TargetDir)Settings\Language\German.json" />
+                        <File Id="ItalianJson"
+                              Source="$(var.WtProgram.TargetDir)Settings\Language\Italian.json" />
+                        <File Id="SpanishJson"
+                              Source="$(var.WtProgram.TargetDir)Settings\Language\Spanish.json" />
+                        <File Id="PortugueseJson"
+                              Source="$(var.WtProgram.TargetDir)Settings\Language\Portuguese.json" />
+                        <File Id="TurkishJson"
+                              Source="$(var.WtProgram.TargetDir)Settings\Language\Turkish.json" />
+                        <File Id="PolishJson"
+                              Source="$(var.WtProgram.TargetDir)Settings\Language\Polish.json" />
+                        <File Id="VietnameseJson"
+                              Source="$(var.WtProgram.TargetDir)Settings\Language\Vietnamese.json" />
+                        <File Id="IndonesianJson"
+                              Source="$(var.WtProgram.TargetDir)Settings\Language\Indonesian.json" />
+                     </Component>
+                  </Directory>
+               </Directory>
+
+               <!-- Registry entries for installation path persistence -->
+               <Component Id="RegistryEntries" Guid="A5B2E1C3-4D6F-7890-ABCD-EF1234567890" Win64="yes" Permanent="yes">
+                  <RegistryKey Root="HKCU"
+                               Key="Software\WindowTabs">
+                     <RegistryValue Type="string"
+                                    Name="InstallPath"
+                                    Value="[INSTALLFOLDER]"
+                                    KeyPath="yes"/>
+                  </RegistryKey>
+               </Component>
+            </Directory>
+         </Directory>
+
+         <!-- Start Menu -->
+         <Directory Id="ProgramMenuFolder">
+            <Directory Id="ApplicationProgramsFolder" Name="WindowTabs">
+               <Component Id="ApplicationShortcut" Guid="B6C3F2E4-5D7A-8901-BCDE-EF2345678901" Win64="yes">
+                  <Shortcut Id="ApplicationStartMenuShortcut"
+                           Name="WindowTabs"
+                           Description="Browser-style tabbed window management"
+                           Target="[INSTALLFOLDER]WindowTabs.exe"
+                           WorkingDirectory="INSTALLFOLDER"
+                           Icon="BemoIcon.ico" />
+
+                  <RemoveFolder Id="CleanUpShortCut"
+                                Directory="ApplicationProgramsFolder"
+                                On="uninstall"/>
+
+                  <RegistryValue Root="HKCU"
+                                 Key="Software\WindowTabs"
+                                 Name="StartMenuShortcut"
+                                 Type="integer"
+                                 Value="1"
+                                 KeyPath="yes"/>
+               </Component>
+            </Directory>
+         </Directory>
+
+         <!-- Desktop Shortcut (optional) -->
+         <Directory Id="DesktopFolder" Name="Desktop">
+            <Component Id="DesktopShortcut" Guid="C7D4E3F5-6E8B-9012-CDEF-EA3456789012" Win64="yes">
+               <Shortcut Id="DesktopShortcutIcon"
+                        Name="WindowTabs"
+                        Description="Browser-style tabbed window management"
+                        Target="[INSTALLFOLDER]WindowTabs.exe"
+                        WorkingDirectory="INSTALLFOLDER"
+                        Icon="BemoIcon.ico" />
+
+               <RegistryValue Root="HKCU"
+                              Key="Software\WindowTabs"
+                              Name="DesktopShortcut"
+                              Type="integer"
+                              Value="1"
+                              KeyPath="yes"/>
+            </Component>
+         </Directory>
+      </Directory>
+
+      <!-- Icon definition -->
+      <Icon Id="BemoIcon.ico" SourceFile="..\WtProgram\Resources\Bemo.ico"/>
+      <Property Id="ARPPRODUCTICON" Value="BemoIcon.ico" />
+
+      <!-- Remember installation directory for upgrades -->
+      <Property Id="INSTALLFOLDER">
+         <RegistrySearch Id="RememberInstallFolder"
+                        Root="HKCU"
+                        Key="Software\WindowTabs"
+                        Name="InstallPath"
+                        Type="raw"
+                        Win64="yes" />
+      </Property>
+
+      <!-- Launch application after installation -->
+      <Property Id="WIXUI_EXITDIALOGOPTIONALCHECKBOXTEXT" Value="Launch WindowTabs" />
+      <Property Id="WIXUI_EXITDIALOGOPTIONALCHECKBOX" Value="1" />
+
+      <CustomAction Id="LaunchApplication"
+                    FileKey="WindowTabsExe"
+                    ExeCommand=""
+                    Execute="immediate"
+                    Impersonate="yes"
+                    Return="asyncNoWait" />
+
+      <!-- Close running WindowTabs before installation -->
+      <util:CloseApplication Id="CloseWindowTabs"
+                              Target="WindowTabs.exe"
+                              CloseMessage="yes"
+                              Description="WindowTabs is currently running. Click OK to close it and continue installation, or Cancel to exit."
+                              RebootPrompt="no"
+                              TerminateProcess="0"
+                              Timeout="5" />
+
+      <!-- No custom actions beyond launching the application. The files under
+           Settings\ are defaults and are simply replaced; what the user writes
+           lives under %APPDATA% and is never touched by this package. Earlier
+           releases backed up edited files here, first with embedded
+           PowerShell (which Defender reported as a trojan) and then by
+           running the OUTGOING WindowTabs.exe with a switch that only the
+           incoming one understood, which left the installer waiting on a
+           program that had started instead. Both are gone with the reason
+           for them. -->
+
+      <!-- Features -->
+      <Feature Id="MainApplication"
+               Title="WindowTabs"
+               Description="Main application files"
+               Level="1"
+               ConfigurableDirectory="INSTALLFOLDER">
+         <ComponentRef Id="MainExecutable"/>
+         <ComponentRef Id="LanguageFiles"/>
+         <ComponentRef Id="SettingsFiles"/>
+         <ComponentRef Id="RegistryEntries"/>
+         <ComponentRef Id="ApplicationShortcut"/>
+      </Feature>
+
+      <Feature Id="DesktopShortcutFeature"
+               Title="Desktop Shortcut"
+               Description="Create a desktop shortcut"
+               Level="1">
+         <ComponentRef Id="DesktopShortcut"/>
+      </Feature>
+
+      <!-- Basic UI with installation directory selection -->
+      <Property Id="WIXUI_INSTALLDIR" Value="INSTALLFOLDER" />
+
+      <UI>
+         <UIRef Id="WixUI_InstallDir" />
+
+         <!-- Skip License Agreement Dialog -->
+         <Publish Dialog="WelcomeDlg" Control="Next" Event="NewDialog" Value="InstallDirDlg" Order="2">1</Publish>
+         <Publish Dialog="InstallDirDlg" Control="Back" Event="NewDialog" Value="WelcomeDlg" Order="2">1</Publish>
+
+         <!-- Launch application on finish -->
+         <Publish Dialog="ExitDialog"
+                  Control="Finish"
+                  Event="DoAction"
+                  Value="LaunchApplication">WIXUI_EXITDIALOGOPTIONALCHECKBOX = 1 and NOT Installed</Publish>
+      </UI>
+
+   </Product>
+</Wix>

@@ -1,0 +1,233 @@
+﻿namespace Bemo
+open System
+open System.Threading
+open System.Windows.Forms
+
+// Global flag to indicate force exit is in progress (used by watchdog)
+module ForceExitState =
+    let mutable isForceExiting = false
+
+type InvokeDelegate<'a> = delegate of unit -> 'a
+[<AllowNullLiteral>]
+type Invoker() as this =
+    let form =
+        let f = new Form()
+        f.Handle.ignore
+        f
+
+    let lockDispose f = lock this <| fun() -> if form.IsDisposed.not && form.IsHandleCreated then f()
+
+    do
+        printfn "Invoker for %d" (System.Threading.Thread.CurrentThread.ManagedThreadId)
+
+    member this.invokeRequired = form.InvokeRequired
+
+    member this.invoke f=
+        if this.invokeRequired then
+            form.Invoke(InvokeDelegate(fun() -> f()), null) :?> 'a
+        else
+            f()
+
+    member this.asyncInvoke f =
+        lockDispose <| fun() ->
+            form.BeginInvoke(MethodInvoker(fun() -> f())).ignore
+
+    // Restore needs to distinguish a queued action from a disposed target.
+    // Existing asyncInvoke callers retain their original behavior.
+    member this.tryAsyncInvoke f =
+        lock this <| fun () ->
+            if form.IsDisposed || not form.IsHandleCreated then false
+            else
+                try
+                    form.BeginInvoke(MethodInvoker(fun () -> f())) |> ignore
+                    true
+                with :? InvalidOperationException -> false
+
+    interface IDisposable with
+        member this.Dispose() =
+            lockDispose <| fun() ->
+                form.Dispose()
+
+#if DEBUG
+// Debug only: every thread that owns an Invoker (the main thread and each
+// tab-group thread), so the watchdog can dump all their stacks on a freeze.
+module InvokerThreads =
+    let private gate = obj()
+    let private threads = System.Collections.Generic.List<WeakReference<Thread>>()
+
+    let register (thread: Thread) =
+        lock gate (fun () -> threads.Add(WeakReference<Thread>(thread)))
+
+    let snapshot () =
+        lock gate (fun () ->
+            threads.RemoveAll(fun r ->
+                match r.TryGetTarget() with
+                | true, t -> not t.IsAlive
+                | _ -> true) |> ignore
+            threads
+            |> Seq.choose (fun r ->
+                match r.TryGetTarget() with
+                | true, t -> Some (t, t.ManagedThreadId, t.Name)
+                | _ -> None)
+            |> Seq.toArray)
+#endif
+
+type InvokerService =
+    [<DefaultValue>]
+    [<ThreadStatic>]
+    static val mutable private _invoker : Invoker
+
+    static member invoker
+        with get() =
+            if InvokerService._invoker = null then
+                InvokerService._invoker <- Invoker()
+#if DEBUG
+                InvokerThreads.register Thread.CurrentThread
+#endif
+            InvokerService._invoker
+
+// Deadlock guard for secondary UI threads (one per tab group).
+//
+// On a display-settings change (monitor added/removed, resolution change),
+// Microsoft.Win32.SystemEvents — whose broadcast window lives on the MAIN
+// thread — delivers DisplaySettingsChanged / UserPreferenceChanged to every
+// WinForms control that subscribed from a group thread via that thread's
+// SynchronizationContext.Send, i.e. the main thread BLOCKS until the group
+// thread has processed the callback. At the same moment the group thread is
+// typically handling the same broadcast on its own windows and makes a
+// synchronous service call into the main thread (ServiceProxy /
+// Invoker.invoke). Both threads then wait on each other forever — this is
+// the freeze that the watchdog used to "fix" by force-restarting the app.
+//
+// Installing this context on a group thread before any control is created
+// makes WinForms and SystemEvents capture it (WinForms only auto-installs
+// its own context over a null/default one, never over a custom type).
+// A cross-thread Send is then degraded to Post: the callback still runs on
+// the correct (owning) thread, just asynchronously, so the sender never
+// blocks and the cycle cannot form. Same-thread Send runs inline as before.
+type NonBlockingSyncContext private (inner: SynchronizationContext, ownerThreadId: int) =
+    inherit SynchronizationContext()
+    new (inner: SynchronizationContext) =
+        NonBlockingSyncContext(inner, Thread.CurrentThread.ManagedThreadId)
+    override this.Post(d, state) = inner.Post(d, state)
+    override this.Send(d, state) =
+        if Thread.CurrentThread.ManagedThreadId = ownerThreadId
+        then d.Invoke(state)
+        else inner.Post(d, state)
+    override this.CreateCopy() =
+        NonBlockingSyncContext(inner, ownerThreadId) :> SynchronizationContext
+
+module ThreadHelper =
+    let private threadGate = obj()
+    let private groupThreads = ResizeArray<Thread>()
+    let groupsStopped() = lock threadGate (fun () ->
+        groupThreads.RemoveAll(fun thread -> not thread.IsAlive) |> ignore
+        groupThreads.Count = 0)
+
+    let queueBackground f =
+        System.Threading.ThreadPool.QueueUserWorkItem(Threading.WaitCallback(fun _ -> f())).ignore
+
+    let startOnThreadAndWait fStart =
+        let evt = ManualResetEvent(false)
+        let results = ref None
+        let start() =
+            CrashLog.installThread()
+            // Must run before the first control is created on this thread so
+            // that every SystemEvents subscription captures the non-blocking
+            // context (see NonBlockingSyncContext above).
+            let inner = new WindowsFormsSynchronizationContext()
+            SynchronizationContext.SetSynchronizationContext(NonBlockingSyncContext(inner))
+            results := Some(fStart())
+            evt.Set().ignore
+            Application.EnableVisualStyles()
+            try Application.Run()
+            finally
+                (InvokerService.invoker :> IDisposable).Dispose()
+                inner.Dispose()
+                ShutdownTrace.write "group message loop ended"
+        let thread = Thread(ThreadStart(start))
+        thread.SetApartmentState(ApartmentState.STA)
+        lock threadGate (fun () ->
+            groupThreads.RemoveAll(fun thread -> not thread.IsAlive) |> ignore
+            thread.Start()
+            groupThreads.Add(thread))
+        evt.WaitOne().ignore
+        results.Value.Value
+
+    let cancelablePostBack interval f =
+        let timer = new System.Windows.Forms.Timer()
+        timer.Interval <- interval
+        timer.Tick.Add <| fun _ ->
+            f()
+            timer.Dispose()
+        timer.Start()
+        timer :> IDisposable
+// WinEvent delivery can wait inside the native message pump during a display
+// change. Its queue must not also own the UI or a tab strip's message loop.
+module WinEventPump =
+    let private gate = obj()
+    let mutable private stopping = false
+    let mutable private worker : Thread option = None
+    let isStopped() = worker |> Option.forall (fun thread -> not thread.IsAlive)
+    // Owned and disposed only on the pump thread.
+    let private deferred = System.Collections.Generic.HashSet<System.Windows.Forms.Timer>()
+    let private cancelDeferred() =
+        for timer in deferred do timer.Dispose()
+        deferred.Clear()
+    let private dispatcher = lazy (
+        let ready = new System.Threading.Tasks.TaskCompletionSource<Invoker>()
+        let run() =
+            try
+                CrashLog.installThread()
+                let inner = new WindowsFormsSynchronizationContext()
+                SynchronizationContext.SetSynchronizationContext(NonBlockingSyncContext(inner))
+                let invoker = InvokerService.invoker
+                ready.SetResult(invoker)
+                try Application.Run()
+                finally
+                    cancelDeferred()
+                    (invoker :> IDisposable).Dispose()
+                    inner.Dispose()
+                    ShutdownTrace.write "WinEvent message loop ended"
+            with ex ->
+                if not (ready.TrySetException(ex)) then reraise()
+        let thread = new Thread(ThreadStart(run), IsBackground = true, Name = "WindowTabs WinEvent pump")
+        thread.SetApartmentState(ApartmentState.STA)
+        worker <- Some thread
+        thread.Start()
+        ready.Task.GetAwaiter().GetResult())
+
+    let post action = lock gate (fun () ->
+        if not stopping then dispatcher.Value.asyncInvoke action)
+
+    // Called on the pump, unlike post. A timer returns control to the native
+    // message loop instead of extending the current BeginInvoke callback batch.
+    // This grace period is not a guarantee that all WinEvents have drained.
+    let defer milliseconds action = lock gate (fun () ->
+        if stopping then false
+        else
+            let timer = new System.Windows.Forms.Timer()
+            try
+                timer.Interval <- milliseconds
+                timer.Tick.Add(fun _ ->
+                    timer.Stop()
+                    deferred.Remove timer |> ignore
+                    timer.Dispose()
+                    action())
+                deferred.Add timer |> ignore
+                timer.Start()
+                true
+            with _ ->
+                deferred.Remove timer |> ignore
+                timer.Dispose()
+                false)
+
+    let stop cleanup = lock gate (fun () ->
+        if not stopping then
+            stopping <- true
+            if dispatcher.IsValueCreated then
+                dispatcher.Value.asyncInvoke(fun () ->
+                    cancelDeferred()
+                    cleanup()
+                    ShutdownTrace.write "WinEvent ExitThread"
+                    Application.ExitThread()))

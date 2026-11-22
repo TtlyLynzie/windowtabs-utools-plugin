@@ -1,0 +1,435 @@
+﻿namespace Bemo
+open System
+open System.Drawing
+open System.IO
+open System.Windows.Forms
+open Bemo.Win32.Forms
+open Aga.Controls
+open Aga.Controls.Tree
+
+module ImgHelper =
+    let imgFromIcon (icon:Icon) =
+        // The tree's row height follows the monitor scale, so the icon box
+        // does too. ScaledIcon re-extracts the requested size from the icon's
+        // own resource (icons usually carry 16/24/32/48), which is sharper
+        // than stretching the 16-px image - the same trick the tab strips use.
+        let size = SettingsDpi.px 16
+        let img =
+            try
+                // At 100% the icon goes through exactly the path it always
+                // did, so nothing on an unscaled monitor changes.
+                let source = if size = 16 then icon else ScaledIcon.at icon size
+                source.ToBitmap().img
+            with _ ->
+                try
+                    icon.ToBitmap().img
+                with _ ->
+                    SystemIcons.Application.ToBitmap().img
+        img.resize(Sz(size,size)).bitmap :> Image
+
+type private DpiIcon(icon: Icon) =
+    // Keep one image for each monitor scale. TreeViewAdv can ask for the same
+    // property again while completing an earlier paint, so disposing the
+    // previous scale's image during a DPI transition is unsafe. A desktop has
+    // only a handful of distinct monitor scales, keeping this cache bounded in
+    // normal use and making repeated monitor crossings allocation-free.
+    let images = Collections.Generic.Dictionary<float, Image>()
+
+    member this.image =
+        let scale = SettingsDpi.current()
+        match images.TryGetValue(scale) with
+        | true, image -> image
+        | _ ->
+            let image = ImgHelper.imgFromIcon icon
+            images.[scale] <- image
+            image
+
+
+type ExeNode(procPath) =
+    inherit Node(Path.GetFileName(procPath))
+    let icon =
+        let procIcon = Win32Helper.GetFileIcon(procPath)
+        DpiIcon(Ico.fromHandle(procIcon).def(System.Drawing.SystemIcons.Application))
+    let mutable _isRunning = true
+    let mutable _enableTabs = Services.filter.getIsTabbingEnabledForProcess(procPath)
+    let mutable _enableAutoGrouping = Services.program.getAutoGroupingEnabled(procPath)
+    let initialCategoryNumber = Services.program.getCategoryNumber(procPath)
+    let mutable _category1 = initialCategoryNumber = 1
+    let mutable _category2 = initialCategoryNumber = 2
+    let mutable _category3 = initialCategoryNumber = 3
+    let mutable _category4 = initialCategoryNumber = 4
+    let mutable _category5 = initialCategoryNumber = 5
+    let mutable _category6 = initialCategoryNumber = 6
+    let mutable _category7 = initialCategoryNumber = 7
+    let mutable _category8 = initialCategoryNumber = 8
+    let mutable _category9 = initialCategoryNumber = 9
+    let mutable _category10 = initialCategoryNumber = 10
+    member this.Icon with get() = icon.image
+    member this.processPath = procPath
+    member this.isRunning
+        with get() = _isRunning
+        and set(v) = _isRunning <- v
+    member this.enableTabs
+        with get() = _enableTabs
+        and set(newValue) =
+            _enableTabs <- newValue
+            Services.filter.setIsTabbingEnabledForProcess procPath _enableTabs
+            // When Tabs is disabled, also disable Auto Grouping
+            if not _enableTabs then
+                _enableAutoGrouping <- false
+                Services.program.setAutoGroupingEnabled procPath false
+    member this.enableAutoGrouping
+        with get() = _enableAutoGrouping
+        and set(newValue) =
+            _enableAutoGrouping <- newValue
+            Services.program.setAutoGroupingEnabled procPath _enableAutoGrouping
+    member this.category1
+        with get() = _category1
+        and set(newValue) =
+            _category1 <- newValue
+            Services.program.setCategoryEnabled procPath 1 _category1
+    member this.category2
+        with get() = _category2
+        and set(newValue) =
+            _category2 <- newValue
+            Services.program.setCategoryEnabled procPath 2 _category2
+    member this.category3
+        with get() = _category3
+        and set(newValue) =
+            _category3 <- newValue
+            Services.program.setCategoryEnabled procPath 3 _category3
+    member this.category4
+        with get() = _category4
+        and set(newValue) =
+            _category4 <- newValue
+            Services.program.setCategoryEnabled procPath 4 _category4
+    member this.category5
+        with get() = _category5
+        and set(newValue) =
+            _category5 <- newValue
+            Services.program.setCategoryEnabled procPath 5 _category5
+    member this.category6
+        with get() = _category6
+        and set(newValue) =
+            _category6 <- newValue
+            Services.program.setCategoryEnabled procPath 6 _category6
+    member this.category7
+        with get() = _category7
+        and set(newValue) =
+            _category7 <- newValue
+            Services.program.setCategoryEnabled procPath 7 _category7
+    member this.category8
+        with get() = _category8
+        and set(newValue) =
+            _category8 <- newValue
+            Services.program.setCategoryEnabled procPath 8 _category8
+    member this.category9
+        with get() = _category9
+        and set(newValue) =
+            _category9 <- newValue
+            Services.program.setCategoryEnabled procPath 9 _category9
+    member this.category10
+        with get() = _category10
+        and set(newValue) =
+            _category10 <- newValue
+            Services.program.setCategoryEnabled procPath 10 _category10
+
+    // Get the category number (0 = unset, 1-10 = category number)
+    member this.categoryNumber
+        with get() =
+            if _category1 then 1
+            elif _category2 then 2
+            elif _category3 then 3
+            elif _category4 then 4
+            elif _category5 then 5
+            elif _category6 then 6
+            elif _category7 then 7
+            elif _category8 then 8
+            elif _category9 then 9
+            elif _category10 then 10
+            else 0
+
+    interface INode with
+        member x.showSettings = true
+
+type WindowNode(window:Window) =
+    inherit Node(window.text)
+    let icon = DpiIcon(window.iconSmall)
+    member this.Icon with get() = icon.image
+    member this.canEnableTabs = window.isWindow && Services.filter.getIsTabbingEnabledForProcess(window.pid.processPath)
+    member this.enableTabs
+        with get() = Services.filter.getIsTabbingEnabledForWindow(window.hwnd)
+        and set(value) =
+            if this.canEnableTabs then
+                Services.filter.setIsTabbingEnabledForWindows (List2([window.hwnd])) value
+    interface INode with
+        member x.showSettings = false
+
+type NodeDeleteButton() =
+    inherit NodeControls.NodeControl()
+    let deleteClicked = Event<ExeNode>()
+    member this.DeleteClicked = deleteClicked.Publish
+    override this.MeasureSize(node, context) =
+        let path = this.Parent.GetPath(node)
+        if path <> null && path.LastNode <> null then
+            match path.LastNode with
+            | :? ExeNode as exeNode when not exeNode.isRunning ->
+                let side = SettingsDpi.px 16
+                Size(side, side)
+            | _ -> Size.Empty
+        else
+            Size.Empty
+    override this.Draw(node, context) =
+        let path = this.Parent.GetPath(node)
+        if path <> null && path.LastNode <> null then
+            match path.LastNode with
+            | :? ExeNode as exeNode when not exeNode.isRunning ->
+                let bounds = this.GetBounds(node, context)
+                let g = context.Graphics
+                // The cross is drawn by hand, so it has to be scaled by hand.
+                use pen = new Pen(Color.Gray, SettingsDpi.pxf 1.5f)
+                let x = bounds.X + SettingsDpi.px 3
+                let y = bounds.Y + SettingsDpi.px 3
+                let size = SettingsDpi.px 9
+                g.DrawLine(pen, x, y, x + size, y + size)
+                g.DrawLine(pen, x + size, y, x, y + size)
+            | _ -> ()
+    override this.MouseDown(args) =
+        let path = this.Parent.GetPath(args.Node)
+        if path <> null && path.LastNode <> null then
+            match path.LastNode with
+            | :? ExeNode as exeNode when not exeNode.isRunning ->
+                deleteClicked.Trigger(exeNode)
+                args.Handled <- true
+            | _ -> ()
+
+type ProgramView() as this=
+
+    let invoker = InvokerService.invoker
+    let mutable showAllSettings = false
+    let toolBar =
+        let ts = ToolStrip()
+        ts.GripStyle <- ToolStripGripStyle.Hidden
+        // Use a soft-grey separator and balanced spacing in both light and
+        // dark mode. The default Professional renderer paints the vertical
+        // separator with a near-white inner line (SeparatorLight) which the
+        // user found too bright; this custom renderer paints a single thin
+        // grey line instead and the separator's Margin gives the trailing
+        // checkbox visible breathing room.
+        let renderer =
+            { new ToolStripProfessionalRenderer() with
+                override _.OnRenderSeparator(e: ToolStripSeparatorRenderEventArgs) =
+                    let g = e.Graphics
+                    let item = e.Item
+                    use pen = new Pen(Color.FromArgb(120, 120, 120))
+                    let h = item.Height
+                    let cx = item.Width / 2
+                    let topPad = 6
+                    let botPad = 6
+                    g.DrawLine(pen, cx, topPad, cx, h - botPad - 1) }
+        ts.Renderer <- renderer
+        let refreshBtn =
+            let btn = ToolStripButton(Localization.getString("Refresh"))
+            btn.Click.Add <| fun _ -> this.populateNodes()
+            btn
+        ts.Items.Add(refreshBtn).ignore
+        let separator = new ToolStripSeparator()
+        // Extra right-margin so the trailing checkbox doesn't crowd the
+        // separator. Default Margin = (0,0,0,0) on a ToolStripSeparator.
+        separator.Margin <- Padding(2, 0, 12, 0)
+        ts.Items.Add(separator) |> ignore
+        let checkBoxCtrl = new SettingsCheckBox()
+        checkBoxCtrl.Text <- Localization.getString("ShowAllSettings")
+        checkBoxCtrl.AutoSize <- true
+        checkBoxCtrl.Checked <- false
+        checkBoxCtrl.CheckedChanged.Add(fun _ ->
+            showAllSettings <- checkBoxCtrl.Checked
+            this.populateNodes()
+        )
+        let host = new ToolStripControlHost(checkBoxCtrl)
+        host.AutoSize <- true
+        ts.Items.Add(host) |> ignore
+        ts
+    let tree,model =
+        let tree = TreeViewAdv()
+        let model = TreeModel()
+        let nameColumn = TreeColumn(Localization.getString("ProcessName"), 200)
+        tree.UseColumns <- true
+        tree.Columns.Add(nameColumn)
+        tree.RowHeight <- 24
+        let addCheckBoxColumn displayName propName colWidth visibilityCheck =
+            let content =
+                match displayName with
+                | Some name -> name
+                | None -> Localization.getString(propName)
+            let parentColumn =
+                let col = TreeColumn(content, colWidth)
+                col.TextAlign <- HorizontalAlignment.Center
+                col
+            tree.Columns.Add(parentColumn)
+            // Use the dark variant when dark mode is on so the box matches
+            // the CheckBox dark style elsewhere in the dialog.
+            let control = DarkModeFactory.makeNodeCheckBox()
+            control.ParentColumn <- parentColumn
+            control.IsVisibleValueNeeded.Add <| fun e ->
+                let path = tree.GetPath(e.Node)
+                if path <> null && path.LastNode <> null then
+                    let node = path.LastNode :?> INode
+                    // Check basic visibility (showSettings)
+                    let basicVisible = node.showSettings || (propName = "enableTabs" && path.LastNode :? WindowNode)
+                    // Check additional visibility condition if provided
+                    let additionalVisible =
+                        match visibilityCheck with
+                        | Some checkFn ->
+                            match path.LastNode with
+                            | :? ExeNode as exeNode -> checkFn exeNode
+                            | _ -> true
+                        | None -> true
+                    e.Value <- basicVisible && additionalVisible
+                else
+                    e.Value <- false
+            // Center the checkbox horizontally in the column
+            // Checkbox size is 13 pixels (NodeCheckBox.ImageSize)
+            let checkboxSize = 13
+            control.LeftMargin <- (colWidth - checkboxSize) / 2
+            control.EditEnabled <- true
+            control.IsEditEnabledValueNeeded.Add <| fun e ->
+                let path = tree.GetPath(e.Node)
+                e.Value <-
+                    if path = null then false else
+                    match path.LastNode with
+                    | :? WindowNode as windowNode -> propName = "enableTabs" && windowNode.canEnableTabs
+                    | :? ExeNode -> true
+                    | _ -> false
+            control.CheckStateChanged.Add(fun _ -> tree.Invalidate())
+            control.DataPropertyName <- propName
+            tree.NodeControls.Add(control)
+            control
+        // Helper function to check if any category is selected
+        let hasAnyCategory (exeNode:ExeNode) =
+            exeNode.category1 || exeNode.category2 || exeNode.category3 || exeNode.category4 || exeNode.category5 ||
+            exeNode.category6 || exeNode.category7 || exeNode.category8 || exeNode.category9 || exeNode.category10
+        // Category visibility: show only when autoGrouping is ON and (this category is checked OR no category is checked)
+        let categoryVisibility categoryNum (exeNode:ExeNode) =
+            exeNode.enableAutoGrouping &&
+            (let thisCategory =
+                match categoryNum with
+                | 1 -> exeNode.category1 | 2 -> exeNode.category2 | 3 -> exeNode.category3
+                | 4 -> exeNode.category4 | 5 -> exeNode.category5 | 6 -> exeNode.category6
+                | 7 -> exeNode.category7 | 8 -> exeNode.category8 | 9 -> exeNode.category9
+                | 10 -> exeNode.category10 | _ -> false
+             thisCategory || not (hasAnyCategory exeNode))
+        // Delete column - shows [x] button for non-running process rows
+        let deleteColumn =
+            let col = TreeColumn("", 24)
+            col.TextAlign <- HorizontalAlignment.Center
+            col
+        tree.Columns.Add(deleteColumn)
+        let deleteBtn = NodeDeleteButton()
+        deleteBtn.ParentColumn <- deleteColumn
+        deleteBtn.LeftMargin <- 3
+        deleteBtn.DeleteClicked.Add(fun exeNode ->
+            Services.program.removeProcessSettings(exeNode.processPath)
+            model.Nodes.Remove(exeNode) |> ignore
+        )
+        tree.NodeControls.Add(deleteBtn)
+        addCheckBoxColumn (Some(Localization.getString("EnableTabs"))) "enableTabs" 50 None |> ignore
+        addCheckBoxColumn (Some(Localization.getString("EnableAutoGrouping"))) "enableAutoGrouping" 100 (Some(fun (exeNode:ExeNode) -> exeNode.enableTabs)) |> ignore
+        for i in 1..10 do
+            let header = sprintf "%s%d" (Localization.getString("Category")) i
+            addCheckBoxColumn (Some header) (sprintf "category%d" i) 70 (Some(categoryVisibility i)) |> ignore
+        tree.NodeControls.Add(
+            let control = NodeControls.NodeIcon()
+            control.ParentColumn <- nameColumn
+            control.LeftMargin <- 3
+            control.DataPropertyName <- "Icon"
+            control)
+        tree.NodeControls.Add(
+            let control = SmoothNodeTextBox()
+            control.Trimming <- StringTrimming.EllipsisCharacter
+            control.DisplayHiddenContentInToolTip <- true
+            control.ParentColumn <- nameColumn
+            control.DataPropertyName <- "Text"
+            control.LeftMargin <- 3
+            control)
+        tree.Model <- model
+        tree,model
+    let panel =
+        let panel = Panel()
+        toolBar.Dock <- DockStyle.Top
+        tree.Dock <- DockStyle.Fill
+        panel.Controls.Add(tree)
+        panel.Controls.Add(toolBar)
+        panel
+    let mutable populationGeneration = 0
+
+    do  
+        this.populateNodes()
+        // ISettings has no unsubscribe API. Do not let its process-lifetime
+        // notification retain a disposed settings page after a structural rebuild.
+        let target = WeakReference<ProgramView>(this)
+        Services.settings.notifyValue "enableTabbingByDefault" <| fun(_) ->
+            match target.TryGetTarget() with
+            | true, view -> view.refresh()
+            | _ -> ()
+
+    member this.refresh() =
+        if not panel.IsDisposed then this.populateNodes()
+
+    member private this.populateNodes() =
+#if DEBUG
+        let timing = SettingsTiming.current
+#endif
+        let generation = Threading.Interlocked.Increment(&populationGeneration)
+        // Keep the last completed list until its replacement is ready.
+        let showAll = showAllSettings
+        ThreadHelper.queueBackground <| fun() ->
+            let os = OS()
+            let procs = Services.program.appWindows.fold (Map2()) <| fun procs hwnd ->
+                let window = os.windowFromHwnd(hwnd)
+                let procPath = window.pid.processPath
+                procs.add procPath (procs.tryFind(procPath).def(List2()).append(window))
+            let procNodes = procs.items.map <| fun (procPath, windows) ->
+                let procNode = ExeNode(procPath)
+                windows.iter <| fun window ->
+                    let windowNode = WindowNode(window)
+                    procNode.Nodes.Add(windowNode)
+                procNode
+            // When showAllSettings is ON, also add configured programs that are not currently running
+            let allProcNodes =
+                if showAll then
+                    // Compared by application, not by string: a setting is
+                    // stored as a pattern for an application whose path
+                    // carries its version, so it never equals the path the
+                    // running process reports, and the application would be
+                    // listed twice.
+                    let runningPaths = System.Collections.Generic.HashSet<string>()
+                    procs.items.iter <| fun (procPath, _) ->
+                        runningPaths.Add(AppPath.normalize procPath) |> ignore
+                    let configuredPaths = Services.program.getAllConfiguredProcessPaths()
+                    let extraNodes =
+                        configuredPaths.where(fun p -> not (runningPaths.Contains(AppPath.normalize p))).map <| fun procPath ->
+                        let node = ExeNode(procPath)
+                        node.isRunning <- false
+                        node
+                    procNodes.appendList(extraNodes)
+                else
+                    procNodes
+
+            invoker.asyncInvoke <| fun() ->
+                if not panel.IsDisposed && generation = Threading.Volatile.Read(&populationGeneration) then
+                    model.Nodes.Clear()
+                    // Sort by category number first (0 = unset first, then 1-5), then by name
+                    allProcNodes.sortBy(fun n -> (n.categoryNumber, n.Text)).iter <| fun node -> model.Nodes.Add(node)
+#if DEBUG
+                    timing |> Option.iter(fun run ->
+                        run.Mark(sprintf "programs-ready:nodes=%d" model.Nodes.Count)
+                        tree.Update()
+                        run.Mark("programs-painted")
+                        run.Flush())
+#endif
+
+    interface ISettingsView with
+        member x.key = SettingsViewType.ProgramSettings
+        member x.title = Localization.getString "Programs"
+        member x.control = panel :> Control

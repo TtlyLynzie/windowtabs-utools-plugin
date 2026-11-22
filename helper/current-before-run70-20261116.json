@@ -1,0 +1,26 @@
+{
+  "version": "ss_2026.11.11",
+  "buildId": "ss_2026.11.11-upstream-integrated-v12",
+  "sourceTag": "ss_2026.11.11",
+  "path": "ss_2026.11.11-upstream-integrated-v12/WindowTabs.exe",
+  "protocol": 1,
+  "ipc": true,
+  "supportsIpc": true,
+  "contractVersion": 1,
+  "capabilities": ["integrated-settings-v1"],
+  "schemaSha256": "41c0daaf0025082e6b7d4f98fc2adc5ff159acd794a16aaa2b95a565a6f6383c",
+  "patchId": "upstream-integrated-v12",
+  "source": "https://github.com/standard-software/WindowTabs/releases/tag/ss_2026.11.11",
+  "sourceCommit": "eca928100890e6d1a0bc601b0092c937e09148ee",
+  "sha256": "d6caa9ddd512028f1ac935458c73286129bb02ecae094a39e97a79f55e69fa93",
+  "updatePolicy": "disabled-runtime-download",
+  "runtimeVerification": {
+    "passed": true,
+    "suite": "integrated-settings-v1",
+    "buildId": "ss_2026.11.11-upstream-integrated-v12",
+    "sha256": "d6caa9ddd512028f1ac935458c73286129bb02ecae094a39e97a79f55e69fa93",
+    "schemaSha256": "41c0daaf0025082e6b7d4f98fc2adc5ff159acd794a16aaa2b95a565a6f6383c",
+    "updaterDisabled": false,
+    "testedAt": "2026-11-14T09:04:21.721Z"
+  }
+}

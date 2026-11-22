@@ -1,9 +1,10 @@
 import assert from "node:assert/strict";
 import { createRequire } from "node:module";
 import { readFileSync } from "node:fs";
-import { resolve } from "node:path";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 
-const root = resolve(decodeURIComponent(new URL("..", import.meta.url).pathname));
+const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const html = readFileSync(resolve(root, "index.html"), "utf8");
 const renderer = readFileSync(resolve(root, "renderer.js"), "utf8");
 const preload = readFileSync(resolve(root, "preload.js"), "utf8");

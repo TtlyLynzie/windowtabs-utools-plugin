@@ -22,7 +22,8 @@ node "$ROOT_DIR/scripts/validate-helper.mjs" "$ROOT_DIR"
 
 cp "$ROOT_DIR/plugin.json" "$ROOT_DIR/index.html" "$ROOT_DIR/renderer.js" \
   "$ROOT_DIR/styles.css" "$ROOT_DIR/preload.js" "$ROOT_DIR/logo.png" \
-  "$ROOT_DIR/settings-model.js" "$ROOT_DIR/settings-schema.json" "$STAGE_DIR/"
+  "$ROOT_DIR/settings-model.js" "$ROOT_DIR/settings-schema.json" \
+  "$ROOT_DIR/lifecycle-state.js" "$ROOT_DIR/settings-storage.js" "$STAGE_DIR/"
 
 mkdir -p "$STAGE_DIR/LICENSES"
 cp "$ROOT_DIR/LICENSES/WindowTabs-MIT.txt" "$STAGE_DIR/LICENSES/"
@@ -30,7 +31,7 @@ cat > "$STAGE_DIR/UPSTREAM-NOTICE.txt" <<'EOF'
 WindowTabs
 Copyright (c) 2018 Maurice Flanagan
 MIT License: LICENSES/WindowTabs-MIT.txt
-Upstream base: standard-software/WindowTabs ss_2026.11.11
+Upstream base: standard-software/WindowTabs ss_2026.11.22
 This helper is rebuilt from the pinned upstream source plus the audited IPC
 and updater-disable patches. Runtime update checks and downloads are disabled.
 EOF

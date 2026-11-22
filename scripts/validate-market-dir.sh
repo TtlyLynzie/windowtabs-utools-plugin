@@ -9,6 +9,8 @@ test -f "$ROOT_DIR/renderer.js"
 test -f "$ROOT_DIR/styles.css"
 test -f "$ROOT_DIR/logo.png"
 test -f "$ROOT_DIR/settings-model.js"
+test -f "$ROOT_DIR/lifecycle-state.js"
+test -f "$ROOT_DIR/settings-storage.js"
 test -f "$ROOT_DIR/settings-schema.json"
 test -f "$ROOT_DIR/helper/current.json"
 test -f "$ROOT_DIR/LICENSES/WindowTabs-MIT.txt"
@@ -27,7 +29,7 @@ for forbidden in README.md native patches build scripts tests dev; do
 done
 for entry in "$ROOT_DIR"/*; do
   case "$(basename "$entry")" in
-    plugin.json|index.html|preload.js|renderer.js|styles.css|logo.png|settings-model.js|settings-schema.json|helper|LICENSES|UPSTREAM-NOTICE.txt) ;;
+    plugin.json|index.html|preload.js|renderer.js|styles.css|logo.png|settings-model.js|settings-schema.json|lifecycle-state.js|settings-storage.js|helper|LICENSES|UPSTREAM-NOTICE.txt) ;;
     *) echo "Unexpected marketplace entry: $entry" >&2; exit 1 ;;
   esac
 done
