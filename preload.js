@@ -381,6 +381,7 @@ class HelperManager {
     this.child = null;
     this.helperManifest = null;
     this.helperVerified = false;
+    this.helperCopySuppressed = false;
     this.startPromise = null;
     this.stopPromise = null;
     this.restartPromise = null;
@@ -482,6 +483,10 @@ class HelperManager {
       if (sameVersion(localManifest, bundledManifest) && fileExists(localPath)) {
         this.helperManifest = localManifest;
         return localPath;
+      }
+      if (this.helperCopySuppressed) {
+        this.helperManifest = bundledManifest;
+        return bundledPath;
       }
       try {
         const versionDir = path.basename(path.dirname(bundledPath));
@@ -647,6 +652,7 @@ class HelperManager {
     if (!this.isNativePlatform()) {
       throw makeError("UNSUPPORTED_PLATFORM", "WindowTabs 原生核心仅支持 Windows");
     }
+    this.helperCopySuppressed = false;
     // Remove stale plugin-local helper files left by a crash or an interrupted
     // uninstall. Never touch the bundled helper or another installation.
     await this.cleanupManagedFiles({ onlyIfStopped: true });
@@ -1035,6 +1041,7 @@ class HelperManager {
     if (!cleanup.helperFilesRemoved) {
       throw cleanup.error || makeError("HELPER_CLEANUP_FAILED", "WindowTabs helper 未能清理", cleanup);
     }
+    this.helperCopySuppressed = true;
     return { stopped: !stopError, ...cleanup };
   }
 
