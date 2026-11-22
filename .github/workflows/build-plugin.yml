@@ -6,7 +6,7 @@ on:
       core_tag:
         description: WindowTabs Git tag to build
         required: true
-        default: ss_2026.11.11
+        default: ss_2026.11.22
   push:
     paths:
       - '.gitattributes'
@@ -37,7 +37,7 @@ jobs:
   build:
     runs-on: windows-latest
     env:
-      CORE_TAG: ${{ github.event.inputs.core_tag || 'ss_2026.11.11' }}
+      CORE_TAG: ${{ github.event.inputs.core_tag || 'ss_2026.11.22' }}
 
     steps:
       - name: Checkout plugin
