@@ -5,7 +5,7 @@ const path = require("path");
 const os = require("os");
 const net = require("net");
 const crypto = require("crypto");
-const { spawn } = require("child_process");
+const { spawn, spawnSync } = require("child_process");
 const { LifecycleState } = require("./lifecycle-state.js");
 const { prepareSettingsPath } = require("./settings-storage.js");
 
@@ -21,6 +21,7 @@ const PLUGIN_VERSION = "1.0.6";
 const MAX_PARAMS_BYTES = 256 * 1024;
 const MAX_PARAM_DEPTH = 8;
 const MAX_PARAM_ARRAY_ITEMS = 2000;
+const MANAGED_PROCESS_OWNER = "windowtabs-utools-plugin";
 
 function makeError(code, message, details) {
   const error = new Error(message);
@@ -77,6 +78,26 @@ function readJson(filePath, fallback = null) {
     const text = fs.readFileSync(filePath, "utf8").replace(/^\uFEFF/, "");
     return JSON.parse(text);
   } catch (_) { return fallback; }
+}
+
+function getManagedProcessPath() {
+  return path.join(getPluginDataPath(), "managed-windowtabs.json");
+}
+
+function readManagedProcess() {
+  const record = readJson(getManagedProcessPath());
+  return record && record.owner === MANAGED_PROCESS_OWNER ? record : null;
+}
+
+function writeManagedProcess(record) {
+  writeJsonAtomic(getManagedProcessPath(), { ...record, owner: MANAGED_PROCESS_OWNER });
+}
+
+function clearManagedProcess(expectedPid = null) {
+  const record = readManagedProcess();
+  if (!record || expectedPid === null || Number(record.pid) === Number(expectedPid)) {
+    try { fs.rmSync(getManagedProcessPath(), { force: true }); } catch (_) {}
+  }
 }
 
 function invalidParams(message, details) {
@@ -401,21 +422,21 @@ class HelperManager {
     return true;
   }
 
-  findExistingProcessPid() {
-    if (process.platform !== NATIVE_PLATFORM) return Promise.resolve(null);
-    return new Promise((resolve) => {
-      const tasklist = spawn("tasklist", ["/FI", "IMAGENAME eq WindowTabs.exe", "/FO", "CSV", "/NH"], {
-        windowsHide: true,
-        stdio: ["ignore", "pipe", "ignore"]
-      });
-      let output = "";
-      tasklist.stdout?.on("data", (chunk) => { output += chunk; });
-      tasklist.once("error", () => resolve(null));
-      tasklist.once("exit", () => {
-        const match = output.match(/"WindowTabs\.exe"\s*,\s*"(\d+)"/i);
-        resolve(match ? Number(match[1]) : null);
-      });
-    });
+  getManagedRecord() {
+    const record = readManagedProcess();
+    if (!record || !Number.isInteger(Number(record.pid)) || Number(record.pid) <= 0) return null;
+    if (record.pipeName !== this.pipeName) return null;
+    return record;
+  }
+
+  async getManagedPid() {
+    const record = this.getManagedRecord();
+    if (!record) return null;
+    if (!(await this.isProcessRunning(Number(record.pid)))) {
+      clearManagedProcess(Number(record.pid));
+      return null;
+    }
+    return Number(record.pid);
   }
 
   resolveHelper() {
@@ -535,7 +556,7 @@ class HelperManager {
             error: null
           });
         } else {
-          const existingPid = await this.findExistingProcessPid();
+          const existingPid = await this.getManagedPid();
           if (existingPid && helperPath && this.helperManifest?.supportsIpc !== true) {
             this.setState("LEGACY_RUNNING", {
               message: "检测到旧版 WindowTabs，准备切换到插件核心",
@@ -613,6 +634,9 @@ class HelperManager {
     if (!this.isNativePlatform()) {
       throw makeError("UNSUPPORTED_PLATFORM", "WindowTabs 原生核心仅支持 Windows");
     }
+    // Remove a stale ownership record left by a crash or an interrupted
+    // uninstall before deciding whether a process is already running.
+    await this.getManagedPid();
     const current = await this.getStatus();
     if (current.state === "READY") {
       const bundled = readJson(path.join(PLUGIN_ROOT, "helper", "current.json"));
@@ -639,7 +663,14 @@ class HelperManager {
     this.setState("STARTING", { message: "正在启动 WindowTabs", error: null });
     try {
       const settingsPath = prepareSettingsPath(getPluginDataPath(), process.env.APPDATA);
-      const helperArgs = [`--windowtabs-ipc-pipe=${this.pipeName}`, `--windowtabs-settings=${settingsPath}`];
+      const startToken = crypto.randomBytes(16).toString("hex");
+      const parentPid = process.pid;
+      const helperArgs = [
+        `--windowtabs-ipc-pipe=${this.pipeName}`,
+        `--windowtabs-settings=${settingsPath}`,
+        `--windowtabs-parent-pid=${parentPid}`,
+        `--windowtabs-start-token=${startToken}`
+      ];
       const command = helperPath.toLowerCase().endsWith(".js") ? process.execPath : helperPath;
       const commandArgs = helperPath.toLowerCase().endsWith(".js")
         ? [helperPath, ...helperArgs]
@@ -650,12 +681,22 @@ class HelperManager {
         windowsHide: true,
         stdio: ["ignore", "pipe", "pipe"]
       });
+      writeManagedProcess({
+        pid: this.child.pid,
+        parentPid,
+        startToken,
+        pipeName: this.pipeName,
+        helperPath: path.resolve(helperPath),
+        helperSha256: this.helperManifest?.sha256 || null,
+        startedAt: new Date().toISOString()
+      });
       this.child.stdout?.on("data", (chunk) => this.appendLog(chunk));
       this.child.stderr?.on("data", (chunk) => this.appendLog(chunk));
       this.child.on("error", (error) => {
         this.setState("DEGRADED", { message: "WindowTabs 启动失败", error: makeError("CORE_START_FAILED", error.message) });
       });
       this.child.on("exit", (code, signal) => {
+        clearManagedProcess(this.child?.pid || null);
         this.child = null;
         if (this.state !== "STOPPING") {
           this.setState("DEGRADED", { message: `WindowTabs 已退出（code=${code ?? "-"}, signal=${signal ?? "-"}）`, error: makeError("CORE_CRASHED", "WindowTabs 核心已退出") });
@@ -730,6 +771,16 @@ class HelperManager {
     });
   }
 
+  terminateProcessByPidSync(pid) {
+    if (!pid || process.platform !== NATIVE_PLATFORM) return false;
+    const result = spawnSync("taskkill", ["/PID", String(pid), "/T", "/F"], {
+      windowsHide: true,
+      stdio: "ignore",
+      timeout: STOP_TIMEOUT_MS
+    });
+    return !result.error && (result.status === 0 || result.status === 128);
+  }
+
   isProcessRunning(pid) {
     if (!pid || process.platform !== NATIVE_PLATFORM) return Promise.resolve(false);
     return new Promise((resolve) => {
@@ -764,6 +815,8 @@ class HelperManager {
 
   async stopInternal() {
     const current = await this.getStatus();
+    const managed = this.getManagedRecord();
+    const managedPid = managed ? Number(managed.pid) : null;
     if (current.state === "LEGACY_RUNNING") {
       this.setState("STOPPING", { message: "正在停止 WindowTabs", error: null });
       const child = this.child;
@@ -773,13 +826,16 @@ class HelperManager {
           if (!(await this.waitForChildExit(child))) {
             throw makeError("CORE_STOP_TIMEOUT", "WindowTabs 进程未在规定时间内退出");
           }
-        } else if (current.pid) {
-          if (!(await this.terminateProcessByPid(current.pid))) {
-            throw makeError("CORE_STOP_TIMEOUT", "旧版 WindowTabs 进程未在规定时间内退出");
+        } else if (managedPid) {
+          if (!(await this.terminateProcessByPid(managedPid)) || !(await this.waitForProcessExit(managedPid))) {
+            throw makeError("CORE_STOP_TIMEOUT", "由插件托管的旧版 WindowTabs 进程未在规定时间内退出");
           }
+        } else if (current.pid && !(await this.waitForProcessExit(current.pid, 300))) {
+          throw makeError("CORE_EXTERNAL_PROCESS", "检测到非插件托管的 WindowTabs，未终止该进程");
         }
         this.pipe.close();
         this.child = null;
+        clearManagedProcess(managedPid);
         this.setState("INSTALLED_STOPPED", { message: "WindowTabs 已停止", pid: null, groupCount: 0, error: null });
         return this.lastStatus;
       } catch (error) {
@@ -797,15 +853,27 @@ class HelperManager {
       await this.pipe.request("shutdown", {}, STOP_TIMEOUT_MS);
       this.pipe.close();
       if (child && !(await this.waitForChildExit(child))) {
-        throw makeError("CORE_STOP_TIMEOUT", "WindowTabs 进程未在规定时间内退出");
+        if (!managedPid || !(await this.terminateProcessByPid(managedPid)) || !(await this.waitForProcessExit(managedPid))) {
+          throw makeError("CORE_STOP_TIMEOUT", "WindowTabs 进程未在规定时间内退出");
+        }
       }
       if (!child && current.pid && !(await this.waitForProcessExit(current.pid))) {
-        throw makeError("CORE_STOP_TIMEOUT", "WindowTabs 进程未在规定时间内退出");
+        if (!managedPid || !(await this.terminateProcessByPid(managedPid)) || !(await this.waitForProcessExit(managedPid))) {
+          throw makeError("CORE_STOP_TIMEOUT", "WindowTabs 进程未在规定时间内退出");
+        }
       }
       this.child = null;
+      clearManagedProcess(managedPid);
       this.setState("INSTALLED_STOPPED", { message: "WindowTabs 已停止", pid: null, groupCount: 0, error: null });
       return this.lastStatus;
     } catch (error) {
+      if (managedPid && await this.terminateProcessByPid(managedPid) && await this.waitForProcessExit(managedPid)) {
+        this.pipe.close();
+        this.child = null;
+        clearManagedProcess(managedPid);
+        this.setState("INSTALLED_STOPPED", { message: "WindowTabs 已停止", pid: null, groupCount: 0, error: null });
+        return this.lastStatus;
+      }
       this.setState("DEGRADED", { message: "WindowTabs 停止失败", error });
       throw error;
     }
@@ -874,6 +942,7 @@ class HelperManager {
 
   async getDiagnostics() {
     const helperPath = this.resolveHelper();
+    const managedProcess = this.getManagedRecord();
     const bundledManifest = readJson(path.join(PLUGIN_ROOT, "helper", "current.json"));
     return {
       pluginVersion: PLUGIN_VERSION,
@@ -894,6 +963,13 @@ class HelperManager {
       legacyResponseIdCount: this.pipe.legacyResponseIdCount,
       childPid: this.child?.pid || null,
       childAlive: this.isChildAlive(),
+      managedProcess: managedProcess ? {
+        pid: Number(managedProcess.pid),
+        parentPid: Number(managedProcess.parentPid) || null,
+        startToken: managedProcess.startToken || null,
+        helperPath: managedProcess.helperPath || null,
+        startedAt: managedProcess.startedAt || null
+      } : null,
       recentLogs: this.logLines.slice(-30),
       platform: process.platform,
       arch: process.arch,
@@ -909,17 +985,62 @@ class HelperManager {
     this.pipe.close();
   }
 
+  async prepareUninstall() {
+    await this.stop();
+    clearManagedProcess();
+    const localHelperRoot = path.join(getPluginDataPath(), "helper");
+    fs.rmSync(localHelperRoot, { recursive: true, force: true });
+    return { stopped: true, helperFilesRemoved: true };
+  }
+
   async onPluginEnter(code) {
     this.pluginActive = true;
     if (code === "windowtabs-settings") this.emit("navigate", { page: "general" });
     return await this.start();
   }
 
-  onPluginOut() {
+  onPluginOut(isKill) {
     this.pluginActive = false;
-    // The uTools panel closing is not a request to stop the background helper.
-    // Closing this renderer's pipe lets the next panel entry reconnect cleanly.
-    this.dispose();
+    if (!isKill) {
+      // Hiding the plugin keeps its helper running; the next entry reconnects.
+      this.dispose();
+      return;
+    }
+    // This callback is synchronous in uTools. Start the asynchronous graceful
+    // shutdown immediately; the helper's parent monitor is the final safety
+    // net if uTools tears down this plugin process before the promise settles.
+    void this.stopForKill();
+  }
+
+  async stopForKill() {
+    const record = this.getManagedRecord();
+    const pid = record ? Number(record.pid) : null;
+    try {
+      if (this.pipe.isConnected()) {
+        await this.pipe.request("shutdown", {}, STOP_TIMEOUT_MS);
+        this.pipe.close();
+        if (pid && !(await this.waitForProcessExit(pid))) {
+          if (!this.terminateProcessByPidSync(pid) || !(await this.waitForProcessExit(pid))) throw makeError("CORE_STOP_FAILED", "WindowTabs 进程未退出");
+        }
+      } else if (pid) {
+        if (!this.terminateProcessByPidSync(pid) || !(await this.waitForProcessExit(pid))) throw makeError("CORE_STOP_FAILED", "由插件托管的 WindowTabs 进程未退出");
+      }
+      clearManagedProcess(pid);
+      this.child = null;
+      this.setState("INSTALLED_STOPPED", { message: "WindowTabs 已停止", pid: null, groupCount: 0, error: null });
+    } catch (error) {
+      // IPC can be interrupted when uTools begins tearing down the plugin.
+      // Only the persisted, plugin-owned PID may be used for the fallback.
+      if (pid && this.terminateProcessByPidSync(pid) && await this.waitForProcessExit(pid)) {
+        clearManagedProcess(pid);
+        this.pipe.close();
+        this.child = null;
+        this.setState("INSTALLED_STOPPED", { message: "WindowTabs 已停止", pid: null, groupCount: 0, error: null });
+        return;
+      }
+      this.pipe.close();
+      this.setState("DEGRADED", { message: "WindowTabs 停止失败", pid, error });
+    }
   }
 }
 
@@ -943,6 +1064,7 @@ function expose() {
     getStatus: () => manager.getStatus(),
     start: () => manager.start(),
     stop: () => manager.stop(),
+    prepareUninstall: () => manager.prepareUninstall(),
     restart: () => manager.restart(),
     openSettings: () => manager.openSettings(),
     getConfig: () => manager.getConfig(),
@@ -965,6 +1087,8 @@ if (global.utools && typeof utools.onPluginEnter === "function") {
 }
 
 if (global.utools && typeof utools.onPluginOut === "function") {
-  utools.onPluginOut(() => manager.onPluginOut());
+  utools.onPluginOut((isKill) => {
+    manager.onPluginOut(isKill);
+  });
 }
 
