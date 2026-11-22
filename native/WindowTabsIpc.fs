@@ -45,6 +45,19 @@ module WindowTabsIpc =
                 | _ -> None
             else None)
 
+    let cleanupPathArgument (argv: string array) =
+        argv
+        |> Array.tryPick(fun arg ->
+            let prefix = "--windowtabs-cleanup-path="
+            if arg.StartsWith(prefix, StringComparison.OrdinalIgnoreCase) then
+                let value = arg.Substring(prefix.Length)
+                let normalized = Path.GetFullPath(value)
+                let lower = normalized.ToLowerInvariant()
+                if normalized.EndsWith(Path.DirectorySeparatorChar + "helper", StringComparison.OrdinalIgnoreCase) &&
+                   lower.Contains("\\utools\\local-data\\plugins\\") then Some normalized
+                else None
+            else None)
+
     let private exposedSettings =
         [| "IncludedPaths"; "ExcludedPaths"; "AutoGroupingPaths"
            "HideInactiveTabs"; "GroupTaskbarButtons"; "EnableTabbingByDefault"
@@ -197,13 +210,29 @@ module WindowTabsIpc =
               // arbitrary file path over IPC.
               success (makeObject([| JProperty("lines", JArray()) |]))
           | _ -> invalidArg "method" (sprintf "Unsupported IPC method: %s" methodName)
-    type Server(pipeName: string, coreVersion: string, parentPid: int option, log: string -> unit) =
+    type Server(pipeName: string, coreVersion: string, parentPid: int option, cleanupPath: string option, log: string -> unit) =
         let owner = InvokerService.invoker
         let controller = IntegratedSettings.Controller(owner)
         let pipeName = normalizePipeName pipeName
         let cancellation = new CancellationTokenSource()
         let mutable task: Task = null
         let mutable parentMonitor: Task = null
+
+        let scheduleCleanup() =
+            match cleanupPath with
+            | Some target when Directory.Exists(target) ->
+                try
+                    let script = Path.Combine(Path.GetTempPath(), sprintf "windowtabs-cleanup-%d.cmd" (Process.GetCurrentProcess().Id))
+                    let escapedTarget = target.Replace("\"", "\"\"")
+                    let command = sprintf "/d /c timeout /t 3 /nobreak >nul & rmdir /s /q \"%s\" & del /q \"%s\"" escapedTarget script
+                    File.WriteAllText(script, "@echo off\r\n")
+                    let info = ProcessStartInfo("cmd.exe", command)
+                    info.CreateNoWindow <- true
+                    info.UseShellExecute <- false
+                    info.WindowStyle <- ProcessWindowStyle.Hidden
+                    Process.Start(info) |> ignore
+                with ex -> log (sprintf "Helper cleanup worker could not start: %O" ex)
+            | _ -> ()
 
         let handleClient (pipe: NamedPipeServerStream) =
             use reader = new StreamReader(pipe, utf8NoBom, false, 65536, true)
@@ -260,11 +289,13 @@ module WindowTabsIpc =
                             try
                                 use parent = Process.GetProcessById(pid)
                                 if parent.HasExited then
+                                    scheduleCleanup()
                                     Services.program.shutdown()
                                     cancellation.Cancel()
                                     raise (OperationCanceledException())
                             with
                             | :? ArgumentException ->
+                                scheduleCleanup()
                                 Services.program.shutdown()
                                 cancellation.Cancel()
                                 raise (OperationCanceledException())
@@ -295,6 +326,6 @@ module WindowTabsIpc =
         match pipeArgument argv with
         | None -> None
         | Some pipe ->
-            let server = Server(pipe, coreVersion, parentPidArgument argv, fun message -> Debug.WriteLine(message))
+            let server = Server(pipe, coreVersion, parentPidArgument argv, cleanupPathArgument argv, fun message -> Debug.WriteLine(message))
             server.Start()
             Some server
