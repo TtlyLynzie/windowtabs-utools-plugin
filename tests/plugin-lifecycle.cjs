@@ -16,12 +16,70 @@ async function test(root) {
   const manager = sandbox.module.exports;
   const calls = [];
   manager.dispose = () => { calls.push("dispose"); };
+  manager.cleanupManagedFiles = () => { calls.push("cleanupManagedFiles"); };
   manager.stopForKill = () => { calls.push("stopForKill"); return Promise.resolve(); };
   onOut(false);
   onOut(true);
   assert.deepEqual(calls, ["dispose", "stopForKill"]);
   assert.equal(manager.lastStatus.state, "INSTALLED_STOPPED");
   assert.equal(manager.exitPromise, undefined);
+}
+
+async function testStopKeepsHelperFiles(root) {
+  const dataRoot = fs.mkdtempSync(path.join(os.tmpdir(), "windowtabs-plugin-stop-"));
+  const helperRoot = path.join(dataRoot, "helper");
+  fs.mkdirSync(helperRoot);
+  fs.writeFileSync(path.join(helperRoot, "WindowTabs.exe"), "fixture");
+  fs.writeFileSync(path.join(dataRoot, "managed-windowtabs.json"), JSON.stringify({
+    owner: "windowtabs-utools-plugin", pid: 2468
+  }));
+  const filename = path.join(root, "preload.js");
+  const utools = { getPluginLocalDataPath: () => dataRoot };
+  const sandbox = { require: createRequire(filename), __dirname: root, process, Buffer,
+    setTimeout, clearTimeout, console, window: {}, global: { utools }, utools, module: { exports: {} } };
+  try {
+    vm.runInNewContext(fs.readFileSync(filename, "utf8") + "\nmodule.exports = manager;", sandbox, { filename });
+    const manager = sandbox.module.exports;
+    manager.getManagedRecord = () => ({ pid: 2468 });
+    manager.pipe.isConnected = () => false;
+    manager.terminateProcessByPidSync = pid => pid === 2468;
+    manager.waitForProcessExit = async pid => pid === 2468;
+    await manager.stopForKill();
+    assert.equal(fs.existsSync(path.join(helperRoot, "WindowTabs.exe")), true);
+    assert.equal(fs.existsSync(path.join(dataRoot, "managed-windowtabs.json")), false);
+    assert.equal(manager.lastStatus.state, "INSTALLED_STOPPED");
+  } finally {
+    fs.rmSync(dataRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+  }
+}
+
+async function testPrepareUninstallRemovesHelper(root) {
+  const dataRoot = fs.mkdtempSync(path.join(os.tmpdir(), "windowtabs-plugin-uninstall-"));
+  const helperRoot = path.join(dataRoot, "helper");
+  fs.mkdirSync(helperRoot);
+  fs.writeFileSync(path.join(helperRoot, "WindowTabs.exe"), "fixture");
+  const filename = path.join(root, "preload.js");
+  const utools = { getPluginLocalDataPath: () => dataRoot };
+  const sandbox = { require: createRequire(filename), __dirname: root, process, Buffer,
+    setTimeout, clearTimeout, console, window: {}, global: { utools }, utools, module: { exports: {} } };
+  try {
+    vm.runInNewContext(fs.readFileSync(filename, "utf8") + "\nmodule.exports = manager;", sandbox, { filename });
+    const manager = sandbox.module.exports;
+    manager.stop = async () => ({ state: "INSTALLED_STOPPED" });
+    manager.getManagedRecord = () => null;
+    const result = await manager.prepareUninstall();
+    assert.equal(result.helperFilesRemoved, true);
+    assert.equal(fs.existsSync(helperRoot), false);
+  } finally {
+    fs.rmSync(dataRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+  }
+}
+
+function testParentExitOnlyStopsCore(root) {
+  const source = fs.readFileSync(path.join(root, "native", "WindowTabsIpc.fs"), "utf8");
+  assert.match(source, /if parent\.HasExited then\s+Services\.program\.shutdown\(\)/);
+  assert.match(source, /\| :\? ArgumentException ->\s+Services\.program\.shutdown\(\)/);
+  assert.doesNotMatch(source, /scheduleCleanup|cleanupPathArgument|rmdir \/s|cmd\.exe/);
 }
 
 async function testDoesNotKillExternalPid(root) {
@@ -126,8 +184,11 @@ async function testHelperUpgradeAndRollback() {
 (async () => {
   const root = path.resolve(__dirname, "..");
   await test(root);
+  await testStopKeepsHelperFiles(root);
+  await testPrepareUninstallRemovesHelper(root);
+  testParentExitOnlyStopsCore(root);
   await testDoesNotKillExternalPid(root);
   await testCleanupScope(root);
   await testHelperUpgradeAndRollback();
-  console.log("plugin lifecycle and helper upgrade/rollback tests passed");
+  console.log("plugin lifecycle, cleanup separation, and helper version tests passed");
 })().catch(error => { console.error(error); process.exitCode = 1; });
