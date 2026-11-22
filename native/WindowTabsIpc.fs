@@ -141,7 +141,7 @@ module WindowTabsIpc =
           | "hello" ->
               success (makeObject([| JProperty("coreVersion", coreVersion);
                                  JProperty("protocolVersion", protocolVersion);
-                                 JProperty("buildId", coreVersion + "-upstream-integrated-v12");
+                                 JProperty("buildId", coreVersion + "-upstream-integrated-v13");
                                  JProperty("pid", Process.GetCurrentProcess().Id);
                                  JProperty("groupCount", 0);
                                  JProperty("capabilities", JArray([| JValue("status") :> JToken; JValue("config") :> JToken; JValue("integrated-settings-v1") :> JToken |]));
@@ -179,12 +179,13 @@ module WindowTabsIpc =
               // arbitrary file path over IPC.
               success (makeObject([| JProperty("lines", JArray()) |]))
           | _ -> invalidArg "method" (sprintf "Unsupported IPC method: %s" methodName)
-    type Server(pipeName: string, coreVersion: string, log: string -> unit) =
+    type Server(pipeName: string, coreVersion: string, parentPid: int option, log: string -> unit) =
         let owner = InvokerService.invoker
         let controller = IntegratedSettings.Controller(owner)
         let pipeName = normalizePipeName pipeName
         let cancellation = new CancellationTokenSource()
         let mutable task: Task = null
+        let mutable parentMonitor: Task = null
 
         let handleClient (pipe: NamedPipeServerStream) =
             use reader = new StreamReader(pipe, utf8NoBom, false, 65536, true)
@@ -233,6 +234,29 @@ module WindowTabsIpc =
             if isNull task then
                 task <- Task.Factory.StartNew((fun () -> listen()), cancellation.Token,
                                               TaskCreationOptions.LongRunning, TaskScheduler.Default)
+            match parentPid with
+            | Some pid when pid > 0 ->
+                parentMonitor <- Task.Factory.StartNew((fun () ->
+                    try
+                        while not cancellation.IsCancellationRequested do
+                            try
+                                use parent = Process.GetProcessById(pid)
+                                if parent.HasExited then
+                                    Services.program.shutdown()
+                                    cancellation.Cancel()
+                                    raise (OperationCanceledException())
+                            with
+                            | :? ArgumentException ->
+                                Services.program.shutdown()
+                                cancellation.Cancel()
+                                raise (OperationCanceledException())
+                            | :? InvalidOperationException -> ()
+                            Thread.Sleep(1000)
+                    with
+                    | :? OperationCanceledException -> ()
+                    | ex -> log (sprintf "Parent process monitor stopped: %O" ex)), cancellation.Token,
+                    TaskCreationOptions.LongRunning, TaskScheduler.Default)
+            | _ -> ()
 
         member _.Dispose() =
             cancellation.Cancel()
@@ -245,6 +269,8 @@ module WindowTabsIpc =
             with _ -> ()
             if not (isNull task) then
                 try task.Wait(1000) |> ignore with _ -> ()
+            if not (isNull parentMonitor) then
+                try parentMonitor.Wait(1000) |> ignore with _ -> ()
             cancellation.Dispose()
 
     let pipeArgument (argv: string array) =
@@ -255,10 +281,20 @@ module WindowTabsIpc =
                 Some(arg.Substring(prefix.Length))
             else None)
 
+    let parentPidArgument (argv: string array) =
+        argv
+        |> Array.tryPick(fun arg ->
+            let prefix = "--windowtabs-parent-pid="
+            if arg.StartsWith(prefix, StringComparison.OrdinalIgnoreCase) then
+                match Int32.TryParse(arg.Substring(prefix.Length)) with
+                | true, pid when pid > 0 -> Some pid
+                | _ -> None
+            else None)
+
     let start (argv: string array) (coreVersion: string) =
         match pipeArgument argv with
         | None -> None
         | Some pipe ->
-            let server = Server(pipe, coreVersion, fun message -> Debug.WriteLine(message))
+            let server = Server(pipe, coreVersion, parentPidArgument argv, fun message -> Debug.WriteLine(message))
             server.Start()
             Some server
