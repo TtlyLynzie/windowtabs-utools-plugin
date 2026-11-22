@@ -53,7 +53,7 @@ module WindowTabsIpc =
                 let value = arg.Substring(prefix.Length)
                 let normalized = Path.GetFullPath(value)
                 let lower = normalized.ToLowerInvariant()
-                if normalized.EndsWith(Path.DirectorySeparatorChar + "helper", StringComparison.OrdinalIgnoreCase) &&
+                if normalized.EndsWith(Path.DirectorySeparatorChar.ToString() + "helper", StringComparison.OrdinalIgnoreCase) &&
                    lower.Contains("\\utools\\local-data\\plugins\\") then Some normalized
                 else None
             else None)
