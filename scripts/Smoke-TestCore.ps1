@@ -128,8 +128,8 @@ finally {
   if ($parentPidProcess -and -not $parentPidProcess.HasExited) {
     Stop-Process -Id $parentPidProcess.Id -Force -ErrorAction SilentlyContinue
   }
-  if ($parentPipe) { $parentPipe.Dispose() }
-  if ($parentReader) { $parentReader.Dispose() }
-  if ($parentWriter) { $parentWriter.Dispose() }
+  if ($parentReader) { try { $parentReader.Dispose() } catch {} }
+  if ($parentWriter) { try { $parentWriter.Dispose() } catch {} }
+  if ($parentPipe) { try { $parentPipe.Dispose() } catch {} }
   if (Test-Path $parentTestRoot) { Remove-Item $parentTestRoot -Recurse -Force -ErrorAction SilentlyContinue }
 }
