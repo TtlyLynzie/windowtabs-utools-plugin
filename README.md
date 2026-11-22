@@ -21,12 +21,12 @@ windowtabs-utools-plugin/
 
 ## 接入原生核心
 
-当前目标核心为 WindowTabs 官方 release `ss_2026.11.11`：
+当前目标核心为 WindowTabs 官方 release `ss_2026.11.22`：
 
 ```text
 windowtabs-utools-plugin/helper/
 ├─ current.json
-└─ ss_2026.11.11-upstream-integrated-v12/
+└─ ss_2026.11.22-upstream-integrated-v13/
    ├─ WindowTabs.exe
    ├─ WindowTabs.exe.config
    └─ Settings/
