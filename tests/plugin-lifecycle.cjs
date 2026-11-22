@@ -75,6 +75,52 @@ async function testPrepareUninstallRemovesHelper(root) {
   }
 }
 
+async function testStatusRefreshDoesNotRecreateCleanedHelper() {
+  const pluginRoot = fs.mkdtempSync(path.join(os.tmpdir(), "windowtabs-plugin-cleanup-bundle-"));
+  const dataRoot = fs.mkdtempSync(path.join(os.tmpdir(), "windowtabs-plugin-cleanup-data-"));
+  const bundledRoot = path.join(pluginRoot, "helper");
+  const buildId = "ss_2026.11.22-upstream-integrated-v15";
+  const bundledVersionRoot = path.join(bundledRoot, buildId);
+  fs.mkdirSync(bundledVersionRoot, { recursive: true });
+  for (const name of ["preload.js", "lifecycle-state.js", "settings-storage.js"]) {
+    fs.copyFileSync(path.join(__dirname, "..", name), path.join(pluginRoot, name));
+  }
+  const bundledExe = path.join(bundledVersionRoot, "WindowTabs.exe");
+  fs.writeFileSync(bundledExe, "bundled helper fixture");
+  const digest = require("crypto").createHash("sha256").update(fs.readFileSync(bundledExe)).digest("hex");
+  fs.writeFileSync(path.join(bundledRoot, "current.json"), JSON.stringify({
+    version: "ss_2026.11.22", buildId, path: `${buildId}/WindowTabs.exe`, sha256: digest
+  }));
+
+  const fakeProcess = { platform: "win32", env: process.env, pid: process.pid };
+  const filename = path.join(pluginRoot, "preload.js");
+  const utools = { getPluginLocalDataPath: () => dataRoot };
+  const sandbox = { require: createRequire(filename), __dirname: pluginRoot, process: fakeProcess, Buffer,
+    setTimeout, clearTimeout, console, window: {}, global: { utools }, utools, module: { exports: {} } };
+  try {
+    vm.runInNewContext(fs.readFileSync(filename, "utf8") + "\nmodule.exports = manager;", sandbox, { filename });
+    const manager = sandbox.module.exports;
+
+    const firstResolvedPath = manager.resolveHelper();
+    assert.equal(fs.existsSync(firstResolvedPath), true);
+    assert.equal(fs.existsSync(path.join(dataRoot, "helper")), true);
+
+    manager.stop = async () => ({ state: "INSTALLED_STOPPED" });
+    manager.getManagedRecord = () => null;
+    const cleanup = await manager.prepareUninstall();
+    assert.equal(cleanup.helperFilesRemoved, true);
+    assert.equal(fs.existsSync(path.join(dataRoot, "helper")), false);
+
+    manager.pipe.request = async () => { throw Object.assign(new Error("pipe closed"), { code: "PIPE_UNAVAILABLE" }); };
+    const status = await manager.getStatus();
+    assert.equal(status.state, "INSTALLED_STOPPED");
+    assert.equal(fs.existsSync(path.join(dataRoot, "helper")), false);
+  } finally {
+    fs.rmSync(pluginRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+    fs.rmSync(dataRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+  }
+}
+
 function testParentExitOnlyStopsCore(root) {
   const source = fs.readFileSync(path.join(root, "native", "WindowTabsIpc.fs"), "utf8");
   assert.match(source, /if parent\.HasExited then\s+Services\.program\.shutdown\(\)/);
@@ -186,6 +232,7 @@ async function testHelperUpgradeAndRollback() {
   await test(root);
   await testStopKeepsHelperFiles(root);
   await testPrepareUninstallRemovesHelper(root);
+  await testStatusRefreshDoesNotRecreateCleanedHelper();
   testParentExitOnlyStopsCore(root);
   await testDoesNotKillExternalPid(root);
   await testCleanupScope(root);
