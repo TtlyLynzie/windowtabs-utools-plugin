@@ -1966,6 +1966,24 @@ index 0000000..384c066
 +    // Keep the pipe protocol BOM-free. Node.js JSON.parse rejects a leading BOM.
 +    let private utf8NoBom = UTF8Encoding(false)
 +
++    let pipeArgument (argv: string array) =
++        argv
++        |> Array.tryPick(fun arg ->
++            let prefix = "--windowtabs-ipc-pipe="
++            if arg.StartsWith(prefix, StringComparison.OrdinalIgnoreCase) then
++                Some(arg.Substring(prefix.Length))
++            else None)
++
++    let parentPidArgument (argv: string array) =
++        argv
++        |> Array.tryPick(fun arg ->
++            let prefix = "--windowtabs-parent-pid="
++            if arg.StartsWith(prefix, StringComparison.OrdinalIgnoreCase) then
++                match Int32.TryParse(arg.Substring(prefix.Length)) with
++                | true, pid when pid > 0 -> Some pid
++                | _ -> None
++            else None)
+
 +    let private exposedSettings =
 +        [| "IncludedPaths"; "ExcludedPaths"; "AutoGroupingPaths"
 +           "HideInactiveTabs"; "GroupTaskbarButtons"; "TaskbarActiveTabFirst"; "EnableTabbingByDefault"
@@ -2211,24 +2229,6 @@ index 0000000..384c066
 +            if not (isNull parentMonitor) then
 +                try parentMonitor.Wait(1000) |> ignore with _ -> ()
 +            cancellation.Dispose()
-+
-+    let pipeArgument (argv: string array) =
-+        argv
-+        |> Array.tryPick(fun arg ->
-+            let prefix = "--windowtabs-ipc-pipe="
-+            if arg.StartsWith(prefix, StringComparison.OrdinalIgnoreCase) then
-+                Some(arg.Substring(prefix.Length))
-+            else None)
-+
-+    let parentPidArgument (argv: string array) =
-+        argv
-+        |> Array.tryPick(fun arg ->
-+            let prefix = "--windowtabs-parent-pid="
-+            if arg.StartsWith(prefix, StringComparison.OrdinalIgnoreCase) then
-+                match Int32.TryParse(arg.Substring(prefix.Length)) with
-+                | true, pid when pid > 0 -> Some pid
-+                | _ -> None
-+            else None)
 +
 +    let start (argv: string array) (coreVersion: string) =
 +        match pipeArgument argv with
