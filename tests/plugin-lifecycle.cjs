@@ -63,10 +63,71 @@ async function testCleanupScope(root) {
   }
 }
 
+async function testHelperUpgradeAndRollback() {
+  const pluginRoot = fs.mkdtempSync(path.join(os.tmpdir(), "windowtabs-plugin-versions-"));
+  const dataRoot = fs.mkdtempSync(path.join(os.tmpdir(), "windowtabs-plugin-data-"));
+  const bundledRoot = path.join(pluginRoot, "helper");
+  const localRoot = path.join(dataRoot, "helper");
+  fs.mkdirSync(bundledRoot, { recursive: true });
+  for (const name of ["preload.js", "lifecycle-state.js", "settings-storage.js"]) {
+    fs.copyFileSync(path.join(__dirname, "..", name), path.join(pluginRoot, name));
+  }
+
+  const writeBundle = (buildId, content) => {
+    const versionDir = path.join(bundledRoot, buildId);
+    fs.mkdirSync(versionDir, { recursive: true });
+    fs.writeFileSync(path.join(versionDir, "WindowTabs.exe"), content);
+    fs.writeFileSync(path.join(bundledRoot, "current.json"), JSON.stringify({
+      version: buildId,
+      buildId,
+      path: `${buildId}/WindowTabs.exe`,
+      sha256: require("crypto").createHash("sha256").update(content).digest("hex")
+    }));
+  };
+
+  const fakeProcess = { platform: "win32", env: process.env, pid: process.pid };
+  const filename = path.join(pluginRoot, "preload.js");
+  const sandbox = {
+    require: createRequire(filename), __dirname: pluginRoot, process: fakeProcess, Buffer,
+    setTimeout, clearTimeout, console, window: {},
+    global: { utools: { getPluginLocalDataPath: () => dataRoot } },
+    utools: { getPluginLocalDataPath: () => dataRoot }, module: { exports: {} }
+  };
+  try {
+    vm.runInNewContext(fs.readFileSync(filename, "utf8") + "\nmodule.exports = manager;", sandbox, { filename });
+    const manager = sandbox.module.exports;
+
+    writeBundle("ss_2026.11.22-upstream-integrated-v13", "core-v13");
+    let selected = manager.resolveHelper();
+    assert.equal(fs.readFileSync(selected, "utf8"), "core-v13");
+    assert.equal(manager.helperManifest.buildId, "ss_2026.11.22-upstream-integrated-v13");
+    assert.equal(JSON.parse(fs.readFileSync(path.join(localRoot, "current.json"), "utf8")).buildId,
+      "ss_2026.11.22-upstream-integrated-v13");
+
+    writeBundle("ss_2026.11.22-upstream-integrated-v14", "core-v14");
+    selected = manager.resolveHelper();
+    assert.equal(fs.readFileSync(selected, "utf8"), "core-v14");
+    assert.equal(manager.helperManifest.buildId, "ss_2026.11.22-upstream-integrated-v14");
+    assert.equal(JSON.parse(fs.readFileSync(path.join(localRoot, "current.json"), "utf8")).buildId,
+      "ss_2026.11.22-upstream-integrated-v14");
+
+    writeBundle("ss_2026.11.22-upstream-integrated-v13", "core-v13");
+    selected = manager.resolveHelper();
+    assert.equal(fs.readFileSync(selected, "utf8"), "core-v13");
+    assert.equal(manager.helperManifest.buildId, "ss_2026.11.22-upstream-integrated-v13");
+    assert.equal(JSON.parse(fs.readFileSync(path.join(localRoot, "current.json"), "utf8")).buildId,
+      "ss_2026.11.22-upstream-integrated-v13");
+  } finally {
+    fs.rmSync(pluginRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+    fs.rmSync(dataRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+  }
+}
+
 (async () => {
   const root = path.resolve(__dirname, "..");
   await test(root);
   await testDoesNotKillExternalPid(root);
   await testCleanupScope(root);
-  console.log("plugin exit lifecycle tests passed");
+  await testHelperUpgradeAndRollback();
+  console.log("plugin lifecycle and helper upgrade/rollback tests passed");
 })().catch(error => { console.error(error); process.exitCode = 1; });
