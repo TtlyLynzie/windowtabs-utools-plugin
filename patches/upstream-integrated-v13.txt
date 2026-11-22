@@ -1936,7 +1936,7 @@ new file mode 100644
 index 0000000..384c066
 --- /dev/null
 +++ b/WtProgram/WindowTabsIpc.fs
-@@ -0,0 +1,264 @@
+@@ -0,0 +1,300 @@
 +namespace Bemo
 +
 +open System
@@ -1983,16 +1983,16 @@ index 0000000..384c066
 +                | true, pid when pid > 0 -> Some pid
 +                | _ -> None
 +            else None)
-
++
 +    let private exposedSettings =
 +        [| "IncludedPaths"; "ExcludedPaths"; "AutoGroupingPaths"
-+           "HideInactiveTabs"; "GroupTaskbarButtons"; "TaskbarActiveTabFirst"; "EnableTabbingByDefault"
++           "HideInactiveTabs"; "GroupTaskbarButtons"; "EnableTabbingByDefault"
 +           "EnableCtrlNumberHotKey"; "EnableAltNumberHotKey"; "EnableHoverActivate"
 +           "EnableTabPreview"; "TabPreviewDelay"; "TabPreviewSize"
 +           "TabCloseButton"; "TabPinButton"; "TabPositionByDefault"
 +           "TabVerticalDirection"; "HideTabsWhenDownByDefault"
 +           "HideTabsDelayMilliseconds"; "HideTabsOnFullscreen"
-+           "HideTabsWhileMoving"; "LockWindowPosition"; "SnapTabHeightMargin"; "SnapTabMarginMode"
++           "HideTabsWhileMoving"; "LockWindowPosition"; "SnapTabHeightMargin"
 +           "ChangeTabPositionOnSnap"; "SnapOnDragDetach"; "TabAppearance"
 +           "IsDisabled"; "EnableDarkMode" |]
 +
