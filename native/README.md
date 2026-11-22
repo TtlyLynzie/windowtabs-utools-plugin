@@ -1,6 +1,6 @@
 # 原生 IPC 接入说明
 
-`WindowTabsIpc.fs` 是针对 WindowTabs `ss_2026.11.11` 的纯 F# IPC 实现，由 `patches/upstream-integrated-v12.txt` 应用到官方源码，并加入 `WtProgram.fsproj`。`WindowTabsIpcServer.cs` 保留为独立 C# 管道服务的参考实现。
+`WindowTabsIpc.fs` 是针对 WindowTabs 的纯 F# IPC 实现，由对应的 `patches/upstream-integrated-v13.txt` 应用到官方源码，并加入 `WtProgram.fsproj`。`WindowTabsIpcServer.cs` 保留为独立 C# 管道服务的参考实现。
 
 官方发布的原始 EXE 不含 uTools IPC。要获得完整控制能力，必须从官方 Tag 应用集成补丁后，在 Windows 上重新编译；市场版本通过 GitHub Actions 构建和运行验证。
 
@@ -18,7 +18,7 @@
 
 `Program.run` 在服务注册、设置加载和设置窗口预加载完成后创建 `WindowTabsIpc.Server`，主入口从 `--windowtabs-ipc-pipe=...` 读取管道参数。`Application.Run()` 返回后释放服务。
 
-普通桌面启动不带管道参数，因此仍保持 WindowTabs 原有行为；uTools 启动时会带上管道参数。
+普通桌面启动不带管道参数，因此仍保持 WindowTabs 原有行为；uTools 启动时会带上管道参数和插件父进程 PID。helper 会监测该父进程，发现插件进程被强制结束后自动退出。
 
 ## 当前方法
 
