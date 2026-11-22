@@ -659,8 +659,9 @@ class HelperManager {
       const required = bundled?.capabilities || [];
       const outdated = bundled?.contractVersion === 1 &&
         required.some(capability => !this.capabilities.includes(capability));
-      if (!outdated) return current;
+      if (!outdated && !current.updateAvailable) return current;
       await this.stop();
+      await this.cleanupManagedFiles({ onlyIfStopped: true, allowNoRecord: true });
     }
     if (current.state === "LEGACY_RUNNING") {
       // A plugin upgrade can leave an old helper process alive. If the
@@ -668,6 +669,7 @@ class HelperManager {
       // automatically before launching the new core.
       if (this.helperManifest?.ipc === true) {
         await this.stop();
+        await this.cleanupManagedFiles({ onlyIfStopped: true, allowNoRecord: true });
       } else {
         return current;
       }
@@ -1003,8 +1005,13 @@ class HelperManager {
     this.pipe.close();
   }
 
-  async cleanupManagedFiles({ onlyIfStopped = false } = {}) {
+  async cleanupManagedFiles({ onlyIfStopped = false, allowNoRecord = false } = {}) {
     const record = this.getManagedRecord();
+    if (!record && !allowNoRecord) {
+      const helperRoot = getLocalHelperRoot();
+      const exists = fileExists(helperRoot);
+      return { helperFilesRemoved: !exists, managedRecordRemoved: !readManagedProcess(), remainingPaths: exists ? [helperRoot] : [], error: null };
+    }
     if (onlyIfStopped && record && await this.isProcessRunning(Number(record.pid))) {
       return { helperFilesRemoved: false, remainingPaths: [getLocalHelperRoot()], error: makeError("HELPER_RUNNING", "WindowTabs helper 仍在运行") };
     }
@@ -1022,7 +1029,7 @@ class HelperManager {
   async prepareUninstall() {
     let stopError = null;
     try { await this.stop(); } catch (error) { stopError = error; }
-    const cleanup = await this.cleanupManagedFiles({ onlyIfStopped: true });
+    const cleanup = await this.cleanupManagedFiles({ onlyIfStopped: true, allowNoRecord: !stopError });
     if (stopError && !cleanup.helperFilesRemoved) {
       stopError.details = { ...(stopError.details || {}), remainingPaths: cleanup.remainingPaths };
       throw stopError;
