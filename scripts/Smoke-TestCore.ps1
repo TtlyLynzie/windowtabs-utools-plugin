@@ -78,3 +78,58 @@ finally {
   if ($process) { $process.Dispose() }
   if (Test-Path $settingsDirectory) { Remove-Item $settingsDirectory -Recurse -Force -ErrorAction SilentlyContinue }
 }
+
+$parentTestRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("windowtabs-parent-exit-" + [Guid]::NewGuid().ToString('N'))
+$pluginHelperDirectory = Join-Path $parentTestRoot 'uTools\local-data\plugins\test-plugin\helper'
+$parentSettingsPath = Join-Path $parentTestRoot 'WindowTabsSettings.json'
+$parentPidProcess = $null
+$parentCore = $null
+$parentPipe = $null
+$parentReader = $null
+$parentWriter = $null
+try {
+  New-Item -ItemType Directory -Force -Path $pluginHelperDirectory | Out-Null
+  $markerPath = Join-Path $pluginHelperDirectory 'must-remain.txt'
+  Set-Content -Path $markerPath -Value 'helper files remain after plugin process exit' -NoNewline
+
+  $parentPidProcess = Start-Process -FilePath 'powershell.exe' -ArgumentList @('-NoProfile', '-Command', 'Start-Sleep -Seconds 30') -PassThru -WindowStyle Hidden
+  $parentPipeName = "windowtabs-parent-exit-$([Guid]::NewGuid().ToString('N'))"
+  $parentPipeAddress = "\\.\pipe\$parentPipeName"
+  $parentArguments = @(
+    "--windowtabs-ipc-pipe=$parentPipeAddress",
+    "--windowtabs-settings=$parentSettingsPath",
+    "--windowtabs-parent-pid=$($parentPidProcess.Id)",
+    "--windowtabs-cleanup-path=$pluginHelperDirectory"
+  )
+  $parentCore = Start-Process -FilePath $Executable -ArgumentList $parentArguments -PassThru -WindowStyle Hidden
+  $parentPipe = New-Object System.IO.Pipes.NamedPipeClientStream('.', $parentPipeName, [System.IO.Pipes.PipeDirection]::InOut)
+  $parentPipe.Connect($TimeoutSeconds * 1000)
+  $utf8 = New-Object System.Text.UTF8Encoding($false)
+  $parentReader = New-Object System.IO.StreamReader($parentPipe, $utf8, $false, 65536, $true)
+  $parentWriter = New-Object System.IO.StreamWriter($parentPipe, $utf8, 65536, $true)
+  $parentWriter.AutoFlush = $true
+  $parentWriter.WriteLine((@{ id = 'parent-exit-ready'; version = 1; method = 'hello'; params = @{} } | ConvertTo-Json -Compress))
+  $parentResponse = $parentReader.ReadLineAsync()
+  if (-not $parentResponse.Wait($TimeoutSeconds * 1000)) { throw 'Parent-exit test core did not complete its IPC handshake.' }
+  if (-not $parentCore.HasExited) { Stop-Process -Id $parentPidProcess.Id -Force }
+  if (-not $parentCore.WaitForExit($TimeoutSeconds * 1000)) {
+    throw 'WindowTabs did not exit after its uTools parent process ended.'
+  }
+  if (-not (Test-Path $markerPath)) {
+    throw 'Helper files were removed when the uTools parent process ended.'
+  }
+  Write-Host 'Parent-exit test passed: core exited and plugin helper files remained.'
+}
+finally {
+  if ($parentCore -and -not $parentCore.HasExited) {
+    Stop-Process -Id $parentCore.Id -Force -ErrorAction SilentlyContinue
+    $parentCore.WaitForExit(5000) | Out-Null
+  }
+  if ($parentPidProcess -and -not $parentPidProcess.HasExited) {
+    Stop-Process -Id $parentPidProcess.Id -Force -ErrorAction SilentlyContinue
+  }
+  if ($parentReader) { try { $parentReader.Dispose() } catch {} }
+  if ($parentWriter) { try { $parentWriter.Dispose() } catch {} }
+  if ($parentPipe) { try { $parentPipe.Dispose() } catch {} }
+  if (Test-Path $parentTestRoot) { Remove-Item $parentTestRoot -Recurse -Force -ErrorAction SilentlyContinue }
+}

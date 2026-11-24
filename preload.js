@@ -100,6 +100,19 @@ function clearManagedProcess(expectedPid = null) {
   }
 }
 
+function getLocalHelperRoot() {
+  return path.join(getPluginDataPath(), "helper");
+}
+
+function removeTreeWithRetry(filePath) {
+  try {
+    fs.rmSync(filePath, { recursive: true, force: true, maxRetries: 5, retryDelay: 300 });
+  } catch (error) {
+    return error;
+  }
+  return fileExists(filePath) ? makeError("HELPER_CLEANUP_FAILED", "WindowTabs helper 目录仍然存在") : null;
+}
+
 function invalidParams(message, details) {
   return makeError("INVALID_PARAMS", message, details);
 }
@@ -368,6 +381,7 @@ class HelperManager {
     this.child = null;
     this.helperManifest = null;
     this.helperVerified = false;
+    this.helperCopySuppressed = false;
     this.startPromise = null;
     this.stopPromise = null;
     this.restartPromise = null;
@@ -469,6 +483,10 @@ class HelperManager {
       if (sameVersion(localManifest, bundledManifest) && fileExists(localPath)) {
         this.helperManifest = localManifest;
         return localPath;
+      }
+      if (this.helperCopySuppressed) {
+        this.helperManifest = bundledManifest;
+        return bundledPath;
       }
       try {
         const versionDir = path.basename(path.dirname(bundledPath));
@@ -634,6 +652,10 @@ class HelperManager {
     if (!this.isNativePlatform()) {
       throw makeError("UNSUPPORTED_PLATFORM", "WindowTabs 原生核心仅支持 Windows");
     }
+    this.helperCopySuppressed = false;
+    // Remove stale plugin-local helper files left by a crash or an interrupted
+    // uninstall. Never touch the bundled helper or another installation.
+    await this.cleanupManagedFiles({ onlyIfStopped: true });
     // Remove a stale ownership record left by a crash or an interrupted
     // uninstall before deciding whether a process is already running.
     await this.getManagedPid();
@@ -643,8 +665,9 @@ class HelperManager {
       const required = bundled?.capabilities || [];
       const outdated = bundled?.contractVersion === 1 &&
         required.some(capability => !this.capabilities.includes(capability));
-      if (!outdated) return current;
+      if (!outdated && !current.updateAvailable) return current;
       await this.stop();
+      await this.cleanupManagedFiles({ onlyIfStopped: true, allowNoRecord: true });
     }
     if (current.state === "LEGACY_RUNNING") {
       // A plugin upgrade can leave an old helper process alive. If the
@@ -652,6 +675,7 @@ class HelperManager {
       // automatically before launching the new core.
       if (this.helperManifest?.ipc === true) {
         await this.stop();
+        await this.cleanupManagedFiles({ onlyIfStopped: true, allowNoRecord: true });
       } else {
         return current;
       }
@@ -985,12 +1009,40 @@ class HelperManager {
     this.pipe.close();
   }
 
+  async cleanupManagedFiles({ onlyIfStopped = false, allowNoRecord = false } = {}) {
+    const record = this.getManagedRecord();
+    if (!record && !allowNoRecord) {
+      const helperRoot = getLocalHelperRoot();
+      const exists = fileExists(helperRoot);
+      return { helperFilesRemoved: !exists, managedRecordRemoved: !readManagedProcess(), remainingPaths: exists ? [helperRoot] : [], error: null };
+    }
+    if (onlyIfStopped && record && await this.isProcessRunning(Number(record.pid))) {
+      return { helperFilesRemoved: false, remainingPaths: [getLocalHelperRoot()], error: makeError("HELPER_RUNNING", "WindowTabs helper 仍在运行") };
+    }
+    const localHelperRoot = getLocalHelperRoot();
+    const error = removeTreeWithRetry(localHelperRoot);
+    if (!error) clearManagedProcess(record?.pid || null);
+    return {
+      helperFilesRemoved: !error && !fileExists(localHelperRoot),
+      managedRecordRemoved: !readManagedProcess(),
+      remainingPaths: fileExists(localHelperRoot) ? [localHelperRoot] : [],
+      error: error || null
+    };
+  }
+
   async prepareUninstall() {
-    await this.stop();
-    clearManagedProcess();
-    const localHelperRoot = path.join(getPluginDataPath(), "helper");
-    fs.rmSync(localHelperRoot, { recursive: true, force: true });
-    return { stopped: true, helperFilesRemoved: true };
+    let stopError = null;
+    try { await this.stop(); } catch (error) { stopError = error; }
+    const cleanup = await this.cleanupManagedFiles({ onlyIfStopped: true, allowNoRecord: !stopError });
+    if (stopError && !cleanup.helperFilesRemoved) {
+      stopError.details = { ...(stopError.details || {}), remainingPaths: cleanup.remainingPaths };
+      throw stopError;
+    }
+    if (!cleanup.helperFilesRemoved) {
+      throw cleanup.error || makeError("HELPER_CLEANUP_FAILED", "WindowTabs helper 未能清理", cleanup);
+    }
+    this.helperCopySuppressed = true;
+    return { stopped: !stopError, ...cleanup };
   }
 
   async onPluginEnter(code) {
@@ -1007,8 +1059,9 @@ class HelperManager {
       return;
     }
     // This callback is synchronous in uTools. Start the asynchronous graceful
-    // shutdown immediately; the helper's parent monitor is the final safety
+    // shutdown immediately. The helper's parent monitor is the final safety
     // net if uTools tears down this plugin process before the promise settles.
+    // Stopping the process never removes the installed helper files.
     void this.stopForKill();
   }
 

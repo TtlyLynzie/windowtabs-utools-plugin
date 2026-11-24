@@ -8,6 +8,7 @@
   ];
   let schema, draft, page='home', status={}, busy=false, edge='顶部', apps=null, workspaces=null;
   let restoreTimer=null, generation=0, appearanceMode='layout', usageMode='behavior';
+  let appsRefreshTimer=null, appsRefreshInFlight=null, appsRefreshGeneration=0;
   let preferredScheme='';
   let appStatusFilter='all', appSort='name-asc', workspaceSort='saved';
   const clone = v => M.clone(v);
@@ -79,7 +80,7 @@
   }
   function navigation() {
     $('navigation').replaceChildren(...pages.map(([id,label])=>el('button',{
-      type:'button','aria-current':page===id?'page':'false',onclick:()=>{page=id;render();loadPage();}
+      type:'button','aria-current':page===id?'page':'false',onclick:()=>{if(page==='apps'&&id!=='apps')stopAppsAutoRefresh();page=id;render();loadPage();}
     },label)));
   }
   async function connect(restart=false) {
@@ -111,9 +112,35 @@
     if (!draft) return;
     const requestedPage=page;
     try {
-      if(page==='apps') { apps=await api.integrated('applications'); if(page===requestedPage)render(); }
+      if(page==='apps') { apps=await api.integrated('applications'); if(page===requestedPage){render();startAppsAutoRefresh();} }
       if(page==='workspaces') { workspaces=await api.integrated('workspaces'); if(page===requestedPage)render(); }
     } catch(e) { note(errors[e.code]||'无法读取当前内容，请重试。',true); }
+  }
+  function stopAppsAutoRefresh() {
+    appsRefreshGeneration++;
+    if(appsRefreshTimer){clearInterval(appsRefreshTimer);appsRefreshTimer=null;}
+    appsRefreshInFlight=null;
+  }
+  function startAppsAutoRefresh() {
+    if(page!=='apps'||appsRefreshTimer)return;
+    const generationAtStart=appsRefreshGeneration;
+    appsRefreshTimer=setInterval(async()=>{
+      if(page!=='apps'||generationAtStart!==appsRefreshGeneration){stopAppsAutoRefresh();return;}
+      if(document.visibilityState!=='visible')return;
+      if(appsRefreshInFlight||busy)return;
+      const previous=apps;
+      appsRefreshInFlight=api.integrated('applications').then(next=>{
+        if(page!=='apps'||generationAtStart!==appsRefreshGeneration)return;
+        const changed=JSON.stringify(previous)!==JSON.stringify(next);
+        if(changed){
+          apps=next;
+          render();
+          note('应用列表已自动更新。');
+        }
+      }).catch(error=>{
+        if(page==='apps'&&error?.code!=='PIPE_UNAVAILABLE')note(errors[error.code]||'应用列表自动刷新失败，请手动刷新。',true);
+      }).finally(()=>{appsRefreshInFlight=null;});
+    },3000);
   }
   // Fixed-size previews follow WtProgram/Shared/TabShape.fs (120 × 24, edge band 18).
   const shapePaths = {
@@ -356,7 +383,7 @@
         const info=await api.integrated('storageInfo'),snapshot=await api.integrated('settingsSnapshot');
         const toPortable=info.location!=='portable';
         if(await ask('切换数据存放方式？',el('p',{},toPortable?'将设置移动到内置组件旁边，并保留原文件备份。更新组件前需先返回用户文件夹，以免设置随旧目录遗留。':'将便携设置移回 Windows 用户文件夹。若目标已有设置，将停止操作以避免覆盖。'),'切换')){await api.integrated('storageTransfer',{toPortable,move:true,revision:snapshot.revision});await refreshSnapshot(true);note('已切换数据存放位置。');}
-      }))),card('帮助',el('p',{class:'help'},'关闭插件面板后，窗口标签仍会在后台运行。需要停止时，请使用概览页的“暂停标签”按钮或此处的“停止窗口标签”。已打开的应用窗口会保留。旧版本中已开启自动启动的用户，该偏好仍会保留；如需关闭，请在 WindowTabs 的启动设置中关闭。卸载插件前，建议先停止窗口标签。'),el('details',{},el('summary',{},'连接失败或无法使用？'),el('p',{class:'help'},'先重试连接；仍无效时再重启窗口标签。如果电脑上还运行着独立安装的 WindowTabs，请先退出它。复制诊断信息前，请检查其中的个人路径。'),el('div',{class:'actions'},button('重试连接',()=>connect(false)),button('重启 WindowTabs',()=>connect(true)),button('重新读取设置',()=>refreshSnapshot()),button('复制诊断信息',async()=>{await api.copyDiagnostics();note('诊断信息已复制。分享前请检查其中的个人路径。');}),button('停止窗口标签',async()=>{if(await ask('停止窗口标签？',el('p',{},'所有应用窗口会保留，但不再显示标签。'),'停止')){status=await api.stop();draft=null;render();}}),button('卸载前停止并清理',async()=>{if(await ask('准备卸载插件？',el('p',{},'这会停止由插件启动的 WindowTabs，并删除插件数据目录中的 helper。独立安装的 WindowTabs 不受影响。完成后再从 uTools 卸载插件。'),'继续')){await api.prepareUninstall();status=await api.getStatus();render();note('WindowTabs 已停止，本地 helper 已清理。现在可以卸载插件。');}}))),el('p',{class:'help'},'本项目基于 standard-software/WindowTabs 修改，原项目采用 MIT License'))];
+      }))),card('帮助',el('p',{class:'help'},'关闭插件面板后，窗口标签仍会在后台运行。点击 uTools“结束运行”或“停止窗口标签”只会关闭由插件启动的 WindowTabs，保留插件 helper 文件。卸载插件前，请先点击“卸载前停止并清理”；该操作会删除本插件数据目录中的 helper，独立安装的 WindowTabs 不受影响。已打开的应用窗口会保留。旧版本中已开启自动启动的用户，该偏好仍会保留；如需关闭，请在 WindowTabs 的启动设置中关闭。'),el('details',{},el('summary',{},'连接失败或无法使用？'),el('p',{class:'help'},'先重试连接；仍无效时再重启窗口标签。如果电脑上还运行着独立安装的 WindowTabs，请先退出它。复制诊断信息前，请检查其中的个人路径。'),el('div',{class:'actions'},button('重试连接',()=>connect(false)),button('重启 WindowTabs',()=>connect(true)),button('重新读取设置',()=>refreshSnapshot()),button('复制诊断信息',async()=>{await api.copyDiagnostics();note('诊断信息已复制。分享前请检查其中的个人路径。');}),button('停止窗口标签',async()=>{if(await ask('停止窗口标签？',el('p',{},'所有应用窗口会保留，但不再显示标签。'),'停止')){status=await api.stop();draft=null;render();}}),button('卸载前停止并清理',async()=>{if(await ask('准备卸载插件？',el('p',{},'这会停止由插件启动的 WindowTabs，并删除插件数据目录中的 helper。独立安装的 WindowTabs 不受影响。完成后再从 uTools 卸载插件。'),'继续')){const result=await api.prepareUninstall();status=result.stopped?{state:'INSTALLED_STOPPED',message:'WindowTabs 已停止'}:await api.getStatus();render();if(result.remainingPaths?.length)note(`清理未完全完成，残留文件：${result.remainingPaths.join('；')}`,true);else if(!result.stopped)note('本地 helper 文件已清理，但未能确认 WindowTabs 已正常停止。请检查进程后再卸载。',true);else note('WindowTabs 已停止，本地 helper 和托管记录已清理。现在可以卸载插件。');}}))),el('p',{class:'help'},'本项目基于 standard-software/WindowTabs 修改，原项目采用 MIT License'))];
   }
   async function importBackup(file) {
     if(!file)return;if(file.size>750000)throw new Error('备份文件过大，请选择小于 750 KB 的文件。');
@@ -397,6 +424,10 @@
   $('discard').onclick=()=>run(async()=>{if(await ask('撤销未保存的修改？',el('p',{},'已保存的设置不受影响。'),'撤销')){draft.reset(draft.snapshot);render();note('已撤销未保存的修改。');}});
   $('importFile').onchange=e=>run(()=>importBackup(e.target.files[0]));
   if(!api){status={state:'UNSUPPORTED_PLATFORM'};render();note('请在 uTools 中打开插件。');return;}
+  document.addEventListener('visibilitychange',()=>{
+    if(document.visibilityState==='hidden')stopAppsAutoRefresh();
+    else if(page==='apps'&&draft){loadPage();}
+  });
   schema=api.getSchema();
   api.onEvent(({event,payload})=>{
     if(event==='navigate'){

@@ -31,7 +31,7 @@ cat > "$STAGE_DIR/UPSTREAM-NOTICE.txt" <<'EOF'
 WindowTabs
 Copyright (c) 2018 Maurice Flanagan
 MIT License: LICENSES/WindowTabs-MIT.txt
-Upstream base: standard-software/WindowTabs ss_2026.11.22
+Upstream base: standard-software/WindowTabs ss_2026.11.24
 This helper is rebuilt from the pinned upstream source plus the audited IPC
 and updater-disable patches. Runtime update checks and downloads are disabled.
 EOF

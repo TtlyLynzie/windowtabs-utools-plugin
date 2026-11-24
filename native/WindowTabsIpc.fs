@@ -27,15 +27,33 @@ module WindowTabsIpc =
     // Keep the pipe protocol BOM-free. Node.js JSON.parse rejects a leading BOM.
     let private utf8NoBom = UTF8Encoding(false)
 
+    let pipeArgument (argv: string array) =
+        argv
+        |> Array.tryPick(fun arg ->
+            let prefix = "--windowtabs-ipc-pipe="
+            if arg.StartsWith(prefix, StringComparison.OrdinalIgnoreCase) then
+                Some(arg.Substring(prefix.Length))
+            else None)
+
+    let parentPidArgument (argv: string array) =
+        argv
+        |> Array.tryPick(fun arg ->
+            let prefix = "--windowtabs-parent-pid="
+            if arg.StartsWith(prefix, StringComparison.OrdinalIgnoreCase) then
+                match Int32.TryParse(arg.Substring(prefix.Length)) with
+                | true, pid when pid > 0 -> Some pid
+                | _ -> None
+            else None)
+
     let private exposedSettings =
         [| "IncludedPaths"; "ExcludedPaths"; "AutoGroupingPaths"
-           "HideInactiveTabs"; "GroupTaskbarButtons"; "EnableTabbingByDefault"
+           "HideInactiveTabs"; "GroupTaskbarButtons"; "TaskbarOrderDelayMilliseconds"; "EnableTabbingByDefault"
            "EnableCtrlNumberHotKey"; "EnableAltNumberHotKey"; "EnableHoverActivate"
            "EnableTabPreview"; "TabPreviewDelay"; "TabPreviewSize"
            "TabCloseButton"; "TabPinButton"; "TabPositionByDefault"
            "TabVerticalDirection"; "HideTabsWhenDownByDefault"
            "HideTabsDelayMilliseconds"; "HideTabsOnFullscreen"
-           "HideTabsWhileMoving"; "LockWindowPosition"; "SnapTabHeightMargin"
+           "HideTabsWhileMoving"; "LockWindowPosition"; "SnapTabHeightMargin"; "SnapTabMarginDelayMilliseconds"
            "ChangeTabPositionOnSnap"; "SnapOnDragDetach"; "TabAppearance"
            "IsDisabled"; "EnableDarkMode" |]
 
@@ -141,7 +159,7 @@ module WindowTabsIpc =
           | "hello" ->
               success (makeObject([| JProperty("coreVersion", coreVersion);
                                  JProperty("protocolVersion", protocolVersion);
-                                 JProperty("buildId", coreVersion + "-upstream-integrated-v13");
+                                 JProperty("buildId", coreVersion + "-upstream-integrated-v16");
                                  JProperty("pid", Process.GetCurrentProcess().Id);
                                  JProperty("groupCount", 0);
                                  JProperty("capabilities", JArray([| JValue("status") :> JToken; JValue("config") :> JToken; JValue("integrated-settings-v1") :> JToken |]));
@@ -272,24 +290,6 @@ module WindowTabsIpc =
             if not (isNull parentMonitor) then
                 try parentMonitor.Wait(1000) |> ignore with _ -> ()
             cancellation.Dispose()
-
-    let pipeArgument (argv: string array) =
-        argv
-        |> Array.tryPick(fun arg ->
-            let prefix = "--windowtabs-ipc-pipe="
-            if arg.StartsWith(prefix, StringComparison.OrdinalIgnoreCase) then
-                Some(arg.Substring(prefix.Length))
-            else None)
-
-    let parentPidArgument (argv: string array) =
-        argv
-        |> Array.tryPick(fun arg ->
-            let prefix = "--windowtabs-parent-pid="
-            if arg.StartsWith(prefix, StringComparison.OrdinalIgnoreCase) then
-                match Int32.TryParse(arg.Substring(prefix.Length)) with
-                | true, pid when pid > 0 -> Some pid
-                | _ -> None
-            else None)
 
     let start (argv: string array) (coreVersion: string) =
         match pipeArgument argv with
