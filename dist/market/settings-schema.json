@@ -1,6 +1,6 @@
 {
   "contractVersion": 1,
-  "upstream": "ss_2026.11.11",
+  "upstream": "ss_2026.11.24",
   "fields": [
     {
       "path": "EnableTabbingByDefault",
@@ -15,6 +15,24 @@
       "page": "general",
       "type": "boolean",
       "default": false
+    },
+    {
+      "path": "TaskbarActiveTabFirst",
+      "label": "将活动标签置于任务栏按钮首位",
+      "page": "general",
+      "type": "boolean",
+      "default": false
+    },
+    {
+      "path": "TaskbarOrderDelayMilliseconds",
+      "label": "任务栏活动标签排序等待",
+      "page": "general",
+      "type": "number",
+      "default": 2000,
+      "min": 100,
+      "max": 10000,
+      "scale": 1000,
+      "unit": "秒"
     },
     {
       "path": "HideInactiveTabs",
@@ -71,6 +89,38 @@
       "page": "behavior",
       "type": "boolean",
       "default": false
+    },
+    {
+      "path": "SnapTabMarginMode",
+      "label": "吸附或移动时为标签留出空间",
+      "page": "behavior",
+      "type": "select",
+      "default": "none",
+      "options": [
+        {
+          "value": "none",
+          "label": "不留空间"
+        },
+        {
+          "value": "windowTabs",
+          "label": "仅 WindowTabs 吸附时"
+        },
+        {
+          "value": "windows",
+          "label": "WindowTabs 或 Windows 吸附时"
+        }
+      ]
+    },
+    {
+      "path": "SnapTabMarginDelayMilliseconds",
+      "label": "吸附留白生效等待",
+      "page": "behavior",
+      "type": "number",
+      "default": 3000,
+      "min": 100,
+      "max": 10000,
+      "scale": 1000,
+      "unit": "秒"
     },
     {
       "path": "SnapOnDragDetach",
@@ -1370,6 +1420,5 @@
         "Top"
       ]
     }
-  ],
-  "contractVersion": 1
+  ]
 }
